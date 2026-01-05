@@ -10,7 +10,7 @@ COPY proto /app/proto
 COPY go-sidecar /app/go-sidecar
 
 ENV CGO_ENABLED=0
-RUN go build -o /sidecar main.go
+RUN go build -o /sidecar cmd/sidecar/main.go
 
 # --- Stage 2: Build C++ App ---
 FROM debian:bookworm-slim AS cpp_builder

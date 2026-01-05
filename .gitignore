@@ -44,3 +44,5 @@ cpp-app/build
 
 # db data dir
 vol-node*/
+
+.DS_Store
