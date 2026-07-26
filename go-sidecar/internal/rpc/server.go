@@ -27,14 +27,22 @@ const NotLeaderPrefix = "not_leader:"
 // proposeTimeout bounds how long a proposal may wait to be committed and
 // applied before Raft gives up on it.
 //
-// Deliberately SHORTER than the C++ client's 5s gRPC deadline
-// (kDefaultTimeout in cpp-app/src/raft/raft_client.hpp). With both at 5s the
-// two races: the client's deadline usually fires first, so a slow commit
-// surfaces to the HTTP caller as a bare "DEADLINE_EXCEEDED" instead of the
-// structured raft reason this phase exists to produce. The 1s of margin lets
-// the sidecar always win and answer with a real ProposeResponse.
+// CAREFUL — this bounds LESS than the name suggests. In hashicorp/raft v1.7.3,
+// Raft.Apply's timeout only bounds enqueueing onto applyCh (yielding
+// ErrEnqueueTimeout); see ApplyLog in raft/api.go. Once the entry is queued,
+// ApplyFuture.Error() blocks until it commits AND the local FSM applies it,
+// with no deadline. CppFSM.Apply in turn calls the C++ state machine with
+// context.Background(), also with no deadline.
 //
-// If you change either value, keep this one below the C++ deadline.
+// So a wedged C++ state machine still blocks past this value, and the C++
+// client's 5s gRPC deadline will fire first and surface a bare
+// DEADLINE_EXCEEDED. Keeping this below that 5s only helps the enqueue-backlog
+// case, which is the one it actually covers.
+//
+// Bounding the rest is deliberately NOT done here: timing out an apply locally
+// and moving on would skip an entry other replicas applied, which is real
+// divergence. If a bound is wanted it belongs on the future.Error() wait in
+// raftnode.Node.Apply, and it has to fail the node rather than continue.
 const proposeTimeout = 4 * time.Second
 
 // RaftProposer is the consumer-side view of the Raft node that the Propose

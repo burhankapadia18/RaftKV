@@ -200,6 +200,32 @@ TEST(HttpRequestParserTest, GarbageContentLengthIsFlaggedNotThrown) {
   EXPECT_EQ(huge.content_length, 0);
 }
 
+TEST(HttpRequestParserTest, NegativeContentLengthIsFlagged) {
+  // A negative length does NOT throw — std::stoi("-1") happily returns -1 — so
+  // the exception handling above does not cover it. It has to be rejected
+  // explicitly, and the reason is severe:
+  //
+  // HttpServer::handle_connection tops the body up with
+  //   while (body.size() < static_cast<size_t>(content_length))
+  // and static_cast<size_t>(-1) is 18446744073709551615. The loop can never be
+  // satisfied, so it blocks in recv() until the peer disconnects. The accept
+  // loop is single-threaded, so ONE client that sends this header and keeps the
+  // socket open takes the node's whole HTTP surface offline — while the
+  // container still reports healthy, so nothing restarts it.
+  //
+  // Verified against a live cluster before the guard existed: node3 stopped
+  // answering every request for as long as the socket was held, reported
+  // "Up 10 minutes" throughout, and recovered only when the client hung up.
+  for (const char *value : {"-1", "-1000", "-2147483648"}) {
+    const std::string raw = std::string("POST /insert-val HTTP/1.1\r\n"
+                                        "Content-Length: ") +
+                            value + "\r\n\r\n";
+    const HttpRequest request = parse_ok(raw);
+    EXPECT_TRUE(request.bad_content_length) << "value=" << value;
+    EXPECT_EQ(request.content_length, 0) << "value=" << value;
+  }
+}
+
 // --- Content-Type ---------------------------------------------------------
 
 TEST(HttpRequestParserTest, DetectsMsgpackContentType) {

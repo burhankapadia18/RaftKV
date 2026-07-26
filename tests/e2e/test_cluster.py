@@ -299,10 +299,20 @@ _DOS_EXPLANATION = (
 )
 
 
+@pytest.mark.parametrize(
+    "bad_length",
+    [
+        pytest.param("abc", id="not-a-number"),
+        pytest.param("", id="empty"),
+        pytest.param("99999999999999999999", id="wider-than-int"),
+        pytest.param("-1", id="negative"),
+        pytest.param("-2147483648", id="most-negative-int"),
+    ],
+)
 def test_r1_8_malformed_content_length_is_rejected_without_killing_the_node(
-    cluster, unique_key, unique_value
+    cluster, unique_key, unique_value, bad_length
 ):
-    """``Content-Length: abc`` is a 400, and every node survives it.
+    """A malformed ``Content-Length`` is a 400, and every node survives it.
 
     The highest-value test in Phase 1: it is the only one whose failure means
     an unauthenticated stranger can take the cluster down. ``requests`` cannot
@@ -313,22 +323,32 @@ def test_r1_8_malformed_content_length_is_rejected_without_killing_the_node(
     crash here is permanent: entrypoint.sh exits with the dead process and
     docker-compose.yml declares no ``restart:`` policy, so the port stays shut
     for the rest of the session.
+
+    The negative values are a distinct failure mode and were missed by the
+    first version of this test. ``std::stoi("-1")`` does not throw, so the
+    exception handling that fixed ``abc`` does not cover it; the value flows
+    through to ``static_cast<size_t>(content_length)`` in the body top-up loop,
+    becomes 18446744073709551615, and the loop blocks in ``recv()`` until the
+    peer disconnects. That does not crash the node -- it *wedges* it, silently,
+    while the container still reports healthy. It shows up here as ``send_raw``
+    timing out rather than as a refused connection.
     """
     for base_url in cluster.nodes:
-        request = cluster.malformed_content_length_request(base_url)
+        request = cluster.malformed_content_length_request(base_url, bad_length)
 
         try:
             response = cluster.send_raw(base_url, request)
         except (OSError, ValueError) as exc:
             pytest.fail(
                 f"{base_url} did not answer a request carrying "
-                f"'Content-Length: abc' ({type(exc).__name__}: {exc}).\n"
+                f"'Content-Length: {bad_length}' "
+                f"({type(exc).__name__}: {exc}).\n"
                 f"Request sent:\n{request!r}\n\n{_DOS_EXPLANATION}",
                 pytrace=False,
             )
 
         assert response.status == HTTP_BAD_REQUEST, (
-            f"{base_url} answered {response} to 'Content-Length: abc'; "
+            f"{base_url} answered {response} to 'Content-Length: {bad_length}'; "
             f"expected {HTTP_BAD_REQUEST}.\n\n{_DOS_EXPLANATION}"
         )
         assert response.reason == REASON_PHRASES[HTTP_BAD_REQUEST], (
@@ -352,7 +372,8 @@ def test_r1_8_malformed_content_length_is_rejected_without_killing_the_node(
         if not alive.reachable:
             pytest.fail(
                 f"{base_url} stopped serving reads after receiving "
-                f"'Content-Length: abc' ({alive.body}).\n\n{_DOS_EXPLANATION}",
+                f"'Content-Length: {bad_length}' ({alive.body})."
+                f"\n\n{_DOS_EXPLANATION}",
                 pytrace=False,
             )
         assert alive.status == HTTP_NOT_FOUND, (
@@ -382,8 +403,11 @@ def test_r1_8_wrong_content_type_returns_415(cluster, unique_key):
     """POST /insert-val without the msgpack media type: 415, naming what it wants.
 
     Routing is on method and path only, so a wrong ``Content-Type`` reaches the
-    insert handler and earns a 415. Before Phase 1 it fell through to the "no
-    such route" branch and came back as a 200 with ``Key Not Found``.
+    insert handler and earns a 415. Before Phase 1 the media type was part of
+    the route match, so this fell through to ``HttpResponse::not_found()`` and
+    came back as a 404 with the plain body ``404 Not Found`` -- on the
+    malformed status line ``HTTP/1.1 404 OK``, since the reason phrase was
+    hardcoded. (``200`` + ``Key Not Found`` was the read path, not this one.)
 
     The 415 body carries a second member (``expected``), so this does not go
     through :func:`assert_error_envelope`.

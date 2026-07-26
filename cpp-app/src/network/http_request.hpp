@@ -126,6 +126,18 @@ public:
           request.bad_content_length = true;
           request.content_length = 0;
         }
+        // A NEGATIVE length parses fine — std::stoi("-1") just returns -1 — so
+        // catching exceptions alone is not enough. HttpServer compares
+        // body.size() against static_cast<size_t>(content_length), and
+        // (size_t)-1 is 18446744073709551615: the body top-up loop would never
+        // be satisfied and would block in recv() forever. Because the accept
+        // loop is single-threaded, one client holding that socket open wedges
+        // the node's entire HTTP surface while the container still reports
+        // healthy. Verified against a live cluster before this guard existed.
+        if (request.content_length < 0) {
+          request.bad_content_length = true;
+          request.content_length = 0;
+        }
       }
 
       if (lower_line.find("content-type:") != std::string::npos &&

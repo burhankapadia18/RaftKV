@@ -284,14 +284,18 @@ TEST(StateMachineServiceTest, ApplyRejectsAnEmptyMapPayload) {
 
 // --- Malformed payloads ---------------------------------------------------
 //
-// These take the other failure shape: the decode throws, and the catch-all
-// answers with a non-OK gRPC status. Note that gRPC does not deliver a
-// response message alongside an error status, so the `error` set on the reply
-// is only observable in-process (as here); over the wire the Go FSM sees the
-// transport error instead. Phase 1 deliberately did NOT change which of the
-// two shapes a malformed payload produces - CppFSM.Apply (R1.4) handles both.
+// The decode throws internally, but the catch-all reports it the SAME way as a
+// validation failure: gRPC OK, success=false, reason in `error`. That is
+// correct because the verdict is deterministic - every replica decoding these
+// bytes fails identically, so no replica ends up diverged.
+//
+// It used to return grpc::Status(INTERNAL, ...) instead, which was wrong twice:
+// gRPC drops the response message when the status is non-OK, so `error` never
+// reached the sidecar at all; and CppFSM.Apply routes transport errors down its
+// "THIS REPLICA MAY NOW BE DIVERGED" branch, so every malformed write any
+// client sent raised a false divergence alarm on all three nodes.
 
-TEST(StateMachineServiceTest, ApplyReportsMalformedMsgpackAsInternal) {
+TEST(StateMachineServiceTest, ApplyRejectsMalformedMsgpackDeterministically) {
   FakeKVStore store;
   StateMachineService service(store);
   // 0xc1 is the one byte the MsgPack spec marks "never used".
@@ -301,16 +305,19 @@ TEST(StateMachineServiceTest, ApplyReportsMalformedMsgpackAsInternal) {
 
   const grpc::Status status = service.Apply(nullptr, &request, &reply);
 
-  EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL);
-  EXPECT_FALSE(status.error_message().empty());
+  // gRPC OK so the reply (and therefore the reason) actually reaches the
+  // sidecar - a non-OK status would discard the message.
+  EXPECT_TRUE(status.ok());
   EXPECT_FALSE(reply.success());
-  EXPECT_FALSE(reply.error().empty());
-  EXPECT_EQ(reply.error(), status.error_message());
+  // rfind(prefix, 0) == 0 is "starts with" without pulling in gmock (the
+  // test target links gtest only, and CI installs libgtest-dev alone).
+  EXPECT_EQ(reply.error().rfind("malformed payload: ", 0), 0u)
+      << "error was: " << reply.error();
   EXPECT_EQ(store.writes, 0);
   EXPECT_TRUE(store.data.empty());
 }
 
-TEST(StateMachineServiceTest, ApplyReportsAnEmptyPayloadAsInternal) {
+TEST(StateMachineServiceTest, ApplyRejectsAnEmptyPayloadDeterministically) {
   FakeKVStore store;
   StateMachineService service(store);
   const consensus::Command request = command_with_payload("");
@@ -318,15 +325,18 @@ TEST(StateMachineServiceTest, ApplyReportsAnEmptyPayloadAsInternal) {
 
   const grpc::Status status = service.Apply(nullptr, &request, &reply);
 
-  EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL);
+  EXPECT_TRUE(status.ok());
   EXPECT_FALSE(reply.success());
-  EXPECT_FALSE(reply.error().empty());
+  // rfind(prefix, 0) == 0 is "starts with" without pulling in gmock (the
+  // test target links gtest only, and CI installs libgtest-dev alone).
+  EXPECT_EQ(reply.error().rfind("malformed payload: ", 0), 0u)
+      << "error was: " << reply.error();
   EXPECT_EQ(store.writes, 0);
 }
 
-TEST(StateMachineServiceTest, ApplyReportsAWrongTypedFieldAsInternal) {
-  // A non-string "op" is a type error inside msgpack, not a validation
-  // failure, so it arrives via the throwing path rather than as success=false.
+TEST(StateMachineServiceTest, ApplyRejectsAWrongTypedFieldDeterministically) {
+  // A non-string "op" is a type error inside msgpack rather than a validation
+  // failure, so it arrives via the throwing path - but is reported identically.
   msgpack::sbuffer buffer;
   msgpack::packer<msgpack::sbuffer> pk(&buffer);
   pk.pack_map(3);
@@ -345,9 +355,12 @@ TEST(StateMachineServiceTest, ApplyReportsAWrongTypedFieldAsInternal) {
 
   const grpc::Status status = service.Apply(nullptr, &request, &reply);
 
-  EXPECT_EQ(status.error_code(), grpc::StatusCode::INTERNAL);
+  EXPECT_TRUE(status.ok());
   EXPECT_FALSE(reply.success());
-  EXPECT_FALSE(reply.error().empty());
+  // rfind(prefix, 0) == 0 is "starts with" without pulling in gmock (the
+  // test target links gtest only, and CI installs libgtest-dev alone).
+  EXPECT_EQ(reply.error().rfind("malformed payload: ", 0), 0u)
+      << "error was: " << reply.error();
   EXPECT_EQ(store.writes, 0);
 }
 

@@ -367,9 +367,17 @@ private:
       return;
     }
 
-    // Read remaining body if needed
-    while (parsed_request->body.size() <
-           static_cast<size_t>(parsed_request->content_length)) {
+    // Read remaining body if needed.
+    //
+    // The `> 0` guard is belt-and-braces against a negative content_length
+    // reaching here: the cast below is to size_t, so a negative value becomes
+    // enormous and this loop would never terminate. HttpRequestParser already
+    // rejects negatives into bad_content_length, but this loop runs BEFORE the
+    // handler gets a chance to turn that into a 400, so it must be safe on its
+    // own.
+    while (parsed_request->content_length > 0 &&
+           parsed_request->body.size() <
+               static_cast<size_t>(parsed_request->content_length)) {
       int n = recv(client_socket, buffer.data(), buffer.size(), 0);
       if (n <= 0)
         break;

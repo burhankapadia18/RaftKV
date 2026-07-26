@@ -92,18 +92,23 @@ public:
       return grpc::Status::OK;
 
     } catch (const std::exception &e) {
-      // Malformed MsgPack. Note this arm returns a non-OK gRPC status, which
-      // means the fields set on `reply` never reach the caller: gRPC does
-      // not deliver a response message alongside an error status. The error
-      // is set anyway so the two failure shapes stay consistent for in-process
-      // callers (and unit tests), and because the Go FSM treats a transport
-      // error and success=false identically. Preserving the pre-Phase-1 status
-      // here is deliberate: changing it would change which of the two paths a
-      // malformed payload takes.
-      std::cerr << "[StateMachine] Error: " << e.what() << std::endl;
+      // Malformed MsgPack is a DETERMINISTIC rejection, exactly like a failed
+      // validation: the verdict is a pure function of the entry's bytes, so
+      // every replica decoding this entry reaches it independently and
+      // identically. It is reported the same way — gRPC OK, success=false,
+      // reason in `error`.
+      //
+      // Returning a non-OK status here (as this did before) was wrong twice
+      // over. gRPC does not deliver a response message alongside an error
+      // status, so the `error` field was unobservable on the wire; and the Go
+      // FSM routes transport errors down its "THIS REPLICA MAY NOW BE
+      // DIVERGED" branch, so every bad-msgpack write any client sent raised a
+      // false divergence alarm on all three nodes. Nothing was diverged.
+      std::cerr << "[StateMachine] Rejected: malformed payload: " << e.what()
+                << std::endl;
       reply->set_success(false);
-      reply->set_error(e.what());
-      return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+      reply->set_error(std::string("malformed payload: ") + e.what());
+      return grpc::Status::OK;
     }
   }
 

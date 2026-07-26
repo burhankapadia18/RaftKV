@@ -123,9 +123,12 @@ public:
 private:
   std::unique_ptr<consensus::RaftNode::Stub> stub_;
 
-  // Must stay ABOVE the sidecar's proposeTimeout (4s, in
-  // go-sidecar/internal/rpc/server.go) so a slow commit comes back as the
-  // sidecar's structured reason rather than as a bare DEADLINE_EXCEEDED here.
+  // Above the sidecar's proposeTimeout (4s, go-sidecar/internal/rpc/server.go)
+  // so that when that timeout DOES apply — it only bounds the raft enqueue, not
+  // commit-and-apply — the sidecar wins the race and answers with a structured
+  // reason instead of this deadline firing. For a wedged state machine there is
+  // no bound on the sidecar side, so DEADLINE_EXCEEDED here is still reachable
+  // and ProposeResult carries it as such.
   static constexpr std::chrono::seconds kDefaultTimeout{5};
 
   /** @brief Stand-in when the sidecar reports failure with no reason. */
