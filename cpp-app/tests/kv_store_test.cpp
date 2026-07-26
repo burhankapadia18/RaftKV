@@ -1,31 +1,117 @@
 /**
  * @file kv_store_test.cpp
- * @brief Unit tests for PersistentKVStore (spec R0.11).
+ * @brief Unit tests for PersistentKVStore (spec R0.11, rewritten for Phase 2).
  *
- * Two jobs here:
- *   1. Pin the basic IKVStore contract (set/get/remove/contains, reload).
- *   2. Pin the CURRENT LOSSY on-disk format. `persist()` writes one
- *      "key=value\n" line per entry and `load()` splits each line at the FIRST
- *      '=', dropping any line without one. That mangles keys containing '=' and
- *      truncates anything containing a newline. Phase 2 (R2.1) replaces this
- *      with a length-prefixed binary format; these tests are the "before"
- *      picture that proves it.
+ * Three jobs here:
+ *   1. Pin the IKVStore contract (set/get/remove/contains, reload). Unchanged
+ *      from Phase 0 - Phase 2 replaced the persistence strategy underneath the
+ *      interface without changing the interface.
+ *   2. Pin the NEW on-disk format (R2.1): a base file of magic "KVB1", a
+ *      uint32 entry count and length-prefixed key/value blobs, written
+ *      atomically, plus a write-ahead log next to it carrying every mutation.
+ *   3. Prove the durability properties the phase exists for: writes survive
+ *      without any base-file rewrite (R2.7), legacy files migrate (R2.3), the
+ *      WAL compacts (R2.6), and a corrupt or torn file fails loudly instead of
+ *      loading garbage (R2.5).
+ *
+ * The Phase 0 version of this file pinned the *lossiness* of the old
+ * "key=value\n" format: keys containing '=' were rewritten, anything
+ * containing a newline was truncated. Those tests documented a format that no
+ * longer exists. Their replacements below assert exact round-trips on the same
+ * inputs, and that flip is the proof R2.1 did what it set out to do.
  */
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 
+#include <msgpack.hpp>
+
+#include "commands/kv_command.hpp"
+#include "storage/format.hpp"
 #include "storage/kv_store.hpp"
 
 namespace kvdb {
 namespace {
+
+// --- Expected-bytes builders ----------------------------------------------
+//
+// Written by hand rather than through format::append_u32/append_blob on
+// purpose: a test that encodes with the same helper it is checking would pass
+// for any self-consistent format, including a wrong one.
+
+/** @brief Little-endian uint32, four bytes. */
+std::string u32le(uint32_t value) {
+  std::string out(4, '\0');
+  out[0] = static_cast<char>(value & 0xFFu);
+  out[1] = static_cast<char>((value >> 8) & 0xFFu);
+  out[2] = static_cast<char>((value >> 16) & 0xFFu);
+  out[3] = static_cast<char>((value >> 24) & 0xFFu);
+  return out;
+}
+
+/** @brief uint32 length prefix followed by the raw bytes. */
+std::string blob(const std::string &bytes) {
+  return u32le(static_cast<uint32_t>(bytes.size())) + bytes;
+}
+
+/** @brief The exact base file expected for @p entries, in the given order. */
+std::string
+kvb1(const std::vector<std::pair<std::string, std::string>> &entries) {
+  std::string out = "KVB1";
+  out += u32le(static_cast<uint32_t>(entries.size()));
+  for (const auto &entry : entries) {
+    out += blob(entry.first);
+    out += blob(entry.second);
+  }
+  return out;
+}
+
+/** @brief Msgpack-encode a KVCommand the way the WAL stores one. */
+std::string pack_command(const std::string &op, const std::string &key,
+                         const std::string &value) {
+  KVCommand cmd;
+  cmd.op = op;
+  cmd.key = key;
+  cmd.value = value;
+
+  msgpack::sbuffer buffer;
+  msgpack::pack(buffer, cmd);
+  return std::string(buffer.data(), buffer.size());
+}
+
+/**
+ * @brief Valid msgpack that is not a KVCommand.
+ *
+ * A bare string decodes fine as msgpack but cannot convert to the map
+ * KVCommand expects, so from_msgpack() throws - which is the case the store
+ * has to treat as "stop replaying here".
+ */
+std::string pack_non_command() {
+  msgpack::sbuffer buffer;
+  msgpack::pack(buffer, std::string("this is not a command"));
+  return std::string(buffer.data(), buffer.size());
+}
+
+void expect_value(const IKVStore &store, const std::string &key,
+                  const std::string &expected) {
+  const std::optional<std::string> actual = store.get(key);
+  ASSERT_TRUE(actual.has_value()) << "expected key to be present: " << key;
+  EXPECT_EQ(*actual, expected);
+}
+
+// --- Fixture ---------------------------------------------------------------
 
 class PersistentKVStoreTest : public ::testing::Test {
 protected:
@@ -41,35 +127,97 @@ protected:
     name += ".db";
 
     db_path_ = std::filesystem::temp_directory_path() / name;
-    remove_db_file();
+    wal_path_ = db_path_;
+    wal_path_.replace_extension(".wal");
+    remove_files();
   }
 
-  void TearDown() override { remove_db_file(); }
+  void TearDown() override { remove_files(); }
 
   [[nodiscard]] std::string path() const { return db_path_.string(); }
 
-  /** @brief Read the whole db file back, byte for byte. */
-  [[nodiscard]] std::string read_file() const {
-    std::ifstream file(db_path_, std::ios::binary);
+  /** @brief Read the base file back, byte for byte ("" if absent). */
+  [[nodiscard]] std::string read_db_file() const {
+    return read_whole(db_path_);
+  }
+
+  /** @brief Read the WAL back, byte for byte ("" if absent or truncated). */
+  [[nodiscard]] std::string read_wal_file() const {
+    return read_whole(wal_path_);
+  }
+
+  /** @brief Overwrite the base file behind the store's back. */
+  void write_db_file(const std::string &contents) const {
+    std::ofstream file(db_path_, std::ios::binary | std::ios::trunc);
+    file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  }
+
+  /** @brief Append one well-framed WAL record: len | payload | crc32. */
+  void append_wal_record(const std::string &payload) const {
+    std::string record = u32le(static_cast<uint32_t>(payload.size()));
+    record += payload;
+    record += u32le(format::crc32(payload));
+
+    std::ofstream file(wal_path_, std::ios::binary | std::ios::app);
+    file.write(record.data(), static_cast<std::streamsize>(record.size()));
+  }
+
+  /** @brief Chop @p bytes off the end of the WAL, simulating a torn append. */
+  void chop_wal_tail(size_t bytes) const {
+    const size_t size =
+        static_cast<size_t>(std::filesystem::file_size(wal_path_));
+    ASSERT_GT(size, bytes);
+    std::filesystem::resize_file(wal_path_, size - bytes);
+  }
+
+  /**
+   * @brief Write @p contents as the base file and assert the store refuses it.
+   *
+   * "Refuses" means a std::runtime_error naming the file and the problem - not
+   * a crash, not an out-of-bounds read, and not a silent partial load.
+   */
+  void expect_corrupt_base(const std::string &contents) const {
+    write_db_file(contents);
+    try {
+      const PersistentKVStore store(path());
+      ADD_FAILURE() << "expected a corrupt base file error; the store loaded";
+    } catch (const std::runtime_error &error) {
+      const std::string message = error.what();
+      EXPECT_NE(message.find("corrupt base file"), std::string::npos)
+          << message;
+      EXPECT_NE(message.find(path()), std::string::npos) << message;
+    }
+  }
+
+  std::filesystem::path db_path_;
+  std::filesystem::path wal_path_;
+
+private:
+  [[nodiscard]] static std::string
+  read_whole(const std::filesystem::path &file_path) {
+    std::ifstream file(file_path, std::ios::binary);
     std::ostringstream contents;
     contents << file.rdbuf();
     return contents.str();
   }
 
-  /** @brief Overwrite the db file behind the store's back. */
-  void write_file(const std::string &contents) const {
-    std::ofstream file(db_path_, std::ios::binary | std::ios::trunc);
-    file << contents;
-  }
-
-  std::filesystem::path db_path_;
-
-private:
-  void remove_db_file() const {
+  void remove_files() const {
     std::error_code ec;
     std::filesystem::remove(db_path_, ec);
+    std::filesystem::remove(wal_path_, ec);
+    // atomic_write_file() stages through "<path>.tmp"; a failed write can
+    // leave one behind.
+    std::filesystem::remove(db_path_.string() + ".tmp", ec);
   }
 };
+
+/** @brief Options that keep tests off fsync; durability is asserted by shape,
+ *         not by timing. */
+DurabilityOptions fast_options() {
+  DurabilityOptions options;
+  options.sync_mode = WalSyncMode::kNever;
+  return options;
+}
 
 // --- Basic contract -------------------------------------------------------
 
@@ -82,208 +230,522 @@ TEST_F(PersistentKVStoreTest, ConstructionOnMissingFileYieldsEmptyStore) {
   ASSERT_NE(store, nullptr);
   EXPECT_FALSE(store->contains("anything"));
   EXPECT_FALSE(store->get("anything").has_value());
-  // load() opens the file read-only, so a pure reader never creates it.
+  // Recovery only reads, so a store that is never written to creates no base
+  // file.
   EXPECT_FALSE(std::filesystem::exists(db_path_));
 }
 
 TEST_F(PersistentKVStoreTest, GetOnAbsentKeyReturnsNullopt) {
-  PersistentKVStore store(path());
+  PersistentKVStore store(path(), fast_options());
 
   EXPECT_FALSE(store.get("nope").has_value());
   EXPECT_FALSE(store.contains("nope"));
 }
 
 TEST_F(PersistentKVStoreTest, SetThenGetAndContains) {
-  PersistentKVStore store(path());
+  PersistentKVStore store(path(), fast_options());
 
   store.set("alpha", "beta");
 
-  ASSERT_TRUE(store.get("alpha").has_value());
-  EXPECT_EQ(*store.get("alpha"), "beta");
+  expect_value(store, "alpha", "beta");
   EXPECT_TRUE(store.contains("alpha"));
   EXPECT_FALSE(store.contains("Alpha")); // keys are case sensitive
 }
 
 TEST_F(PersistentKVStoreTest, RemoveExistingKeyReturnsTrueAndPersists) {
-  PersistentKVStore store(path());
-  store.set("alpha", "beta");
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("alpha", "beta");
 
-  EXPECT_TRUE(store.remove("alpha"));
+    EXPECT_TRUE(store.remove("alpha"));
+    EXPECT_FALSE(store.contains("alpha"));
+    EXPECT_FALSE(store.get("alpha").has_value());
+  }
 
-  EXPECT_FALSE(store.contains("alpha"));
-  EXPECT_FALSE(store.get("alpha").has_value());
-  EXPECT_EQ(read_file(), ""); // the rewrite emptied the file
+  const PersistentKVStore reloaded(path(), fast_options());
+  EXPECT_FALSE(reloaded.contains("alpha"));
 }
 
-TEST_F(PersistentKVStoreTest,
-       RemoveAbsentKeyReturnsFalseAndDoesNotRewriteFile) {
-  PersistentKVStore store(path());
+TEST_F(PersistentKVStoreTest, RemoveAbsentKeyReturnsFalseAndDoesNotTouchDisk) {
+  PersistentKVStore store(path(), fast_options());
   store.set("alpha", "beta");
 
-  // Clobber the file behind the store's back; a rewrite would restore
-  // "alpha=beta\n" from the in-memory map.
-  const std::string sentinel = "SENTINEL_NOT_REWRITTEN\n";
-  write_file(sentinel);
+  const std::string wal_before = read_wal_file();
+  ASSERT_FALSE(wal_before.empty());
 
   EXPECT_FALSE(store.remove("missing"));
-  EXPECT_EQ(read_file(), sentinel);
+  EXPECT_EQ(read_wal_file(), wal_before); // no record was appended
 
-  // ...and removing a key that IS present does rewrite.
+  // ...while removing a key that IS present does log something.
   EXPECT_TRUE(store.remove("alpha"));
-  EXPECT_EQ(read_file(), "");
+  EXPECT_GT(read_wal_file().size(), wal_before.size());
 }
 
-TEST_F(PersistentKVStoreTest, OverwriteDoesNotAccumulateDuplicateLines) {
-  PersistentKVStore store(path());
+TEST_F(PersistentKVStoreTest, OverwriteKeepsOnlyTheLatestValue) {
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("k", "v1");
+    store.set("k", "v2");
+    expect_value(store, "k", "v2");
+  }
 
-  store.set("k", "v1");
-  store.set("k", "v2");
-
-  // persist() truncates and rewrites the whole map, so there is exactly one
-  // line for the key.
-  EXPECT_EQ(read_file(), "k=v2\n");
-
-  const PersistentKVStore reloaded(path());
-  ASSERT_TRUE(reloaded.get("k").has_value());
-  EXPECT_EQ(*reloaded.get("k"), "v2");
+  const PersistentKVStore reloaded(path(), fast_options());
+  expect_value(reloaded, "k", "v2");
 }
 
 TEST_F(PersistentKVStoreTest, PersistenceRoundTripAcrossInstances) {
   {
-    PersistentKVStore store(path());
+    PersistentKVStore store(path(), fast_options());
     store.set("one", "1");
     store.set("two", "2");
     store.set("three", "3");
     EXPECT_TRUE(store.remove("two"));
   }
 
-  const PersistentKVStore reloaded(path());
+  const PersistentKVStore reloaded(path(), fast_options());
 
-  ASSERT_TRUE(reloaded.get("one").has_value());
-  EXPECT_EQ(*reloaded.get("one"), "1");
-  ASSERT_TRUE(reloaded.get("three").has_value());
-  EXPECT_EQ(*reloaded.get("three"), "3");
+  expect_value(reloaded, "one", "1");
+  expect_value(reloaded, "three", "3");
   EXPECT_FALSE(reloaded.contains("two"));
-}
-
-// --- On-disk format -------------------------------------------------------
-
-TEST_F(PersistentKVStoreTest, PersistUsesKeyEqualsValueLineFormat) {
-  PersistentKVStore store(path());
-
-  store.set("alpha", "beta");
-
-  // Single entry, so the unordered_map iteration order cannot matter.
-  EXPECT_EQ(read_file(), "alpha=beta\n");
 }
 
 TEST_F(PersistentKVStoreTest, EmptyValueRoundTrips) {
   {
-    PersistentKVStore store(path());
+    PersistentKVStore store(path(), fast_options());
     store.set("k", "");
-    EXPECT_EQ(read_file(), "k=\n");
   }
 
-  const PersistentKVStore reloaded(path());
-
-  ASSERT_TRUE(reloaded.get("k").has_value());
-  EXPECT_EQ(*reloaded.get("k"), "");
+  const PersistentKVStore reloaded(path(), fast_options());
+  expect_value(reloaded, "k", "");
 }
 
-TEST_F(PersistentKVStoreTest, LoadSkipsLinesWithoutAnEqualsSign) {
-  write_file("garbage-line\nk=v\n\nanother\n");
+// --- On-disk base format (R2.1/R2.2) ---------------------------------------
 
-  const PersistentKVStore store(path());
+TEST_F(PersistentKVStoreTest, BaseFileUsesTheKvb1BinaryLayout) {
+  // Replaces the Phase 0 PersistUsesKeyEqualsValueLineFormat: the on-disk shape
+  // this pins is the length-prefixed binary one from R2.1.
+  DurabilityOptions options = fast_options();
+  options.wal_max_records = 1; // compact after every write
 
-  ASSERT_TRUE(store.get("k").has_value());
-  EXPECT_EQ(*store.get("k"), "v");
-  EXPECT_FALSE(store.contains("garbage-line"));
-  EXPECT_FALSE(store.contains("another"));
+  PersistentKVStore store(path(), options);
+  store.set("alpha", "beta");
+
+  // Single entry, so unordered_map iteration order cannot matter.
+  const std::string expected =
+      std::string("KVB1") + u32le(1) + u32le(5) + "alpha" + u32le(4) + "beta";
+  EXPECT_EQ(read_db_file(), expected);
+  EXPECT_EQ(read_db_file(), kvb1({{"alpha", "beta"}}));
 }
 
-// --- CURRENT LOSSY BEHAVIOR (pinned for Phase 2) --------------------------
+TEST_F(PersistentKVStoreTest, EmptyStoreSerialisesToMagicAndAZeroCount) {
+  DurabilityOptions options = fast_options();
+  options.wal_max_records = 1;
 
-TEST_F(PersistentKVStoreTest, ValueContainingEqualsSurvivesReload) {
-  // load() splits at the FIRST '=', so extra '=' inside the *value* is safe.
+  PersistentKVStore store(path(), options);
+  store.set("k", "v");
+  EXPECT_TRUE(store.remove("k"));
+
+  EXPECT_EQ(read_db_file(), kvb1({}));
+  EXPECT_EQ(read_db_file().size(), 8u);
+}
+
+TEST_F(PersistentKVStoreTest, WalPathIsDerivedFromTheBaseFilePath) {
+  EXPECT_EQ(PersistentKVStore::wal_path_for("kv.db"), "kv.wal");
+  EXPECT_EQ(PersistentKVStore::wal_path_for("/var/lib/kvdb/kv.db"),
+            "/var/lib/kvdb/kv.wal");
+  // No ".db" suffix: just append.
+  EXPECT_EQ(PersistentKVStore::wal_path_for("data"), "data.wal");
+  EXPECT_EQ(PersistentKVStore::wal_path_for("data.dbx"), "data.dbx.wal");
+  EXPECT_EQ(PersistentKVStore::wal_path_for("db"), "db.wal");
+}
+
+// --- Binary-hostile keys and values ---------------------------------------
+//
+// Every test in this section replaces a Phase 0 test that pinned the OPPOSITE
+// outcome. The line-based format had no escaping, so '=' and '\n' were
+// ambiguous with its own delimiters; R2.1's length prefixes remove the
+// ambiguity entirely, and "the value comes back exactly as it went in" is now
+// simply true for arbitrary bytes.
+
+TEST_F(PersistentKVStoreTest, ValueContainingEqualsRoundTripsExactly) {
   {
-    PersistentKVStore store(path());
+    PersistentKVStore store(path(), fast_options());
     store.set("k", "a=b=c");
-    EXPECT_EQ(read_file(), "k=a=b=c\n");
   }
 
-  const PersistentKVStore reloaded(path());
-
-  ASSERT_TRUE(reloaded.get("k").has_value());
-  EXPECT_EQ(*reloaded.get("k"), "a=b=c");
+  const PersistentKVStore reloaded(path(), fast_options());
+  expect_value(reloaded, "k", "a=b=c");
 }
 
-TEST_F(PersistentKVStoreTest, KeyContainingEqualsIsCorruptedByReload) {
-  // CURRENT LOSSY BEHAVIOR, pinned so Phase 2 (R2.1, length-prefixed binary
-  // format) can prove it is fixed: the key "a=b" is written as "a=b=v" and read
-  // back as key "a" with value "b=v" - the key that was written is gone.
+TEST_F(PersistentKVStoreTest, KeyContainingEqualsRoundTripsExactly) {
+  // Was KeyContainingEqualsIsCorruptedByReload: "a=b" used to be written as
+  // "a=b=v" and read back as key "a" with value "b=v", losing the key that was
+  // actually written. R2.1 length-prefixes the key, so there is nothing left to
+  // misparse.
   {
-    PersistentKVStore store(path());
+    PersistentKVStore store(path(), fast_options());
     store.set("a=b", "v");
-    EXPECT_EQ(read_file(), "a=b=v\n");
-    ASSERT_TRUE(store.get("a=b").has_value()); // still fine in memory
-    EXPECT_EQ(*store.get("a=b"), "v");
   }
 
-  const PersistentKVStore reloaded(path());
+  const PersistentKVStore reloaded(path(), fast_options());
 
-  EXPECT_FALSE(reloaded.get("a=b").has_value());
-  ASSERT_TRUE(reloaded.get("a").has_value());
-  EXPECT_EQ(*reloaded.get("a"), "b=v");
+  expect_value(reloaded, "a=b", "v");
+  EXPECT_FALSE(reloaded.contains("a")); // no phantom key invented
 }
 
-TEST_F(PersistentKVStoreTest, ValueContainingNewlineIsTruncatedByReload) {
-  // CURRENT LOSSY BEHAVIOR, pinned for Phase 2: the value spans two lines on
-  // disk; the second line has no '=' so load() drops it entirely and the value
-  // silently loses everything after the first newline.
+TEST_F(PersistentKVStoreTest, ValueContainingNewlineRoundTripsExactly) {
+  // Was ValueContainingNewlineIsTruncatedByReload: the value used to span two
+  // lines on disk and everything after the first newline was silently dropped.
   {
-    PersistentKVStore store(path());
+    PersistentKVStore store(path(), fast_options());
     store.set("k", "line1\nline2");
-    EXPECT_EQ(read_file(), "k=line1\nline2\n");
   }
 
-  const PersistentKVStore reloaded(path());
+  const PersistentKVStore reloaded(path(), fast_options());
 
-  ASSERT_TRUE(reloaded.get("k").has_value());
-  EXPECT_EQ(*reloaded.get("k"), "line1");
+  expect_value(reloaded, "k", "line1\nline2");
   EXPECT_FALSE(reloaded.contains("line2"));
 }
 
-TEST_F(PersistentKVStoreTest, KeyContainingNewlineIsReplacedByReload) {
-  // CURRENT LOSSY BEHAVIOR, pinned for Phase 2: "a\nb" is written as two lines,
-  // "a" (dropped: no '=') and "b=v", so reload invents a key "b" that was never
-  // written and loses the one that was.
+TEST_F(PersistentKVStoreTest, KeyContainingNewlineRoundTripsExactly) {
+  // Was KeyContainingNewlineIsReplacedByReload: "a\nb" used to be written as
+  // two lines, so reload invented a key "b" and lost the one that was written.
   {
-    PersistentKVStore store(path());
+    PersistentKVStore store(path(), fast_options());
     store.set("a\nb", "v");
-    EXPECT_EQ(read_file(), "a\nb=v\n");
   }
 
-  const PersistentKVStore reloaded(path());
+  const PersistentKVStore reloaded(path(), fast_options());
 
-  EXPECT_FALSE(reloaded.get("a\nb").has_value());
-  ASSERT_TRUE(reloaded.get("b").has_value());
-  EXPECT_EQ(*reloaded.get("b"), "v");
+  expect_value(reloaded, "a\nb", "v");
+  EXPECT_FALSE(reloaded.contains("b"));
+}
+
+TEST_F(PersistentKVStoreTest, KeyAndValueOfArbitraryBytesRoundTripExactly) {
+  // The acceptance case for R2.1, all three hostile bytes at once, in both
+  // positions, including a trailing NUL that a C-string-based format would eat.
+  const std::string key("k\0ey=with\nall", 13);
+  const std::string value("v\0al=ue\nbytes\0", 14);
+  ASSERT_EQ(key.size(), 13u);
+  ASSERT_EQ(value.size(), 14u);
+
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set(key, value);
+  }
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  const std::optional<std::string> actual = reloaded.get(key);
+  ASSERT_TRUE(actual.has_value());
+  EXPECT_EQ(*actual, value);
+  EXPECT_EQ(actual->size(), 14u);
 }
 
 TEST_F(PersistentKVStoreTest, ValueContainingNulSurvivesReload) {
-  // NUL is not special to the line format, so unlike '=' and '\n' it makes it
-  // back intact. Pinned so Phase 2 does not regress it.
+  // True before Phase 2 and still true: pinned so the binary format does not
+  // regress the one hostile byte the line format happened to handle.
   const std::string value("a\0b", 3);
   {
-    PersistentKVStore store(path());
+    PersistentKVStore store(path(), fast_options());
     store.set("k", value);
   }
 
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  const std::optional<std::string> actual = reloaded.get("k");
+  ASSERT_TRUE(actual.has_value());
+  EXPECT_EQ(*actual, value);
+  EXPECT_EQ(actual->size(), 3u);
+}
+
+// --- WAL-backed durability (R2.5/R2.7) -------------------------------------
+
+TEST_F(PersistentKVStoreTest, WritesSurviveWithoutAnyBaseFileRewrite) {
+  // The crash-safety property, and the only test that runs the *default*
+  // DurabilityOptions end to end: WalSyncMode::kAlways, so every append below
+  // really did fsync. The store is then dropped without any clean shutdown,
+  // and with the default thresholds nothing ever rewrote the base file - so
+  // everything below came back out of the WAL alone. A kill -9 at any point
+  // after set() returned leaves exactly this on disk.
+  {
+    PersistentKVStore store(path());
+    store.set("a", "1");
+    store.set("b", "2");
+    store.set("a", "1-updated");
+    EXPECT_TRUE(store.remove("b"));
+    store.set("c", "3");
+  }
+
+  EXPECT_FALSE(std::filesystem::exists(db_path_)) << "no base file was written";
+  EXPECT_GT(read_wal_file().size(), 0u);
+
   const PersistentKVStore reloaded(path());
 
-  ASSERT_TRUE(reloaded.get("k").has_value());
-  EXPECT_EQ(*reloaded.get("k"), value);
-  EXPECT_EQ(reloaded.get("k")->size(), 3u);
+  expect_value(reloaded, "a", "1-updated");
+  expect_value(reloaded, "c", "3");
+  EXPECT_FALSE(reloaded.contains("b")); // the DELETE replayed too
+}
+
+TEST_F(PersistentKVStoreTest, WalIsReplayedOnTopOfTheBaseFile) {
+  DurabilityOptions options = fast_options();
+  options.wal_max_records = 1; // force a base file after the first write
+
+  {
+    PersistentKVStore store(path(), options);
+    store.set("base", "from-base-file");
+    ASSERT_EQ(read_wal_file().size(), 0u);
+  }
+
+  // Now append records the base file knows nothing about.
+  append_wal_record(pack_command("SET", "later", "from-wal"));
+  append_wal_record(pack_command("DELETE", "base", ""));
+
+  const PersistentKVStore reloaded(path(), options);
+
+  expect_value(reloaded, "later", "from-wal");
+  EXPECT_FALSE(reloaded.contains("base")); // WAL wins, it is newer
+}
+
+TEST_F(PersistentKVStoreTest, TornWalTailIsDroppedAndEarlierWritesSurvive) {
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("a", "1");
+    store.set("b", "2");
+  }
+
+  // Chop three bytes: the last record's trailing CRC is now a short read, the
+  // exact shape of a crash part-way through an append.
+  chop_wal_tail(3);
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  expect_value(reloaded, "a", "1");
+  EXPECT_FALSE(reloaded.contains("b"));
+}
+
+TEST_F(PersistentKVStoreTest, UndecodableWalRecordStopsReplayAndHealsTheWal) {
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("a", "1");
+  }
+
+  // A perfectly framed, correctly checksummed record whose payload is not a
+  // KVCommand, followed by a good one. Replay must stop at the bad record
+  // rather than skip it: the record it cannot read might have been a DELETE,
+  // and applying what came after would rebuild a state that never existed.
+  append_wal_record(pack_non_command());
+  append_wal_record(pack_command("SET", "b", "2"));
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  expect_value(reloaded, "a", "1");
+  EXPECT_FALSE(reloaded.contains("b"));
+
+  // Healed: the recovered prefix is now the base file and the refused tail is
+  // gone, so the next start does not hit it again.
+  EXPECT_EQ(read_db_file(), kvb1({{"a", "1"}}));
+  EXPECT_EQ(read_wal_file().size(), 0u);
+}
+
+TEST_F(PersistentKVStoreTest, InvalidCommandInWalStopsReplayToo) {
+  append_wal_record(pack_command("SET", "a", "1"));
+  append_wal_record(pack_command("BOGUS", "b", "2")); // unknown operation
+  append_wal_record(pack_command("SET", "c", "3"));
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  expect_value(reloaded, "a", "1");
+  EXPECT_FALSE(reloaded.contains("b"));
+  EXPECT_FALSE(reloaded.contains("c"));
+}
+
+// --- Compaction (R2.6) ------------------------------------------------------
+
+TEST_F(PersistentKVStoreTest, RecordThresholdTriggersCompaction) {
+  DurabilityOptions options = fast_options();
+  options.wal_max_records = 3;
+
+  {
+    PersistentKVStore store(path(), options);
+    store.set("a", "1");
+    store.set("b", "2");
+
+    const size_t before = read_wal_file().size();
+    EXPECT_GT(before, 0u);
+    EXPECT_FALSE(std::filesystem::exists(db_path_));
+
+    store.set("c", "3"); // third record reaches the threshold
+
+    EXPECT_EQ(read_wal_file().size(), 0u) << "WAL should have been truncated";
+    EXPECT_TRUE(std::filesystem::exists(db_path_));
+    EXPECT_EQ(read_db_file().substr(0, 4), "KVB1");
+  }
+
+  const PersistentKVStore reloaded(path(), options);
+  expect_value(reloaded, "a", "1");
+  expect_value(reloaded, "b", "2");
+  expect_value(reloaded, "c", "3");
+}
+
+TEST_F(PersistentKVStoreTest, ByteThresholdTriggersCompaction) {
+  DurabilityOptions options = fast_options();
+  options.wal_max_bytes = 1; // any append at all reaches it
+
+  PersistentKVStore store(path(), options);
+  store.set("k", "v");
+
+  EXPECT_EQ(read_wal_file().size(), 0u);
+  EXPECT_EQ(read_db_file(), kvb1({{"k", "v"}}));
+}
+
+TEST_F(PersistentKVStoreTest, CompactionKeepsTheWalBoundedOverManyWrites) {
+  DurabilityOptions options = fast_options();
+  options.wal_max_records = 4;
+
+  PersistentKVStore store(path(), options);
+  for (int i = 0; i < 50; ++i) {
+    store.set("key" + std::to_string(i), std::to_string(i));
+    // Never more than the threshold's worth of records outstanding.
+    EXPECT_LT(read_wal_file().size(), 4u * 64u);
+  }
+
+  expect_value(store, "key0", "0");
+  expect_value(store, "key49", "49");
+}
+
+// --- Legacy migration (R2.3) -----------------------------------------------
+
+TEST_F(PersistentKVStoreTest, LegacyFileIsMigratedToTheBinaryFormatOnLoad) {
+  write_db_file("alpha=beta\n");
+
+  {
+    const PersistentKVStore store(path(), fast_options());
+    expect_value(store, "alpha", "beta");
+  }
+
+  // Rewritten during construction, so the next start takes the fast path.
+  EXPECT_EQ(read_db_file(), kvb1({{"alpha", "beta"}}));
+
+  const PersistentKVStore reloaded(path(), fast_options());
+  expect_value(reloaded, "alpha", "beta");
+  EXPECT_EQ(read_db_file(), kvb1({{"alpha", "beta"}}));
+}
+
+TEST_F(PersistentKVStoreTest, MigrationReadsEveryLegacyLine) {
+  write_db_file("one=1\ntwo=2\nthree=3\n");
+
+  const PersistentKVStore store(path(), fast_options());
+
+  expect_value(store, "one", "1");
+  expect_value(store, "two", "2");
+  expect_value(store, "three", "3");
+  // Three entries, so the exact byte order depends on unordered_map iteration;
+  // the magic is the part worth pinning here.
+  EXPECT_EQ(read_db_file().substr(0, 4), "KVB1");
+}
+
+TEST_F(PersistentKVStoreTest, MigrationSkipsLegacyLinesWithoutAnEqualsSign) {
+  // Was LoadSkipsLinesWithoutAnEqualsSign. The rule itself is unchanged - it
+  // just belongs to the legacy reader now, which is kept bug-compatible on
+  // purpose so files written by the old code decode to what they always did.
+  write_db_file("garbage-line\nk=v\n\nanother\n");
+
+  const PersistentKVStore store(path(), fast_options());
+
+  expect_value(store, "k", "v");
+  EXPECT_FALSE(store.contains("garbage-line"));
+  EXPECT_FALSE(store.contains("another"));
+  EXPECT_EQ(read_db_file(), kvb1({{"k", "v"}}));
+}
+
+TEST_F(PersistentKVStoreTest, MigrationSplitsLegacyLinesAtTheFirstEquals) {
+  // The old writer produced this for key "a" / value "b=v" AND for key "a=b" /
+  // value "v"; the format cannot tell them apart. Migration resolves it the
+  // same way the old reader did rather than guessing differently.
+  write_db_file("a=b=v\n");
+
+  const PersistentKVStore store(path(), fast_options());
+
+  expect_value(store, "a", "b=v");
+  EXPECT_FALSE(store.contains("a=b"));
+}
+
+TEST_F(PersistentKVStoreTest, EmptyLegacyFileMigratesToAnEmptyBaseFile) {
+  write_db_file("");
+
+  const PersistentKVStore store(path(), fast_options());
+
+  EXPECT_FALSE(store.contains("anything"));
+  EXPECT_EQ(read_db_file(), kvb1({}));
+}
+
+// --- Corrupt base file (R2.1 bounds checking) -------------------------------
+
+TEST_F(PersistentKVStoreTest, TruncatedEntryCountIsRejected) {
+  expect_corrupt_base(std::string("KVB1") + "ab"); // 2 of the 4 count bytes
+}
+
+TEST_F(PersistentKVStoreTest, EntryCountLargerThanTheFileIsRejected) {
+  // The classic length-lie: a count no amount of remaining bytes could hold.
+  // It must be refused before it is used to size anything.
+  expect_corrupt_base(std::string("KVB1") + u32le(0xFFFFFFFFu));
+}
+
+TEST_F(PersistentKVStoreTest, TruncatedEntryIsRejected) {
+  std::string contents = "KVB1";
+  contents += u32le(1);
+  contents += u32le(5);
+  contents += "alph"; // key_len says 5, only 4 bytes follow
+
+  expect_corrupt_base(contents);
+}
+
+TEST_F(PersistentKVStoreTest, BlobLengthOverrunningTheFileIsRejected) {
+  std::string contents = "KVB1";
+  contents += u32le(1);
+  contents += u32le(1);
+  contents += "k";
+  contents += u32le(0x7FFFFFFFu); // value_len far past the end
+  contents += "v";
+
+  expect_corrupt_base(contents);
+}
+
+TEST_F(PersistentKVStoreTest, TrailingBytesAfterTheLastEntryAreRejected) {
+  expect_corrupt_base(kvb1({{"a", "b"}}) + "junk");
+}
+
+TEST_F(PersistentKVStoreTest,
+       CorruptBinaryFileDoesNotFallBackToTheLegacyParser) {
+  // A file carrying the magic is parsed as binary, period. Falling back to the
+  // legacy line parser here would turn a detectably corrupt file into
+  // plausible-looking data, which is strictly worse than refusing to start.
+  expect_corrupt_base("KVB1k=v\n");
+}
+
+TEST_F(PersistentKVStoreTest, ACorruptBaseFileIsNotPartiallyLoaded) {
+  std::string contents = "KVB1";
+  contents += u32le(2);
+  contents += blob("good");
+  contents += blob("entry");
+  contents += u32le(9); // second entry's key_len lies
+  contents += "short";
+
+  write_db_file(contents);
+
+  try {
+    const PersistentKVStore store(path(), fast_options());
+    ADD_FAILURE() << "expected a corrupt base file error; the store loaded";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string(error.what()).find("corrupt base file"),
+              std::string::npos)
+        << error.what();
+  }
+
+  // The file was left exactly as it was: nothing half-loaded, nothing
+  // helpfully rewritten over the operator's evidence.
+  EXPECT_EQ(read_db_file(), contents);
 }
 
 } // namespace

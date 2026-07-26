@@ -266,6 +266,19 @@ jobs:
       - name: Run e2e tests
         run: pytest tests/e2e -v
 
+      # The Phase 2 crash test (tests/e2e/test_crash.py) is the one test allowed
+      # to touch docker: it SIGKILLs a node, inspects its data directory while it
+      # is dead, and restarts it. pytest.ini deselects the `requires_docker`
+      # marker by default so the step above stays docker-free and portable, so
+      # it has to be selected explicitly here. It runs last because it disturbs
+      # the cluster.
+      #
+      # `-rs` prints skip reasons: the test skips rather than fails when it
+      # cannot do its job (no docker, no compose project, non-local nodes), and
+      # a skip that nobody can see would be a silently unverified requirement.
+      - name: Run crash-recovery test
+        run: pytest tests/e2e -m requires_docker -v -rs
+
       - name: Dump cluster logs
         if: failure()
         run: docker compose logs --no-color --timestamps

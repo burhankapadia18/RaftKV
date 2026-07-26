@@ -38,8 +38,18 @@ The gaps, confirmed by code review:
   no longer a no-op, and `entrypoint.sh` probes the C++ gRPC port instead of
   sleeping. A malformed `Content-Length` no longer crashes the process — that
   was a remote DoS, and there is now an e2e regression test for it.
-- **No durability.** `kv.db` is rewritten wholesale on every write with no fsync
-  and no atomic rename; a crash mid-write corrupts the store.
+- ✅ **The store is crash-safe** (Phase 2, complete). A write is appended to an
+  append-only `kv.wal` and `fsync`ed *before* the in-memory map changes, so an
+  acknowledged write survives `kill -9`; the base file `kv.db` is now a
+  length-prefixed binary format (`KVB1`) written atomically (temp file, `fsync`,
+  `rename`, `fsync` the directory) and only rewritten by compaction, which folds
+  the WAL away once it passes a configured size or record count. Startup loads
+  the base file and replays the WAL over it, healing a torn tail left by a crash
+  mid-append. Keys and values containing `=`, newlines or NUL bytes now
+  round-trip — the Phase 0 tests that pinned the line format's corruption were
+  flipped. A pre-Phase-2 `kv.db` is migrated on first read. An e2e test
+  (`pytest tests/e2e -m requires_docker`) SIGKILLs a node and checks its disk
+  before letting it restart.
 - **No snapshots.** `DiscardSnapshotStore` + `DummySnapshot` mean the raft log
   grows forever, restarts replay the entire history, and a lagging follower can
   never catch up via snapshot transfer.
@@ -100,7 +110,7 @@ criteria) and implementation plan in `docs/phases/`:
 |---|---|---|
 | 0 — Tests and CI | ✅ Complete | [docs/phases/phase-0-tests-and-ci.md](docs/phases/phase-0-tests-and-ci.md) |
 | 1 — Truthful errors | ✅ Complete | [docs/phases/phase-1-truthful-errors.md](docs/phases/phase-1-truthful-errors.md) |
-| 2 — Durability | Not started | [docs/phases/phase-2-durability.md](docs/phases/phase-2-durability.md) |
+| 2 — Durability | ✅ Complete | [docs/phases/phase-2-durability.md](docs/phases/phase-2-durability.md) |
 | 3 — Snapshots & compaction | Not started | [docs/phases/phase-3-snapshots.md](docs/phases/phase-3-snapshots.md) |
 | 4 — Client usability | Not started | [docs/phases/phase-4-client-usability.md](docs/phases/phase-4-client-usability.md) |
 | 5 — Operability | Not started | [docs/phases/phase-5-operability.md](docs/phases/phase-5-operability.md) |
@@ -174,6 +184,10 @@ loop against the C++ gRPC port.
 that names the leader problem; e2e error-path tests pass.
 
 ### Phase 2 — Durability *(the store must survive crashes)*
+
+**Status: ✅ Complete** — see the Outcome section of
+[docs/phases/phase-2-durability.md](docs/phases/phase-2-durability.md) for
+verified results and for the decisions taken where the spec was silent.
 
 2.1 **Atomic persistence.** Replace truncate-rewrite in `PersistentKVStore` with
 write-to-temp + `fsync` + `rename`. Replace the line-based `key=value` format
@@ -307,7 +321,7 @@ README, CHANGELOG, tagged `v1.0.0` with multi-arch images pushed to a registry.
 |---|---|---|---|---|
 | 0 | ✅ Complete | Tests + CI | M | everything |
 | 1 | ✅ Complete | Truthful errors | S–M | 2, 3, 4 |
-| 2 | Not started | Durability (WAL, atomic persist) | M | 3 |
+| 2 | ✅ Complete | Durability (WAL, atomic persist) | M | 3 |
 | 3 | Not started | Snapshots + compaction | L | 4 (wiped-node rejoin) |
 | 4 | Not started | Leader forwarding, consistency, HTTP rework | L | 5, 7 |
 | 5 | Not started | Logging, metrics, lifecycle | M | 7 |

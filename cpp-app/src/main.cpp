@@ -36,7 +36,7 @@ int main(int argc, char *argv[]) {
     std::cout << "======================" << std::endl;
 
     // 2. Initialize the persistent key-value store
-    PersistentKVStore store(config.db_file);
+    PersistentKVStore store(config.db_file, config.durability);
 
     // 3. Start the gRPC StateMachine server in a background thread
     StateMachineServer grpc_server(config.grpc_address(), store);

@@ -9,7 +9,8 @@
   <a href="#architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#api-reference">API</a> •
-  <a href="#configuration">Configuration</a>
+  <a href="#configuration">Configuration</a> •
+  <a href="#data-directory">Data directory</a>
 </p>
 
 ---
@@ -21,6 +22,7 @@
 ## Features
 
 - **High Performance** — C++ storage engine with in-memory operations and persistent storage
+- **Crash-Safe** — every applied command is fsynced to a write-ahead log before it is visible, and the base file is replaced atomically (temp + `fsync` + `rename`)
 - **Strong Consistency** — Raft consensus ensures all nodes agree on the order of operations
 - **Efficient Serialization** — MsgPack binary protocol for minimal overhead
 - **Docker Ready** — Multi-stage Docker build with Docker Compose for easy cluster deployment
@@ -48,7 +50,7 @@
 │             │                   │                               │
 │  ┌──────────▼──────────────┐    │    ┌───────────────────────┐  │
 │  │   Persistent Storage    │    │    │   Management API      │  │
-│  │      (kv.db)            │    │    │   (Port 6000)         │  │
+│  │   (kv.db + kv.wal)      │    │    │   (Port 6000)         │  │
 │  └─────────────────────────┘    │    └───────────────────────┘  │
 └─────────────────────────────────┴───────────────────────────────┘
 ```
@@ -67,7 +69,7 @@
 2. **Proposal** → C++ engine forwards to Go sidecar via gRPC
 3. **Consensus** → Leader replicates log entry to followers via Raft
 4. **Apply** → Once committed, sidecar calls back to C++ state machine
-5. **Persist** → C++ engine updates in-memory store and writes to disk
+5. **Persist** → C++ engine appends the command to the write-ahead log and `fsync`s it, *then* updates the in-memory store (see [Data directory](#data-directory))
 
 ## Quick Start
 
@@ -110,6 +112,13 @@ follower returns `503` naming the leader, and that a malformed `Content-Length`
 returns `400` without killing the node. See
 [tests/e2e/README.md](tests/e2e/README.md) for configuration, the full contract
 table, and the assertions that still deliberately pin known-wrong behavior.
+
+The crash-recovery test is opt-in, because it is the one test that touches
+docker — it `SIGKILL`s a node and restarts it:
+
+```bash
+pytest tests/e2e -m requires_docker -v
+```
 
 `test_client.py` is still around as a one-shot manual demo, but it asserts
 nothing and only touches a single node — use the suite above for verification.
@@ -161,6 +170,10 @@ ctest --test-dir cpp-app/build --output-on-failure
 # 3. End-to-end — requires a running cluster (see "Testing the Cluster" above)
 pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v
+
+# 4. Crash recovery — also needs the LOCAL compose cluster: it SIGKILLs a node.
+#    Deselected from the run above by pytest.ini, opt in with the marker.
+pytest tests/e2e -m requires_docker -v
 ```
 
 **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every
@@ -171,7 +184,7 @@ push to `main` and every pull request, with four independent jobs:
 | `go` | `gofmt -l` (blocking), `go vet ./...`, `go test -race ./...` + coverage summary |
 | `cpp` | `clang-format` check against `.clang-format` (blocking), cmake build with the project warning flags, `ctest` |
 | `cpp-sanitizers` | the same C++ tests under `-fsanitize=address,undefined` |
-| `e2e` | `docker build`, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, `docker compose down -v` |
+| `e2e` | `docker build`, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, then the crash test (`-m requires_docker`), `docker compose down -v` |
 
 ## API Reference
 
@@ -271,6 +284,88 @@ Adds a new node to the Raft cluster.
 | 50051 | gRPC | C++ StateMachine service |
 | 50052 | gRPC | Go RaftNode service |
 
+## Data directory
+
+Each node keeps its whole state in one directory — `/app/data` in the container
+(`DATA_DIR` in `entrypoint.sh`), bind-mounted from `./vol-node<N>` by
+`docker-compose.yml`. Four files, two owners:
+
+| File | Owner | Purpose |
+|---|---|---|
+| `kv.db` | C++ | Base file: the whole key-value map, in the binary `KVB1` format |
+| `kv.wal` | C++ | Write-ahead log: every applied command, `fsync`ed before it is acknowledged |
+| `kv.db.tmp` | C++ | Transient: the in-progress base file, renamed over `kv.db` |
+| `logs.dat` | Go | BoltDB raft log and stable store (HashiCorp Raft) |
+
+### `kv.db` — base file (`KVB1`)
+
+```
+"KVB1"                                    4 bytes, magic
+uint32  entry_count
+entry_count × (
+    uint32  key_len   | key_len bytes
+    uint32  value_len | value_len bytes
+)
+```
+
+All integers are little-endian. Nothing is escaped or delimited, so keys and
+values may contain `=`, newlines and NUL bytes — the format this replaced was
+line-based `key=value\n` and silently corrupted all three. A file that does not
+start with the magic is read once with the old line parser and rewritten in this
+format immediately, so migration is automatic and happens at most once.
+
+The file is never modified in place: the new contents are written to
+`kv.db.tmp`, that file is `fsync`ed, renamed over `kv.db`, and the directory
+itself is `fsync`ed. A reader therefore sees either the entire old file or the
+entire new one. A leftover `kv.db.tmp` after a crash is expected and harmless —
+nothing ever reads it, and the next rewrite replaces it.
+
+`kv.db` is written only by compaction, not by every write.
+
+```bash
+xxd vol-node1/kv.db | head     # 4b 56 42 31 … = "KVB1"
+```
+
+### `kv.wal` — write-ahead log
+
+```
+repeated until EOF:
+    uint32  payload_len | payload_len bytes | uint32  crc32(payload)
+```
+
+`payload` is the MsgPack-encoded command (`{op, key, value}`) — the same shape
+the client sends. CRC32 is the standard IEEE/zlib polynomial. Every `SET` and
+`DELETE` appends one record and `fsync`s it **before** the in-memory map
+changes, which is what makes an acknowledged write survive `kill -9`; it also
+makes an apply cost one record instead of a full rewrite of the store.
+
+**Recovery** on startup is "load `kv.db`, then replay `kv.wal` over it in
+order". The first damaged record — a short read, a length that overruns the
+file, or a CRC mismatch — ends the replay, and the file is truncated back to the
+end of the last intact record. That damaged record is the torn tail a crash
+part-way through an append leaves behind: everything before it is applied,
+everything after it is discarded, because once the framing is lost the following
+bytes cannot be trusted to be the records that were meant to follow.
+
+**Compaction** runs when the WAL passes 4 MiB or 10,000 records (defaults in
+`DurabilityOptions`, `cpp-app/src/config/config.hpp`; also home to the
+`always`/`never` WAL fsync mode). It writes a fresh base file and *then*
+truncates the WAL — that order is the correctness argument, since a crash
+between the two costs only a replay of records already folded into the base
+file, and replaying a `SET`/`DELETE` twice is idempotent.
+
+Note that a restart replays the *entire* raft log through the state machine
+(there are no snapshots yet), and each of those applies appends to the WAL
+again — so the WAL grows on every restart until the next compaction folds it
+away.
+
+### `logs.dat`
+
+Owned by the Go sidecar: `raftnode.New` uses one BoltDB file as both the raft
+log store and the stable store. Deleting it erases the node's raft identity and
+log; deleting `kv.db`/`kv.wal` erases its data. For a clean slate,
+`docker compose down -v && rm -rf vol-node1 vol-node2 vol-node3`.
+
 ## Project Structure
 
 ```
@@ -282,7 +377,8 @@ RaftKV/
 │   │   ├── config/          # CLI args
 │   │   ├── network/         # HTTP request parser + server
 │   │   ├── raft/            # Propose client + StateMachine gRPC service
-│   │   └── storage/         # PersistentKVStore
+│   │   └── storage/         # PersistentKVStore, WAL, atomic file write,
+│   │                        #   binary format primitives (see Data directory)
 │   ├── tests/               # GoogleTest unit tests (-DKVDB_BUILD_TESTS=ON)
 │   ├── CMakeLists.txt       # Build configuration
 │   └── pb/                  # Stale generated Protobuf copy (unused by the build)
@@ -294,7 +390,8 @@ RaftKV/
 │   └── pb/                  # Generated Protobuf files (checked in)
 ├── proto/
 │   └── consensus.proto      # Service definitions
-├── tests/e2e/               # pytest end-to-end suite (needs a running cluster)
+├── tests/e2e/               # pytest end-to-end suite (needs a running cluster;
+│                            #   test_crash.py is opt-in: -m requires_docker)
 ├── docs/phases/             # Roadmap phase specs and plans
 ├── .github/workflows/ci.yml # CI: go, cpp, cpp-sanitizers, e2e
 ├── .clang-format            # C++ formatting (enforced by the cpp CI job)

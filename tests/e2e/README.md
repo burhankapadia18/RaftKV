@@ -1,6 +1,6 @@
 # RaftKV end-to-end suite
 
-Asserting replacement for `test_client.py`. Two families of test:
+Asserting replacement for `test_client.py`. Three families of test:
 
 - **R0.1–R0.5** (Phase 0) — a write on the leader replicates to **all** nodes,
   DELETE round-trips, a missing key is reported as missing, and a write to a
@@ -8,6 +8,8 @@ Asserting replacement for `test_client.py`. Two families of test:
 - **R1.7/R1.8** (Phase 1) — the truthful-error HTTP contract: real status codes,
   correct reason phrases, JSON error bodies, and a regression test for the
   remote denial of service that a malformed `Content-Length` used to cause.
+- **R2.4/R2.5/R2.7** (Phase 2, `test_crash.py`) — an acknowledged write survives
+  `kill -9`. Opt-in; see [The `requires_docker` split](#the-requires_docker-split).
 
 ## The cluster must already be running
 
@@ -23,12 +25,55 @@ docker compose up -d
 
 ```bash
 pip install -r tests/e2e/requirements.txt
-pytest tests/e2e -v
+pytest tests/e2e -v                      # the default suite: never touches docker
+pytest tests/e2e -m requires_docker -v   # the crash test: kills and restarts a node
 ```
 
 Exit status is pytest's: non-zero on any failure. If no node accepts a write
 within the leader-discovery deadline, the suite fails with a message telling you
 the cluster is not up and what each node answered instead.
+
+## The `requires_docker` split
+
+`pytest.ini` sets `addopts = -m "not requires_docker"`, so the default run
+excludes `test_crash.py`. That is not a convenience — it is what keeps the rule
+above true.
+
+The rule exists because it makes the suite portable: knowing nothing about *how*
+the nodes are run, it works against a local compose cluster, a remote host, or a
+k8s namespace, driven only by `RAFTKV_NODES`. Phase 2's acceptance criterion
+("`kill -9` at any instant loses no acknowledged write") cannot be expressed
+that way — it has to send a real SIGKILL to a real container, and specifically
+SIGKILL: `docker compose stop` sends SIGTERM, which is a graceful shutdown and
+would prove nothing.
+
+So the exception is quarantined behind a marker and opted into explicitly rather
+than being smuggled into the default run. A command-line `-m` replaces the one
+in `addopts`, which is what makes the opt-in work.
+
+The crash test **skips** — never fails — when it cannot do its job: no `docker`
+CLI, no `docker compose` plugin, no reachable daemon, no containers in the
+compose project, or `RAFTKV_NODES` pointing at anything other than localhost
+(killing a local container proves nothing about a remote cluster). A skip means
+"not verified here".
+
+**What it actually proves.** Write K keys through the leader, confirm they
+replicated, `docker compose kill -s KILL` a follower, and — *while it is dead* —
+assert the keys are already in that node's `kv.db`/`kv.wal` on disk. That
+assertion is the point: the naive version of this test (kill, restart, read
+back) would pass with an empty store, because there are no raft snapshots yet
+and a restart replays the entire local BoltDB log back into the state machine.
+Only the on-disk check distinguishes "durable" from "refilled by replay". The
+read-back after the restart is then deliberately *not* polled — recovery
+finishes before the HTTP listener opens — and a final write proves the node
+rejoined the cluster rather than merely coming back to life. If the data
+directory cannot be read from the test host (named volume, remote daemon,
+permissions), the test still runs the kill/restart and emits a
+`DurabilityNotVerified` warning rather than pretending it proved more.
+
+The test always attempts to restart the node, including when an assertion
+fails; a run that dies between the kill and the restart leaves the cluster a
+node short, recoverable with `docker compose start <node>`.
 
 ## Configuration
 
@@ -41,6 +86,15 @@ All optional; every value has a working default for `docker-compose.yml`.
 | `RAFTKV_REPLICATION_TIMEOUT` | `5.0` | Deadline for a write to become readable on a node |
 | `RAFTKV_LEADER_TIMEOUT` | `30.0` | Deadline for leader discovery (tolerates an election in progress) |
 | `RAFTKV_POLL_INTERVAL` | `0.1` | Poll interval, seconds |
+
+`test_crash.py` only (all ignored by the default run):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `RAFTKV_COMPOSE_FILE` | `<repo>/docker-compose.yml` | Compose file identifying the project whose container gets killed |
+| `RAFTKV_CRASH_KEYS` | `25` | How many keys to write before the kill |
+| `RAFTKV_RESTART_TIMEOUT` | `90.0` | Deadline for the restarted node to answer a read again |
+| `RAFTKV_DOCKER_TIMEOUT` | `60.0` | Budget for one `docker` CLI invocation |
 
 ```bash
 RAFTKV_NODES=http://node1:8080,http://node2:8080,http://node3:8080 pytest tests/e2e -v
@@ -92,7 +146,12 @@ literal value.
   `contracts` and pytest fixtures — never `conftest` by name, which would be
   fragile once a second `conftest.py` exists in the tree. Request helpers,
   JSON decoding, polling and the raw-socket escape hatch are all methods on the
-  `cluster` fixture.
+  `cluster` fixture. `test_crash.py` follows the same rule, and additionally
+  imports `assert_write_accepted` from `test_cluster` so the committed-write
+  contract (200 + JSON + `{"ok":true}`) is asserted in exactly one place.
+- **All docker knowledge is in `test_crash.py`.** `conftest.py` stays
+  docker-free; the compose plumbing, the skip conditions and the on-disk format
+  checks live only in the module that needs them.
 - **Raw sockets where `requests` cannot go.** `requests` derives
   `Content-Length` from the body, so the R1.8 regression test hand-builds the
   request bytes and reads the response off the socket itself.

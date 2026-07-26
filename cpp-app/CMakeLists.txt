@@ -104,6 +104,9 @@ set(KVDB_SOURCES
 set(KVDB_HEADERS
     src/config/config.hpp
     src/commands/kv_command.hpp
+    src/storage/format.hpp
+    src/storage/atomic_file.hpp
+    src/storage/wal.hpp
     src/storage/kv_store.hpp
     src/raft/raft_client.hpp
     src/raft/state_machine.hpp
@@ -186,6 +189,9 @@ if(KVDB_BUILD_TESTS)
         tests/http_request_test.cpp
         tests/state_machine_test.cpp
         tests/http_handler_test.cpp
+        tests/format_test.cpp
+        tests/atomic_file_test.cpp
+        tests/wal_test.cpp
     )
 
     target_include_directories(kvdb_tests PRIVATE

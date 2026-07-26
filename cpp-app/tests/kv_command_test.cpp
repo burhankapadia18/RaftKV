@@ -74,10 +74,11 @@ TEST(KVCommandTest, DecodesValidDeleteCommand) {
 
 TEST(KVCommandTest, DecodesBinarySafeValues) {
   // MsgPack strings are length-prefixed, so embedded NULs and newlines survive
-  // the decode intact. Storage is where they diverge: the NUL survives
-  // PersistentKVStore too, the newline does not - see
+  // the decode intact - and since Phase 2 they survive storage as well: the
+  // base file and the WAL are length-prefixed too. See
   // ValueContainingNulSurvivesReload and
-  // ValueContainingNewlineIsTruncatedByReload in kv_store_test.cpp.
+  // ValueContainingNewlineRoundTripsExactly in kv_store_test.cpp. (Before
+  // Phase 2 the newline was truncated by the line-based kv.db.)
   const std::string value("a\0b\nc", 5);
   const std::string bytes =
       pack_string_map({{"op", "SET"}, {"key", "k"}, {"value", value}});

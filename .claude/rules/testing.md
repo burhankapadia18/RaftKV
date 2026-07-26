@@ -45,10 +45,19 @@ docker build -t raftkv:latest .
 docker compose up -d
 pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v
+pytest tests/e2e -m requires_docker -v   # Phase 2 crash test, opt-in
 docker compose down -v       # rm -rf vol-node* for a clean slate
 ```
 
 Use `docker compose`, not the standalone `docker-compose` binary.
+
+`tests/e2e/test_crash.py` is the single, deliberate exception to the
+no-docker rule: proving that an acknowledged write survives `kill -9` means
+sending a real SIGKILL to a real container. It carries the `requires_docker`
+marker, `pytest.ini` deselects that marker by default so the line above stays
+true for the normal run, and the test *skips* rather than fails when docker or
+the local compose project is unavailable. Any future test that must drive docker
+goes in that module, behind that marker — not into `conftest.py`.
 
 The e2e suite makes the check the old script never made: a write on the leader
 must be readable on **all three** nodes (polled against a deadline, no fixed
@@ -80,11 +89,12 @@ existing tests rather than inventing a new style:
   `tests/e2e/` or scripted docker compose scenarios, not unit tests.
 
 **Pinned-buggy tests.** Phase 0 is a safety net, not a fix: several assertions
-deliberately encode current misbehavior (200-for-everything HTTP, stringly
-`error` bodies, `ApplyResponse.Success` being ignored, the lossy `kv.db` line
-format). Each is commented with the phase that will change it. When you fix one
-of those behaviors, update its pinning test in the **same** PR — do not "fix"
-the test on its own.
+deliberately encode current misbehavior, each commented with the phase that will
+change it. When you fix one of those behaviors, update its pinning test in the
+**same** PR — do not "fix" the test on its own. Two sets have already been
+flipped this way and must not be re-pinned: the 200-for-everything HTTP contract
+and stringly `error` bodies (Phase 1), and the lossy `kv.db` line format
+(Phase 2 — `=`, newlines and NUL bytes now round-trip exactly).
 
 ## What matters most to cover
 
