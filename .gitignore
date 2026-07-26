@@ -45,4 +45,9 @@ cpp-app/build
 # db data dir
 vol-node*/
 
+# python (tests/e2e)
+__pycache__/
+*.pyc
+.pytest_cache/
+
 .DS_Store

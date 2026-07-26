@@ -1,7 +1,9 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 

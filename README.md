@@ -83,21 +83,35 @@
 docker build -t raftkv:latest .
 
 # Start a 3-node cluster
-docker-compose up -d
+docker compose up -d
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 ```
+
+> Use `docker compose` (the Docker CLI plugin). The standalone `docker-compose`
+> binary is not required and is not what CI uses.
 
 ### Testing the Cluster
 
+With the cluster running, the end-to-end suite verifies it:
+
 ```bash
 # Install Python dependencies
-pip install requests msgpack
+pip install -r tests/e2e/requirements.txt
 
-# Run the test client
-python test_client.py
+# Run the asserting end-to-end suite (exits non-zero on any failure)
+pytest tests/e2e -v
 ```
+
+It checks that a write on the leader replicates to **all three** nodes, that
+DELETE round-trips, that a missing key reads back as `Key Not Found`, and that a
+write sent to a follower is rejected. See
+[tests/e2e/README.md](tests/e2e/README.md) for configuration and for the
+assertions that deliberately pin known-wrong behavior.
+
+`test_client.py` is still around as a one-shot manual demo, but it asserts
+nothing and only touches a single node — use the suite above for verification.
 
 Or use curl directly:
 
@@ -113,6 +127,36 @@ print(requests.post('http://localhost:8080/insert-val', data=data,
 # Read a value
 curl "http://localhost:8080/get-val?key=hello"
 ```
+
+### Running the tests
+
+Three layers, each runnable on its own:
+
+```bash
+# 1. Go sidecar unit tests — no cluster, no gRPC
+cd go-sidecar && test -z "$(gofmt -l .)" && go vet ./... && go test -race ./...
+
+# 2. C++ unit tests — GoogleTest via CTest.
+#    KVDB_BUILD_TESTS defaults to OFF, so the normal build and the Docker image
+#    are unaffected and need no GoogleTest.
+cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON
+cmake --build cpp-app/build -j4
+ctest --test-dir cpp-app/build --output-on-failure
+
+# 3. End-to-end — requires a running cluster (see "Testing the Cluster" above)
+pip install -r tests/e2e/requirements.txt
+pytest tests/e2e -v
+```
+
+**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every
+push to `main` and every pull request, with four independent jobs:
+
+| Job | Gates |
+|---|---|
+| `go` | `gofmt -l` (blocking), `go vet ./...`, `go test -race ./...` + coverage summary |
+| `cpp` | `clang-format` check against `.clang-format` (blocking), cmake build with the project warning flags, `ctest` |
+| `cpp-sanitizers` | the same C++ tests under `-fsanitize=address,undefined` |
+| `e2e` | `docker build`, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, `docker compose down -v` |
 
 ## API Reference
 
@@ -190,20 +234,34 @@ Adds a new node to the Raft cluster.
 
 ```
 RaftKV/
-├── cpp-app/                 # C++ Storage Engine
-│   ├── main.cpp             # HTTP server, gRPC service, KV store
+├── cpp-app/                 # C++ Storage Engine (header-only; main.cpp bootstraps)
+│   ├── src/
+│   │   ├── main.cpp         # Wiring only
+│   │   ├── commands/        # KVCommand (MsgPack wire format)
+│   │   ├── config/          # CLI args
+│   │   ├── network/         # HTTP request parser + server
+│   │   ├── raft/            # Propose client + StateMachine gRPC service
+│   │   └── storage/         # PersistentKVStore
+│   ├── tests/               # GoogleTest unit tests (-DKVDB_BUILD_TESTS=ON)
 │   ├── CMakeLists.txt       # Build configuration
-│   └── pb/                  # Generated Protobuf files
-├── go-sidecar/              # Go Raft Sidecar
-│   ├── main.go              # Raft setup, gRPC service
+│   └── pb/                  # Stale generated Protobuf copy (unused by the build)
+├── go-sidecar/              # Go Raft Sidecar (module: my-raft-sidecar)
+│   ├── cmd/sidecar/main.go  # Wiring only
+│   ├── internal/            # backend, cluster, config, fsm, management,
+│   │                        #   raftnode, rpc (+ *_test.go)
 │   ├── go.mod               # Go module dependencies
-│   └── pb/                  # Generated Protobuf files
+│   └── pb/                  # Generated Protobuf files (checked in)
 ├── proto/
 │   └── consensus.proto      # Service definitions
+├── tests/e2e/               # pytest end-to-end suite (needs a running cluster)
+├── docs/phases/             # Roadmap phase specs and plans
+├── .github/workflows/ci.yml # CI: go, cpp, cpp-sanitizers, e2e
+├── .clang-format            # C++ formatting (enforced by the cpp CI job)
 ├── docker-compose.yml       # Multi-node cluster setup
 ├── Dockerfile               # Multi-stage build
 ├── entrypoint.sh            # Container startup script
-└── test_client.py           # Python test client
+├── ROADMAP.md               # Path to 1.0
+└── test_client.py           # Manual demo client (superseded by tests/e2e)
 ```
 
 ## Building from Source
@@ -218,7 +276,7 @@ make -j$(nproc)
 ```
 
 **Dependencies:**
-- CMake 3.10+
+- CMake 3.20+ (3.15 is enough to build `kvdb_node`; `ctest --test-dir` needs 3.20)
 - gRPC and Protocol Buffers
 - MsgPack for C++ (`libmsgpack-dev`)
 
@@ -226,7 +284,7 @@ make -j$(nproc)
 
 ```bash
 cd go-sidecar
-go build -o sidecar .
+go build -o sidecar ./cmd/sidecar
 ```
 
 **Dependencies:**

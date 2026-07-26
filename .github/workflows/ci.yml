@@ -1,0 +1,275 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Superseding a PR push is fine; superseding a main push is not — it would
+  # leave the earlier commit on main with no CI result at all.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Jobs are deliberately independent (no `needs:`) so that a C++ failure still
+# reports the Go result and vice versa.
+jobs:
+  # --- R0.13: gofmt / go vet / go test -race -----------------------------
+  go:
+    name: Go unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: go-sidecar
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Single source of truth for the Go version: go-sidecar/go.mod.
+          # Paths here are workspace-relative (defaults.run.working-directory
+          # applies to `run` steps only, not to `uses` steps).
+          go-version-file: go-sidecar/go.mod
+          cache-dependency-path: go-sidecar/go.sum
+
+      - name: Check gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            echo
+            echo "Run 'cd go-sidecar && gofmt -w .' and commit the result."
+            exit 1
+          fi
+          echo "All Go files are gofmt-clean."
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tee coverage.txt
+          {
+            echo '### Go coverage'
+            echo
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --- R0.14 (part 1): cmake build + ctest -------------------------------
+  cpp:
+    name: C++ build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Same base image as the Dockerfile's cpp_builder stage. This is the build
+    # configuration we know works; do not swap it for bare ubuntu-latest apt
+    # packages (different gRPC/protobuf versions).
+    container:
+      image: debian:bookworm-slim
+    steps:
+      # The image has neither git nor CA certificates, both of which
+      # actions/checkout needs to clone over HTTPS. Install them first.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            pkg-config \
+            libmsgpack-dev \
+            libgtest-dev \
+            clang-format \
+            git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # R0.16: the checked-in sources are clang-format-clean against
+      # .clang-format under this container's clang-format 14, so this gate is
+      # blocking. Pinning the container pins the formatter version too, which
+      # is what makes the check deterministic.
+      - name: Check clang-format
+        run: |
+          unformatted="$(
+            find cpp-app/src cpp-app/tests \( -name '*.hpp' -o -name '*.cpp' \) \
+              -exec sh -c '
+                for f do
+                  clang-format --style=file "$f" | diff -q - "$f" >/dev/null || echo "$f"
+                done
+              ' sh {} +
+          )"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not clang-format clean:"
+            echo "$unformatted"
+            echo "Fix with: clang-format -i <file>"
+            exit 1
+          fi
+          echo "All C++ files are clang-format clean."
+
+      - name: Configure
+        run: cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build cpp-app/build -j "$(nproc)"
+
+      - name: Run tests
+        run: ctest --test-dir cpp-app/build --output-on-failure
+
+  # --- R0.14 (part 2): the same tests under ASan + UBSan -----------------
+  cpp-sanitizers:
+    name: C++ tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: debian:bookworm-slim
+      # LeakSanitizer (detect_leaks=1 below) needs ptrace. Docker's default
+      # seccomp profile usually allows it, but when it doesn't the failure is a
+      # hard "LeakSanitizer has encountered a fatal error" at every process
+      # exit — all 56 ctest entries fail at once, for reasons unrelated to the
+      # code. The capability costs nothing here.
+      options: --cap-add=SYS_PTRACE
+    env:
+      # Without halt_on_error, UBSan only prints a diagnostic and the process
+      # still exits 0 — the job would pass while reporting undefined behavior.
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:print_stacktrace=1
+      UBSAN_OPTIONS: halt_on_error=1:abort_on_error=1:print_stacktrace=1
+    steps:
+      # NOTE: libgtest-dev is deliberately NOT installed here (unlike the `cpp`
+      # job). Debian's libgtest.a is built without sanitizers; linking it into
+      # ASan-instrumented test objects puts a std::string across an
+      # instrumented/non-instrumented boundary on every assertion, which is the
+      # textbook trigger for ASan `container-overflow` false positives — and
+      # abort_on_error=1 below turns those into job failures.
+      # With no system GoogleTest, CMakeLists.txt falls back to FetchContent and
+      # builds GoogleTest from source under the same sanitizer flags. `git` and
+      # `ca-certificates` (installed below) are what that fallback needs.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            pkg-config \
+            libmsgpack-dev \
+            git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (sanitizers)
+        run: |
+          cmake -S cpp-app -B cpp-app/build-asan \
+            -DKVDB_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build test target
+        run: cmake --build cpp-app/build-asan --target kvdb_tests -j "$(nproc)"
+
+      - name: Run tests
+        run: ctest --test-dir cpp-app/build-asan --output-on-failure
+
+  # --- R0.15: full cluster end-to-end ------------------------------------
+  e2e:
+    name: End-to-end cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Build image
+        run: docker build -t raftkv:latest .
+
+      # `docker compose` (the CLI plugin) is preinstalled on GitHub runners;
+      # the standalone `docker-compose` binary is not guaranteed to be. The
+      # compose file's top-level `version:` key produces a deprecation warning
+      # on modern compose — that is expected and harmless.
+      - name: Start cluster
+        run: docker compose up -d
+
+      # Bounded readiness poll instead of a fixed sleep. Two conditions:
+      #   1. all three published HTTP ports answer a GET;
+      #   2. every node's Raft sidecar reports a non-empty leader_addr, i.e.
+      #      node2/node3 have finished joining and a leader has been elected.
+      # The C++ HTTP listener comes up long before Raft converges, so (1)
+      # alone is not sufficient. The management API on :6000 is not published
+      # to the host, so it is queried from inside the containers (the runtime
+      # image ships curl).
+      # Worst case for a join is 20 attempts x 2s = ~40s; 120s gives headroom.
+      - name: Wait for cluster readiness
+        run: |
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+
+            for port in 8080 8081 8082; do
+              if ! curl -sf --max-time 2 \
+                "http://localhost:${port}/get-val?key=__ci_readiness_probe__" \
+                >/dev/null; then
+                ready=0
+              fi
+            done
+
+            if [ "$ready" -eq 1 ]; then
+              for svc in node1 node2 node3; do
+                status="$(docker compose exec -T "$svc" \
+                  curl -sf --max-time 2 http://localhost:6000/status \
+                  2>/dev/null </dev/null || true)"
+                # Positive match on a NON-EMPTY leader_addr. Matching the
+                # negative case instead ("leader_addr": "") would be fail-open:
+                # any unexpected body — a proxy error page, or the compact
+                # `"leader_addr":""` that Phase 5 R5.6 will emit once this
+                # handler moves to encoding/json — would read as "ready" and
+                # silently hand an unconverged cluster to pytest. Whitespace
+                # around the colon is tolerated for exactly that reason.
+                printf '%s' "$status" \
+                  | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+              done
+            fi
+
+            if [ "$ready" -eq 1 ]; then
+              echo "Cluster is ready."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::Cluster did not become ready within 120s"
+          docker compose ps
+          exit 1
+
+      - name: Run e2e tests
+        run: pytest tests/e2e -v
+
+      - name: Dump cluster logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps
+
+      - name: Tear down cluster
+        if: always()
+        run: docker compose down -v

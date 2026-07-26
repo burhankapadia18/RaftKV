@@ -7,19 +7,33 @@ import (
 	"log"
 	"net/http"
 	"time"
-
-	"my-raft-sidecar/internal/raftnode"
 )
+
+// RaftControl is the consumer-side view of the Raft node that the management
+// API needs. Keeping it here (rather than depending on *raftnode.Node) lets the
+// handlers be tested with a fake and keeps package management free of any
+// dependency on package raftnode.
+//
+// *raftnode.Node satisfies this interface; the compile-time guarantee is the
+// call site in cmd/sidecar/main.go. The `var _ RaftControl = (*raftnode.Node)(nil)`
+// assertion deliberately lives in this package's test file rather than in
+// package raftnode, since putting it there would make raftnode import
+// management and invert the dependency.
+type RaftControl interface {
+	IsLeader() bool
+	LeaderAddr() string
+	AddVoter(id, address string) error
+}
 
 // Server represents the HTTP management server.
 type Server struct {
-	node       *raftnode.Node
+	node       RaftControl
 	httpServer *http.Server
 	port       string
 }
 
 // NewServer creates a new management server.
-func NewServer(node *raftnode.Node, port string) *Server {
+func NewServer(node RaftControl, port string) *Server {
 	return &Server{
 		node: node,
 		port: port,

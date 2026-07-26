@@ -22,7 +22,9 @@ The KV payload travels as **opaque MsgPack bytes in `Command.data`**, end to end
    ```
 
    The `option go_package = "./pb";` in the proto places output in `go-sidecar/pb/`.
-4. Rebuild both sides and run the cluster smoke test (`docker build`, `docker-compose up -d`, `python test_client.py`).
+4. Rebuild both sides and run the unit tests (`cd go-sidecar && go test -race ./...`;
+   `cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON && cmake --build cpp-app/build && ctest --test-dir cpp-app/build --output-on-failure`),
+   then the cluster smoke test (`docker build`, `docker compose up -d`, `pytest tests/e2e -v`).
 
 ## Compatibility rules
 

@@ -15,22 +15,39 @@ RaftKV is a distributed key-value store using a **sidecar pattern**: each node r
 ```bash
 # Full cluster (the primary way to run and verify anything)
 docker build -t raftkv:latest .
-docker-compose up -d                  # 3 nodes: HTTP on host ports 8080/8081/8082
-docker-compose logs -f
-docker-compose down                   # add -v and rm -rf vol-node* for a clean slate
+docker compose up -d                  # 3 nodes: HTTP on host ports 8080/8081/8082
+docker compose logs -f
+docker compose down                   # add -v and rm -rf vol-node* for a clean slate
 
-# Smoke test against a running cluster (needs: pip install requests msgpack)
-python test_client.py
+# Go sidecar
+cd go-sidecar && go build -o sidecar ./cmd/sidecar
+cd go-sidecar && test -z "$(gofmt -l .)" && go vet ./... && go test -race ./...
 
 # C++ engine (local build; needs cmake, gRPC/protobuf dev libs, libmsgpack-dev)
 cd cpp-app && mkdir -p build && cd build && cmake .. && make -j4
 
-# Go sidecar
-cd go-sidecar && go build -o sidecar ./cmd/sidecar
-cd go-sidecar && go vet ./... && go test -race ./...
+# C++ unit tests (GoogleTest via CTest; KVDB_BUILD_TESTS defaults to OFF, so the
+# command above and the Docker image build exactly as before — no gtest needed)
+cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON
+cmake --build cpp-app/build -j4
+ctest --test-dir cpp-app/build --output-on-failure
+
+# End-to-end suite — needs a cluster already running (it never touches docker)
+pip install -r tests/e2e/requirements.txt
+pytest tests/e2e -v
 ```
 
-There is currently **no unit test suite** — `test_client.py` is an end-to-end smoke test that requires a running cluster. If you add tests, follow [.claude/rules/testing.md](.claude/rules/testing.md).
+Use `docker compose` (the CLI plugin), not the standalone `docker-compose` binary — CI and the local toolchain only guarantee the former.
+
+There are three test layers, all of which must stay green:
+
+1. **Go unit tests** (`go-sidecar/internal/*/*_test.go`) — `internal/fsm`, `internal/config`, `internal/cluster`, `internal/management`, run with `go test -race ./...`. `internal/backend`, `internal/raftnode`, `internal/rpc` and `cmd/sidecar` have no tests yet.
+2. **C++ unit tests** (`cpp-app/tests/*.cpp`, GoogleTest via CTest) — `KVCommand::from_msgpack`, `PersistentKVStore`, `HttpRequestParser`. Built only when `-DKVDB_BUILD_TESTS=ON`; uses the system GoogleTest when present, otherwise fetches it. Also run under `-fsanitize=address,undefined` in CI.
+3. **End-to-end** (`tests/e2e/`, pytest) — asserts that a write on the leader is readable on **all three** nodes, DELETE round-trips, missing keys, and follower-write rejection. Requires a live cluster; exits 1 with a "cluster does not look ready" message if there isn't one.
+
+`test_client.py` is retained only as a manual one-shot demo — it asserts nothing and checks a single node. Use `pytest tests/e2e` for verification. If you add tests, follow [.claude/rules/testing.md](.claude/rules/testing.md).
+
+**CI**: `.github/workflows/ci.yml` runs on every push to `main` and every PR, with four independent jobs: `go` (blocking `gofmt -l`, `go vet`, `go test -race` + coverage summary), `cpp` (blocking `clang-format` check against `.clang-format`, cmake build with the project warning flags, `ctest`), `cpp-sanitizers` (the same tests under ASan+UBSan), and `e2e` (docker build, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, `docker compose down -v`).
 
 ## Architecture — The Two Data Paths
 
@@ -46,7 +63,7 @@ Understanding writes vs. reads is the key to this codebase:
 **Read path** (no consensus): `GET /get-val?key=...` is served directly from the local in-memory store. Reads on followers can be stale.
 
 Important consequences:
-- The proto `Command.op/key/value` fields are **unused in transit** — the payload rides in `Command.data` as opaque MsgPack. Only the C++ state machine parses it, at apply time. Changing the wire format means touching `kv_command.hpp`, `test_client.py`, and the README API docs together.
+- The proto `Command.op/key/value` fields are **unused in transit** — the payload rides in `Command.data` as opaque MsgPack. Only the C++ state machine parses it, at apply time. Changing the wire format means touching `kv_command.hpp`, `cpp-app/tests/kv_command_test.cpp`, `tests/e2e/conftest.py`, `test_client.py`, and the README API docs together.
 - Writes sent to a follower **fail** (`raft.Apply` returns `ErrNotLeader`; there is no leader forwarding). The client gets `error`.
 - Startup order matters: the C++ app must be up before the sidecar connects (the sidecar retries; see `entrypoint.sh` for launch order and CLI args of both binaries).
 
@@ -79,7 +96,9 @@ See [.claude/rules/protobuf.md](.claude/rules/protobuf.md) for the regeneration 
 
 ## Known Limitations (deliberate — don't "fix" silently)
 
-These are acknowledged simplifications. If a task touches one, call it out and confirm scope before redesigning:
+These are acknowledged simplifications. If a task touches one, call it out and confirm scope before redesigning.
+
+Phase 0 removed none of these — it **pinned** them with tests that assert the current (wrong) behavior, each commented with the phase that will change it. Fixing a limitation therefore means updating its pinning tests in the same PR: see the pinned-behavior tables in `tests/e2e/README.md` and the `CURRENT LOSSY BEHAVIOR` / `PINNED` comments in `cpp-app/tests/` and `go-sidecar/internal/fsm/fsm_test.go`.
 
 - **No snapshots**: `CppFSM` returns a `DummySnapshot` and the raft node uses `NewDiscardSnapshotStore()` — the raft log grows unbounded and restarts replay the full log.
 - **Durability**: `PersistentKVStore::persist()` rewrites the entire `kv.db` on every write, without `fsync` or WAL.

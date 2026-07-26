@@ -140,3 +140,82 @@ endif()
 # --- 8. Installation (Optional) ---
 
 install(TARGETS kvdb_node DESTINATION bin)
+
+# --- 9. Unit Tests (opt-in) ---
+#
+# Everything below is guarded by KVDB_BUILD_TESTS so that the default
+# configuration (and therefore the Docker build) is completely unaffected.
+#   cmake -DKVDB_BUILD_TESTS=ON .. && make -j4 && ctest --output-on-failure
+
+option(KVDB_BUILD_TESTS "Build unit tests" OFF)
+
+if(KVDB_BUILD_TESTS)
+    # Prefer an already-installed GoogleTest (Debian: libgtest-dev) so CI can run
+    # offline; only fall back to fetching the sources when nothing is installed.
+    find_package(GTest QUIET)
+
+    if(TARGET GTest::gtest_main)
+        message(STATUS "Tests: using system GoogleTest")
+    else()
+        message(STATUS "Tests: GoogleTest not found, fetching 1.15.2")
+        include(FetchContent)
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            # The 1.15.2 release is tagged "v1.15.2" (the "release-" prefix was
+            # dropped after 1.12.1).
+            GIT_TAG v1.15.2
+            # A tag is a mutable ref, so without GIT_SHALLOW every build adds a
+            # full-history clone plus an update fetch. This branch is what the
+            # cpp-sanitizers CI job takes (it omits libgtest-dev on purpose), so
+            # keep it cheap.
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(googletest)
+    endif()
+
+    enable_testing()
+    include(GoogleTest)
+
+    # Listed explicitly on purpose - no globbing, so adding a file is a visible
+    # change to this list.
+    add_executable(kvdb_tests
+        tests/kv_command_test.cpp
+        tests/kv_store_test.cpp
+        tests/http_request_test.cpp
+    )
+
+    target_include_directories(kvdb_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    # Deliberately NOT linked against consensus_proto / gRPC: the three units
+    # under test (KVCommand, PersistentKVStore, HttpRequestParser) include only
+    # msgpack and the standard library.
+    target_link_libraries(kvdb_tests PRIVATE
+        GTest::gtest_main
+        msgpackc
+    )
+
+    # <filesystem> (used by the store tests for temp files) needs an explicit
+    # library only on GCC older than 9.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
+        target_link_libraries(kvdb_tests PRIVATE stdc++fs)
+    endif()
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kvdb_tests PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wno-unused-parameter
+        )
+    endif()
+
+    # DISCOVERY_TIMEOUT defaults to 5s and discovery runs the freshly built
+    # binary at build time. Under ASan+UBSan on a loaded CI runner that can
+    # overrun, and the failure surfaces as a *build* error rather than a test
+    # failure, which is badly misleading. 120s costs nothing when it passes.
+    gtest_discover_tests(kvdb_tests DISCOVERY_TIMEOUT 120)
+endif()

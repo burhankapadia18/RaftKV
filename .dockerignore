@@ -45,3 +45,8 @@ cpp-app/build
 
 # db data dir
 vol-node*/
+
+# python test artifacts (tests/ is inside the build context)
+__pycache__/
+*.pyc
+.pytest_cache/
