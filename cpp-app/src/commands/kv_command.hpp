@@ -1,6 +1,7 @@
 #pragma once
 
 #include <msgpack.hpp>
+#include <optional>
 #include <string>
 
 namespace kvdb {
@@ -43,10 +44,30 @@ struct KVCommand {
   [[nodiscard]] Operation operation_type() const { return parse_operation(op); }
 
   /**
+   * @brief Explain why this command is invalid.
+   *
+   * The validation rules and the human-readable reason for each one live
+   * together here so that StateMachineService::Apply can put the reason on
+   * the wire (ApplyResponse.error) without restating them.
+   *
+   * @return std::nullopt when the command is valid, otherwise a short
+   *         description naming the offending field.
+   */
+  [[nodiscard]] std::optional<std::string> validation_error() const {
+    if (operation_type() == Operation::UNKNOWN) {
+      return "unknown operation: \"" + op + "\"";
+    }
+    if (key.empty()) {
+      return "empty key for operation \"" + op + "\"";
+    }
+    return std::nullopt;
+  }
+
+  /**
    * @brief Check if this is a valid command.
    */
   [[nodiscard]] bool is_valid() const {
-    return operation_type() != Operation::UNKNOWN && !key.empty();
+    return !validation_error().has_value();
   }
 
   /**

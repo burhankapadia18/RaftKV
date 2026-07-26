@@ -2,6 +2,8 @@
 
 #include <functional>
 #include <iostream>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,33 +17,152 @@
 
 namespace kvdb {
 
+/** @brief Content-Type of a successful read: the stored bytes, verbatim. */
+inline constexpr const char *kTextContentType = "text/plain; charset=utf-8";
+
+/** @brief Content-Type of every structured body this server emits. */
+inline constexpr const char *kJsonContentType = "application/json";
+
+/** @brief The only request media type POST /insert-val accepts. */
+inline constexpr const char *kMsgpackContentType = "application/msgpack";
+
+/**
+ * @brief Machine-readable prefix on a propose that failed because this node
+ * is not the leader, followed by the raft leader's address.
+ *
+ * The address is empty during an election ("not_leader:"). The sidecar
+ * (go-sidecar/internal/rpc) produces it and Phase 4 leader forwarding keys off
+ * this exact prefix, so it is a contract, not a log message.
+ */
+inline constexpr const char *kNotLeaderPrefix = "not_leader:";
+
+/**
+ * @brief Escape a string so it can be embedded in a JSON string literal.
+ *
+ * Deliberately tiny - no JSON library is linked into this binary. It covers
+ * everything RFC 8259 forbids raw inside a string: the two delimiters ('"' and
+ * '\\') and the C0 control characters, which fall back to \\u00XX. Bytes >=
+ * 0x20 pass through untouched, so UTF-8 payloads survive.
+ *
+ * Every error body goes through this: the propose error and the raft leader
+ * address are both attacker-influenced in principle, and an unescaped quote
+ * would produce a body no client can parse.
+ */
+[[nodiscard]] inline std::string json_escape(const std::string &input) {
+  static constexpr char kHexDigits[] = "0123456789abcdef";
+
+  std::string escaped;
+  escaped.reserve(input.size());
+
+  for (const char c : input) {
+    const auto byte = static_cast<unsigned char>(c);
+    switch (c) {
+    case '"':
+      escaped += "\\\"";
+      break;
+    case '\\':
+      escaped += "\\\\";
+      break;
+    case '\b':
+      escaped += "\\b";
+      break;
+    case '\f':
+      escaped += "\\f";
+      break;
+    case '\n':
+      escaped += "\\n";
+      break;
+    case '\r':
+      escaped += "\\r";
+      break;
+    case '\t':
+      escaped += "\\t";
+      break;
+    default:
+      if (byte < 0x20) {
+        escaped += "\\u00";
+        escaped += kHexDigits[(byte >> 4) & 0x0f];
+        escaped += kHexDigits[byte & 0x0f];
+      } else {
+        escaped += c;
+      }
+      break;
+    }
+  }
+
+  return escaped;
+}
+
 /**
  * @brief HTTP response builder utility.
  */
 struct HttpResponse {
   int status_code = 200;
   std::string body;
+  std::string content_type = kTextContentType;
+
+  /**
+   * @brief Reason phrase for a status code (RFC 9110 section 15).
+   *
+   * Only the codes this server actually emits are listed; anything else is a
+   * programming error, so the default is deliberately bland rather than a
+   * guess.
+   */
+  [[nodiscard]] static const char *reason_phrase(int status_code) {
+    switch (status_code) {
+    case 200:
+      return "OK";
+    case 201:
+      return "Created";
+    case 400:
+      return "Bad Request";
+    case 404:
+      return "Not Found";
+    case 415:
+      return "Unsupported Media Type";
+    case 500:
+      return "Internal Server Error";
+    case 502:
+      return "Bad Gateway";
+    case 503:
+      return "Service Unavailable";
+    default:
+      return "Unknown";
+    }
+  }
 
   /**
    * @brief Serialize the response to HTTP format.
    */
   [[nodiscard]] std::string to_string() const {
-    return "HTTP/1.1 " + std::to_string(status_code) +
-           " OK\r\n"
-           "Content-Length: " +
-           std::to_string(body.size()) + "\r\n\r\n" + body;
+    std::string response = "HTTP/1.1 ";
+    response += std::to_string(status_code);
+    response += " ";
+    response += reason_phrase(status_code);
+    response += "\r\nContent-Type: ";
+    response += content_type;
+    response += "\r\nContent-Length: ";
+    response += std::to_string(body.size());
+    response += "\r\n\r\n";
+    response += body;
+    return response;
   }
 
-  static HttpResponse ok(const std::string &body) {
-    return HttpResponse{200, body};
+  /** @brief 200 carrying a raw stored value as plain text. */
+  [[nodiscard]] static HttpResponse ok(const std::string &body) {
+    return HttpResponse{200, body, kTextContentType};
   }
 
-  static HttpResponse not_found(const std::string &body = "404 Not Found") {
-    return HttpResponse{404, body};
+  /** @brief A JSON body with an explicit status code. */
+  [[nodiscard]] static HttpResponse json(int status_code,
+                                         const std::string &body) {
+    return HttpResponse{status_code, body, kJsonContentType};
   }
 
-  static HttpResponse error(const std::string &body = "Internal Server Error") {
-    return HttpResponse{500, body};
+  /** @brief The standard error envelope: {"error":"<escaped message>"}. */
+  [[nodiscard]] static HttpResponse json_error(int status_code,
+                                               const std::string &message) {
+    return json(status_code, "{\"error\":\"" + json_escape(message) + "\"}");
   }
 };
 
@@ -63,38 +184,94 @@ public:
 
   /**
    * @brief Handle an HTTP request and return a response.
+   *
+   * Routing is on method and path only. The media type is checked inside
+   * handle_insert so that a POST to /insert-val with the wrong Content-Type
+   * gets 415 instead of silently becoming "no such route".
    */
   [[nodiscard]] HttpResponse handle(const HttpRequest &request) const {
-    if (request.method == "POST" && request.path == "/insert-val" &&
-        request.is_msgpack) {
+    if (request.method == "POST" && request.path == "/insert-val") {
       return handle_insert(request);
-    } else if (request.method == "GET" && request.path == "/get-val") {
+    }
+    if (request.method == "GET" && request.path == "/get-val") {
       return handle_get(request);
     }
-    return HttpResponse::not_found();
+    return HttpResponse::json_error(404, "not found");
   }
 
 private:
   IRaftClient &raft_client_;
   const IKVStore &store_;
 
+  /**
+   * @brief POST /insert-val - validate, then propose through Raft.
+   *
+   * Framing is checked before semantics: a Content-Length the parser could not
+   * read means the request itself is malformed (400), and there is no point
+   * arguing about its media type.
+   */
   [[nodiscard]] HttpResponse handle_insert(const HttpRequest &request) const {
-    bool success = raft_client_.propose(request.body);
-    return HttpResponse::ok(success ? "ok" : "error");
+    if (request.bad_content_length) {
+      return HttpResponse::json_error(400, "malformed Content-Length");
+    }
+    if (!request.is_msgpack) {
+      std::string body = "{\"error\":\"unsupported media type\",";
+      body += "\"expected\":\"";
+      body += kMsgpackContentType;
+      body += "\"}";
+      return HttpResponse::json(415, body);
+    }
+    if (request.body.empty()) {
+      return HttpResponse::json_error(400, "empty request body");
+    }
+
+    const ProposeResult result = raft_client_.propose(request.body);
+    if (result.success) {
+      return HttpResponse::json(200, "{\"ok\":true}");
+    }
+
+    // Not-the-leader is the one failure a client can act on by itself, so it
+    // gets a retryable status and the address to retry against.
+    const std::optional<std::string> leader = not_leader_address(result.error);
+    if (leader) {
+      std::string body = "{\"error\":\"not leader\",\"leader\":\"";
+      body += json_escape(*leader);
+      body += "\"}";
+      return HttpResponse::json(503, body);
+    }
+    return HttpResponse::json_error(502, result.error);
   }
 
+  /**
+   * @brief GET /get-val?key=... - served from the local store, no consensus.
+   */
   [[nodiscard]] HttpResponse handle_get(const HttpRequest &request) const {
-    auto params = request.query_params();
-    auto it = params.find("key");
+    const std::map<std::string, std::string> params = request.query_params();
+    const auto it = params.find("key");
     if (it == params.end()) {
-      return HttpResponse::ok("Key Not Found");
+      const std::string message = "missing required query parameter: key";
+      return HttpResponse::json_error(400, message);
     }
 
-    auto value = store_.get(it->second);
-    if (value) {
-      return HttpResponse::ok(*value);
+    const std::optional<std::string> value = store_.get(it->second);
+    if (!value) {
+      return HttpResponse::json_error(404, "key not found");
     }
-    return HttpResponse::ok("Key Not Found");
+    return HttpResponse::ok(*value);
+  }
+
+  /**
+   * @brief Extract the leader address from a "not_leader:<address>" error.
+   * @param error The error string returned by a failed propose
+   * @return The address (possibly empty) if the prefix matched, else nullopt
+   */
+  [[nodiscard]] static std::optional<std::string>
+  not_leader_address(const std::string &error) {
+    const std::string prefix(kNotLeaderPrefix);
+    if (error.rfind(prefix, 0) != 0) {
+      return std::nullopt;
+    }
+    return error.substr(prefix.size());
   }
 };
 

@@ -5,19 +5,21 @@
  * The parser is hand-rolled and deliberately thin. These tests pin what it
  * ACTUALLY does today, including the sharp edges:
  *   - `request.headers` is declared but never filled in.
- *   - a garbage Content-Length propagates a std::invalid_argument out of
- *     parse(), which no handler catches short of main()'s fatal catch-all —
- *     i.e. it kills the whole node (Phase 1 R1.8 wraps the stoi).
  *   - query parsing stops at the first segment without '=' and does no
  *     URL-decoding (Phase 4 R4.6 adds url_decode).
- * Nothing here is a wish list; it is the "before" picture.
+ * Most of this is still the "before" picture rather than a wish list.
+ *
+ * The one guarantee here that is a deliberate, already-delivered property
+ * rather than an observation is totality: parse() never throws. A
+ * Content-Length it cannot read is reported through
+ * HttpRequest::bad_content_length, because an exception escaping this function
+ * would take the whole process down (R1.8).
  */
 
 #include <gtest/gtest.h>
 
 #include <map>
 #include <optional>
-#include <stdexcept>
 #include <string>
 
 #include "network/http_request.hpp"
@@ -141,6 +143,8 @@ TEST(HttpRequestParserTest, MissingContentLengthDefaultsToZero) {
                                        "\r\n");
 
   EXPECT_EQ(request.content_length, 0);
+  // Absent is not malformed: nothing to parse, nothing to complain about.
+  EXPECT_FALSE(request.bad_content_length);
 }
 
 TEST(HttpRequestParserTest, ContentLengthIsCaseInsensitiveAndIgnoresPadding) {
@@ -154,32 +158,46 @@ TEST(HttpRequestParserTest, ContentLengthIsCaseInsensitiveAndIgnoresPadding) {
                                        "1234567");
 
   EXPECT_EQ(request.content_length, 7);
+  EXPECT_FALSE(request.bad_content_length);
 }
 
-TEST(HttpRequestParserTest, GarbageContentLengthThrowsOutOfParse) {
-  // CURRENT BEHAVIOR (bug, pinned) — REMOTE DENIAL OF SERVICE, not just a
-  // dropped request. std::stoi throws and parse() does not catch it, so the
-  // exception unwinds through HttpServer::handle_connection (leaking the
-  // client fd) and out of run() into main.cpp's `catch (const
-  // std::exception&)`, which prints "Fatal error: stoi" and returns 1.
-  // entrypoint.sh's `wait -n` then takes the container down. Verified against a
-  // live cluster: one unauthenticated `Content-Length: abc` moved a node to
-  // Exited(1).
+TEST(HttpRequestParserTest, GarbageContentLengthIsFlaggedNotThrown) {
+  // GUARANTEE (R1.8): parse() is total. A Content-Length it cannot read sets
+  // bad_content_length, leaves content_length at 0 and still returns a request
+  // — KVHttpHandler is what turns the flag into 400 {"error":"malformed
+  // Content-Length"}.
   //
-  // Phase 1 R1.8 owns the fix ("malformed request (bad Content-Length, empty
-  // body) -> 400 - and std::stoi is wrapped so garbage no longer crashes the
-  // server"). NOT Phase 4 R4.9, which is only body/header size caps.
-  // When R1.8 lands, this EXPECT_THROW becomes an assertion on a 400.
-  EXPECT_THROW(HttpRequestParser::parse("POST /insert-val HTTP/1.1\r\n"
-                                        "Content-Length: abc\r\n"
-                                        "\r\n"),
-               std::invalid_argument);
+  // This must not regress into an exception. It used to be one, and it was a
+  // remote kill switch rather than a dropped request: std::stoi threw out of
+  // parse(), unwound through HttpServer::handle_connection (leaking the client
+  // fd) and out of run() into main.cpp's `catch (const std::exception&)`, which
+  // printed "Fatal error: stoi" and returned 1; entrypoint.sh's `wait -n` then
+  // took the container down. Verified against a live cluster: one
+  // unauthenticated `Content-Length: abc` moved a node to Exited(1).
+  const HttpRequest garbage = parse_ok("POST /insert-val HTTP/1.1\r\n"
+                                       "Content-Length: abc\r\n"
+                                       "\r\n");
+  EXPECT_TRUE(garbage.bad_content_length);
+  EXPECT_EQ(garbage.content_length, 0);
+  // The rest of the request is still parsed, so the handler has enough to
+  // answer with a real status line instead of hanging up.
+  EXPECT_EQ(garbage.method, "POST");
+  EXPECT_EQ(garbage.path, "/insert-val");
 
-  // An empty value throws the same way.
-  EXPECT_THROW(HttpRequestParser::parse("POST /insert-val HTTP/1.1\r\n"
-                                        "Content-Length:\r\n"
-                                        "\r\n"),
-               std::invalid_argument);
+  // An empty value is flagged the same way (std::invalid_argument).
+  const HttpRequest empty = parse_ok("POST /insert-val HTTP/1.1\r\n"
+                                     "Content-Length:\r\n"
+                                     "\r\n");
+  EXPECT_TRUE(empty.bad_content_length);
+  EXPECT_EQ(empty.content_length, 0);
+
+  // ...and so is a value too wide for an int, which is the other throw
+  // std::stoi can produce (std::out_of_range).
+  const HttpRequest huge = parse_ok("POST /insert-val HTTP/1.1\r\n"
+                                    "Content-Length: 99999999999999999999\r\n"
+                                    "\r\n");
+  EXPECT_TRUE(huge.bad_content_length);
+  EXPECT_EQ(huge.content_length, 0);
 }
 
 // --- Content-Type ---------------------------------------------------------

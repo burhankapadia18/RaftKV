@@ -105,10 +105,11 @@ pytest tests/e2e -v
 ```
 
 It checks that a write on the leader replicates to **all three** nodes, that
-DELETE round-trips, that a missing key reads back as `Key Not Found`, and that a
-write sent to a follower is rejected. See
-[tests/e2e/README.md](tests/e2e/README.md) for configuration and for the
-assertions that deliberately pin known-wrong behavior.
+DELETE round-trips, that a missing key returns `404`, that a write sent to a
+follower returns `503` naming the leader, and that a malformed `Content-Length`
+returns `400` without killing the node. See
+[tests/e2e/README.md](tests/e2e/README.md) for configuration, the full contract
+table, and the assertions that still deliberately pin known-wrong behavior.
 
 `test_client.py` is still around as a one-shot manual demo, but it asserts
 nothing and only touches a single node — use the suite above for verification.
@@ -120,12 +121,26 @@ Or use curl directly:
 python3 -c "
 import requests, msgpack
 data = msgpack.packb({'op': 'SET', 'key': 'hello', 'value': 'world'})
-print(requests.post('http://localhost:8080/insert-val', data=data, 
-      headers={'Content-Type': 'application/msgpack'}).text)
+r = requests.post('http://localhost:8080/insert-val', data=data,
+                  headers={'Content-Type': 'application/msgpack'})
+print(r.status_code, r.text)          # 200 {\"ok\":true}
 "
 
 # Read a value
-curl "http://localhost:8080/get-val?key=hello"
+curl -i "http://localhost:8080/get-val?key=hello"
+
+# Read a key that is not there
+curl -i "http://localhost:8080/get-val?key=nope"   # 404 {"error":"key not found"}
+
+# Send the same write to a follower
+python3 -c "
+import requests, msgpack
+data = msgpack.packb({'op': 'SET', 'key': 'hello', 'value': 'world'})
+r = requests.post('http://localhost:8081/insert-val', data=data,
+                  headers={'Content-Type': 'application/msgpack'})
+print(r.status_code, r.text)
+# 503 {\"error\":\"not leader\",\"leader\":\"node1:8088\"}
+"
 ```
 
 ### Running the tests
@@ -160,47 +175,73 @@ push to `main` and every pull request, with four independent jobs:
 
 ## API Reference
 
-### Insert Key-Value Pair
+Every failure carries a real status code, the matching reason phrase on the
+status line, and a JSON body naming what went wrong. Error bodies are always
+`Content-Type: application/json`; a successful read is the one response that is
+not JSON.
+
+### Insert / delete a key
 
 ```http
 POST /insert-val
 Content-Type: application/msgpack
 ```
 
-**Request Body** (MsgPack encoded):
+**Request body** (MsgPack **map**, all three fields present):
+
 ```json
-{
-  "op": "SET",
-  "key": "your_key",
-  "value": "your_value"
-}
+{ "op": "SET", "key": "your_key", "value": "your_value" }
 ```
 
-**Response**: `ok` on success, `error` on failure
+`op` is `SET` or `DELETE`; a `DELETE` ignores `value` but must still supply it.
 
-### Get Value by Key
+**Responses**
+
+| Outcome | Status | Body |
+|---|---|---|
+| Committed and applied on this node | `200 OK` | `{"ok":true}` |
+| This node is not the leader | `503 Service Unavailable` | `{"error":"not leader","leader":"node1:8088"}` |
+| Propose failed for any other reason (sidecar unreachable, deadline exceeded, the state machine rejected the command) | `502 Bad Gateway` | `{"error":"<reason>"}` |
+| `Content-Type` is not `application/msgpack` | `415 Unsupported Media Type` | `{"error":"unsupported media type","expected":"application/msgpack"}` |
+| Empty body | `400 Bad Request` | `{"error":"empty request body"}` |
+| `Content-Length` is not a number | `400 Bad Request` | `{"error":"malformed Content-Length"}` |
+
+Two things worth knowing about the failure paths:
+
+- **`leader` is a Raft address, not a URL.** It comes from HashiCorp Raft's
+  `LeaderWithID`, so under `docker-compose.yml` it is `<node-id>:8088` — the
+  peer's raft port, not its HTTP port. It is empty (`"leader":""`) while an
+  election is in progress. There is no leader forwarding yet: a client has to
+  retry against the leader itself. Forwarding lands in Phase 4, and the
+  sidecar's machine-readable `not_leader:` prefix exists so it can.
+- **A command the state machine rejects is a `502`, and it was still
+  replicated.** Validation happens at apply time, after the entry is committed,
+  so an unknown `op` or an empty `key` costs a raft log entry and comes back as
+  `502 {"error":"fsm: failed to apply raft log entry index=… term=…: empty key
+  for operation \"SET\""}`. Rejecting these before proposing is future work.
+
+### Get value by key
 
 ```http
 GET /get-val?key=<key>
 ```
 
-**Response**: The value associated with the key, or `Key Not Found`
+Served from the local in-memory store without consensus, so a follower may
+answer with a stale value.
 
-### Delete Key (via SET operation)
+| Outcome | Status | Content-Type | Body |
+|---|---|---|---|
+| Key present | `200 OK` | `text/plain; charset=utf-8` | the stored value, verbatim |
+| Key absent (never written, or deleted) | `404 Not Found` | `application/json` | `{"error":"key not found"}` |
+| No `key` query parameter | `400 Bad Request` | `application/json` | `{"error":"missing required query parameter: key"}` |
 
-```http
-POST /insert-val
-Content-Type: application/msgpack
-```
+Keys must be URL-safe: the query parser does no percent-decoding.
 
-**Request Body** (MsgPack encoded):
-```json
-{
-  "op": "DELETE",
-  "key": "your_key",
-  "value": ""
-}
-```
+### Anything else
+
+| Outcome | Status | Body |
+|---|---|---|
+| Any other method or path | `404 Not Found` | `{"error":"not found"}` |
 
 ### Cluster Management (Sidecar)
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -174,48 +175,96 @@ func (r *recordingReadCloser) Close() error {
 // CppFSM.Apply
 // ---------------------------------------------------------------------------
 
+// TestCppFSMApply covers every outcome of a single Raft log entry.
+//
+// Phase 1 (R1.4) fixed what Phase 0 pinned here: Apply used to throw the
+// response away (`_, err := f.client.Apply(...)`) and report success to Raft
+// whenever the gRPC call itself succeeded. A C++ state machine that explicitly
+// answered "I could not apply this" was therefore recorded as applied — silent
+// state divergence, with Raft believing this replica holds an entry it does
+// not. The two cases below that used to assert `nil` now assert a non-nil
+// *ApplyError carrying the state machine's own reason.
 func TestCppFSMApply(t *testing.T) {
+	const (
+		logIndex = uint64(7)
+		logTerm  = uint64(3)
+	)
 	transportErr := errors.New("rpc error: code = Unavailable desc = connection refused")
 
 	tests := []struct {
-		name    string
-		resp    *pb.ApplyResponse
-		err     error
-		wantErr error // nil => Apply must return an untyped nil interface{}
+		name string
+		resp *pb.ApplyResponse
+		err  error
+
+		wantErr bool
+		// wantErrIs, when non-nil, must be reachable via errors.Is so the
+		// original transport failure stays inspectable through the wrapper.
+		wantErrIs error
+		// wantContains are substrings the error message must carry. The
+		// index/term are asserted separately off the typed *ApplyError.
+		wantContains []string
 	}{
 		{
 			name:    "success is reported as nil",
 			resp:    &pb.ApplyResponse{Success: true},
 			err:     nil,
-			wantErr: nil,
+			wantErr: false,
 		},
 		{
-			name:    "transport error is returned verbatim",
-			resp:    nil,
-			err:     transportErr,
-			wantErr: transportErr,
+			name:      "transport error is wrapped and returned",
+			resp:      nil,
+			err:       transportErr,
+			wantErr:   true,
+			wantErrIs: transportErr,
+			wantContains: []string{
+				"index=7",
+				"term=3",
+				"connection refused",
+			},
 		},
 		{
-			// !!! PINNED BUG — DO NOT "FIX" IN PHASE 0 !!!
-			// The C++ state machine explicitly reported that it could NOT apply the
-			// entry (ApplyResponse.Success == false), yet CppFSM.Apply discards the
-			// response entirely (`_, err := f.client.Apply(...)`) and reports success
-			// to Raft. That is a silent state divergence: Raft believes the entry is
-			// applied on this node when it is not.
-			// Phase 1 makes Apply inspect resp.GetSuccess() and return an error here;
-			// this assertion flips from `nil` to a non-nil error at that point.
-			name:    "PIN: apply-reported failure is silently swallowed",
+			// Was "PIN: apply-reported failure is silently swallowed".
+			// R1.4 flipped it: the state machine's own reason now reaches Raft.
+			name: "apply-reported failure is returned with the state machine's reason",
+			resp: &pb.ApplyResponse{
+				Success: false,
+				Error:   "invalid command: empty key for op SET",
+			},
+			err:     nil,
+			wantErr: true,
+			wantContains: []string{
+				"index=7",
+				"term=3",
+				"invalid command: empty key for op SET",
+			},
+		},
+		{
+			// A false success with no error text is still a failure; the entry
+			// is unapplied either way, so Apply supplies its own reason rather
+			// than reporting an empty one.
+			name:    "apply-reported failure without a reason still fails",
 			resp:    &pb.ApplyResponse{Success: false},
 			err:     nil,
-			wantErr: nil,
+			wantErr: true,
+			wantContains: []string{
+				"index=7",
+				"term=3",
+				"state machine reported failure without a reason",
+			},
 		},
 		{
-			// Defensive: a nil response with a nil error is also treated as success
-			// today because the response is never dereferenced.
-			name:    "PIN: nil response with nil error is treated as success",
+			// Was "PIN: nil response with nil error is treated as success".
+			// Defensive: the response used to be discarded, so a nil one could
+			// never be noticed. It is now an explicit failure.
+			name:    "nil response with nil error is a failure",
 			resp:    nil,
 			err:     nil,
-			wantErr: nil,
+			wantErr: true,
+			wantContains: []string{
+				"index=7",
+				"term=3",
+				"nil response",
+			},
 		},
 	}
 
@@ -225,28 +274,93 @@ func TestCppFSMApply(t *testing.T) {
 			f := NewCppFSM(client)
 
 			got := f.Apply(&raft.Log{
-				Index: 1,
-				Term:  1,
+				Index: logIndex,
+				Term:  logTerm,
 				Type:  raft.LogCommand,
 				Data:  []byte("payload"),
 			})
 
-			if tt.wantErr == nil {
+			if !tt.wantErr {
 				if got != nil {
 					t.Fatalf("Apply() = %#v (%T), want nil", got, got)
 				}
-			} else {
-				gotErr, ok := got.(error)
-				if !ok {
-					t.Fatalf("Apply() = %#v (%T), want an error", got, got)
+				if n := client.callCount(); n != 1 {
+					t.Fatalf("client.Apply called %d times, want exactly 1", n)
 				}
-				if !errors.Is(gotErr, tt.wantErr) {
-					t.Fatalf("Apply() error = %v, want %v", gotErr, tt.wantErr)
+				return
+			}
+
+			gotErr, ok := got.(error)
+			if !ok {
+				t.Fatalf("Apply() = %#v (%T), want an error", got, got)
+			}
+			if tt.wantErrIs != nil && !errors.Is(gotErr, tt.wantErrIs) {
+				t.Errorf("Apply() error = %v, want errors.Is(..., %v)", gotErr, tt.wantErrIs)
+			}
+			for _, want := range tt.wantContains {
+				if !strings.Contains(gotErr.Error(), want) {
+					t.Errorf("Apply() error = %q, want it to contain %q", gotErr.Error(), want)
 				}
+			}
+
+			// The typed error is the seam rpc.Server.Propose inspects, and the
+			// index/term are what tell an operator which entry diverged.
+			var applyErr *ApplyError
+			if !errors.As(gotErr, &applyErr) {
+				t.Fatalf("Apply() error = %#v (%T), want an *ApplyError", gotErr, gotErr)
+			}
+			if applyErr.Index != logIndex || applyErr.Term != logTerm {
+				t.Errorf("ApplyError index/term = %d/%d, want %d/%d",
+					applyErr.Index, applyErr.Term, logIndex, logTerm)
+			}
+			if applyErr.Reason == "" {
+				t.Error("ApplyError.Reason is empty; the failure must always name a cause")
 			}
 
 			if n := client.callCount(); n != 1 {
 				t.Fatalf("client.Apply called %d times, want exactly 1", n)
+			}
+		})
+	}
+}
+
+// TestApplyErrorMessage pins the text an operator reads in the sidecar log and
+// that rpc.Server.Propose forwards verbatim into ProposeResponse.error.
+func TestApplyErrorMessage(t *testing.T) {
+	cause := errors.New("connection refused")
+
+	tests := []struct {
+		name      string
+		err       *ApplyError
+		want      string
+		wantCause error // nil => Unwrap must return nil
+	}{
+		{
+			name:      "state machine rejection has no underlying cause",
+			err:       &ApplyError{Index: 12, Term: 4, Reason: "unknown op FOO"},
+			want:      "fsm: failed to apply raft log entry index=12 term=4: unknown op FOO",
+			wantCause: nil,
+		},
+		{
+			name: "transport failure keeps its cause reachable",
+			err: &ApplyError{
+				Index:  12,
+				Term:   4,
+				Reason: cause.Error(),
+				Err:    cause,
+			},
+			want:      "fsm: failed to apply raft log entry index=12 term=4: connection refused",
+			wantCause: cause,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Errorf("Error() = %q, want %q", got, tt.want)
+			}
+			if got := errors.Unwrap(tt.err); got != tt.wantCause {
+				t.Errorf("errors.Unwrap() = %v, want %v", got, tt.wantCause)
 			}
 		})
 	}

@@ -12,34 +12,46 @@ extended.
 What it is **not** yet: a system you could trust with data or run unattended.
 The gaps, confirmed by code review:
 
-- ✅ **Tests and CI exist** (Phase 0, complete). Three layers: Go unit tests
-  covering `internal/fsm`, `management`, `cluster` and `config` (all above the
-  80% bar; live figures come from the CI coverage summary, and a snapshot is in
-  the Phase 0 doc — `internal/backend`, `raftnode`, `rpc` and `cmd/sidecar`
-  remain untested),
-  56 C++ GoogleTest cases under CTest (also run under ASan/UBSan), and an
-  asserting `tests/e2e` pytest suite that proves a leader write replicates to
-  **all three** nodes. `.github/workflows/ci.yml` gates gofmt, `go vet`,
+- ✅ **Tests and CI exist** (Phase 0, complete; extended by Phase 1). Three
+  layers: Go unit tests covering `internal/fsm`, `management`, `cluster`,
+  `config`, and — since Phase 1 — `backend` and `rpc` (live coverage figures
+  come from the CI summary, and a Phase 0 snapshot is in the Phase 0 doc;
+  `internal/raftnode` and `cmd/sidecar` remain untested); C++ GoogleTest cases
+  under CTest, also run under ASan/UBSan, covering `KVCommand`,
+  `PersistentKVStore`, `HttpRequestParser`, `StateMachineService::Apply` and
+  `KVHttpHandler`; and an asserting `tests/e2e` pytest suite that proves a
+  leader write replicates to **all three** nodes and pins the whole HTTP
+  status-code contract. `.github/workflows/ci.yml` gates gofmt, `go vet`,
   `go test -race`, clang-format, the C++ build and ctest, and the full
   docker-compose e2e run. Everything below is now change-detected: the suites
   **pin** the current wrong behavior, so each fix must flip its own tests.
   (`test_client.py` survives only as a manual demo — it still asserts nothing.)
-- **Correctness bugs.** `CppFSM.Apply` ignores `ApplyResponse.success`, so a
-  failed apply silently diverges a node from the raft log. `KVCommand::is_valid()`
-  exists but is never called. The HTTP status line is hardcoded to `OK`
-  (`HTTP/1.1 404 OK`), and every response is 200 with `"ok"`/`"error"` in the body.
-  `backend.Connect`'s 15-retry loop is a no-op because `grpc.Dial` is lazy.
+- ✅ **Errors are truthful** (Phase 1, complete). Every failure now reports what
+  actually happened, end to end: `CppFSM.Apply` returns a typed `*fsm.ApplyError`
+  instead of silently diverging a node from the raft log; `StateMachine.Apply`
+  validates the decoded command and fills `ApplyResponse.error`;
+  `rpc.Server.Propose` tags not-the-leader with a stable `not_leader:<addr>`
+  prefix; `GrpcRaftClient::propose` returns a `ProposeResult{success, error}`
+  rather than a bare bool; and the HTTP layer answers with real status codes,
+  correct reason phrases and JSON error bodies (200/400/404/415/502/503).
+  `backend.Connect` waits for the channel to reach `Ready`, so its retry loop is
+  no longer a no-op, and `entrypoint.sh` probes the C++ gRPC port instead of
+  sleeping. A malformed `Content-Length` no longer crashes the process — that
+  was a remote DoS, and there is now an e2e regression test for it.
 - **No durability.** `kv.db` is rewritten wholesale on every write with no fsync
   and no atomic rename; a crash mid-write corrupts the store.
 - **No snapshots.** `DiscardSnapshotStore` + `DummySnapshot` mean the raft log
   grows forever, restarts replay the entire history, and a lagging follower can
   never catch up via snapshot transfer.
-- **Unusable from a client's perspective.** Writes to a follower just fail
-  (no leader forwarding, no leader hint). Follower reads are silently stale.
-  The HTTP server is a single-threaded blocking loop with a 4KB first read, no
-  URL decoding, no body-size limit, and `std::stoi` on Content-Length can crash it.
+- **Unusable from a client's perspective.** Writes to a follower are rejected
+  rather than forwarded — the 503 does now name the leader, but it names its
+  *Raft* address (`node1:8088`), which is not something a client can dial.
+  Follower reads are silently stale with no linearizable option. Command
+  validation happens after the entry is committed, so a bad command still costs
+  a raft log entry. The HTTP server is a single-threaded blocking loop with a
+  4KB first read, no URL decoding and no body-size limit.
 - **No operability or security.** Unstructured logs, no metrics, `/health` always
-  says OK, `sleep 2` startup race, no signal propagation, no TLS or auth anywhere
+  says OK, no signal propagation, no TLS or auth anywhere
   (anyone who can reach :6000 can join a voter into the cluster).
 
 ## End-goal: what "finished" looks like
@@ -87,7 +99,7 @@ criteria) and implementation plan in `docs/phases/`:
 | Phase | Status | Spec & plan |
 |---|---|---|
 | 0 — Tests and CI | ✅ Complete | [docs/phases/phase-0-tests-and-ci.md](docs/phases/phase-0-tests-and-ci.md) |
-| 1 — Truthful errors | Not started | [docs/phases/phase-1-truthful-errors.md](docs/phases/phase-1-truthful-errors.md) |
+| 1 — Truthful errors | ✅ Complete | [docs/phases/phase-1-truthful-errors.md](docs/phases/phase-1-truthful-errors.md) |
 | 2 — Durability | Not started | [docs/phases/phase-2-durability.md](docs/phases/phase-2-durability.md) |
 | 3 — Snapshots & compaction | Not started | [docs/phases/phase-3-snapshots.md](docs/phases/phase-3-snapshots.md) |
 | 4 — Client usability | Not started | [docs/phases/phase-4-client-usability.md](docs/phases/phase-4-client-usability.md) |
@@ -131,6 +143,10 @@ and run `gofmt`/`clang-format` checks.
 **Exit:** CI green on main; e2e proves replication on all nodes.
 
 ### Phase 1 — Truthful errors *(small diffs, large trust gain)*
+
+**Status: ✅ Complete** — see the Outcome section of
+[docs/phases/phase-1-truthful-errors.md](docs/phases/phase-1-truthful-errors.md)
+for verified results and for the decisions taken where the spec was silent.
 
 1.1 **Fix the FSM contract.** `CppFSM.Apply` must check `ApplyResponse.success`;
 on failure return an error object raft can surface — and log loudly. Add an
@@ -290,7 +306,7 @@ README, CHANGELOG, tagged `v1.0.0` with multi-arch images pushed to a registry.
 | Phase | Status | Theme | Rough size | Unblocks |
 |---|---|---|---|---|
 | 0 | ✅ Complete | Tests + CI | M | everything |
-| 1 | Not started | Truthful errors | S–M | 2, 3, 4 |
+| 1 | ✅ Complete | Truthful errors | S–M | 2, 3, 4 |
 | 2 | Not started | Durability (WAL, atomic persist) | M | 3 |
 | 3 | Not started | Snapshots + compaction | L | 4 (wiped-node rejoin) |
 | 4 | Not started | Leader forwarding, consistency, HTTP rework | L | 5, 7 |

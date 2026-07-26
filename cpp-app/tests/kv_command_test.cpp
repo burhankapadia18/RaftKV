@@ -4,15 +4,19 @@
  *
  * KVCommand::from_msgpack is the trust boundary for every byte a client sends:
  * the HTTP layer forwards the body unparsed, so this is the first and only
- * place the payload is validated. These tests pin the CURRENT behavior,
- * including the places where it is permissive; Phase 1 (truthful errors) is
- * what changes the reporting, not this phase.
+ * place the payload is validated. These tests pin the decode contract,
+ * including the places where it is permissive.
+ *
+ * Phase 1 (R1.2/R1.3) added validation_error(), which is where the reason a
+ * command is rejected now lives; is_valid() is a thin wrapper over it. What
+ * Apply() does with that reason is pinned in state_machine_test.cpp.
  */
 
 #include <gtest/gtest.h>
 
 #include <exception>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -156,17 +160,16 @@ TEST(KVCommandTest, UnknownOpDecodesButIsInvalid) {
 
   const KVCommand cmd = decode(bytes);
 
-  // Decoding succeeds; only is_valid() flags the problem. CURRENT BEHAVIOR:
-  // StateMachine::Apply never calls is_valid() (it is dead code - the only
-  // references are its definition and this test file). An unknown op is still
-  // caught, but by the switch's UNKNOWN arm in state_machine.hpp: stderr log
-  // plus success=false, with gRPC status OK and no reason on the wire.
+  // Decoding succeeds; validation is what flags the problem. Since Phase 1
+  // (R1.2/R1.3) StateMachineService::Apply runs validation_error() before it
+  // touches the store, so an unknown op and an empty key both come back as
+  // success=false with the reason in ApplyResponse.error - see
+  // ApplyRejectsUnknownOpWithAReason / ApplyRejectsEmptyKeyWithoutTouchingStore
+  // in state_machine_test.cpp. (Before that, an unknown op was caught by the
+  // switch's UNKNOWN arm with no reason attached, and the empty key was not
+  // caught at all: store_.set("", value) ran and reported success.)
   //
-  // The case the missing is_valid() call actually loses is the EMPTY KEY:
-  // {op:"SET", key:""} is invalid, yet Apply runs store_.set("", value) and
-  // reports success=true. Nothing pins that today - it needs a KVHttpHandler
-  // or StateMachine test, which Phase 1 (R1.2/R1.3) adds along with routing
-  // both cases through validation. This test pins only the decode contract.
+  // This test pins only the decode contract.
   EXPECT_EQ(cmd.op, "PATCH");
   EXPECT_EQ(cmd.operation_type(), Operation::UNKNOWN);
   EXPECT_FALSE(cmd.is_valid());
@@ -274,6 +277,57 @@ TEST(KVCommandTest, IsValidTruthTable) {
     EXPECT_EQ(cmd.is_valid(), c.expected)
         << "op=[" << c.op << "] key=[" << c.key << "] value=[" << c.value
         << "]";
+    // is_valid() is implemented in terms of validation_error(); pin that the
+    // two can never disagree about whether a command is acceptable.
+    EXPECT_EQ(cmd.validation_error().has_value(), !c.expected)
+        << "op=[" << c.op << "] key=[" << c.key << "] value=[" << c.value
+        << "]";
+  }
+}
+
+TEST(KVCommandTest, ValidationErrorNamesTheOffendingField) {
+  // R1.2/R1.3: the reason strings are the payload of ApplyResponse.error, so
+  // they are part of the observable contract, not just log text. They must
+  // distinguish the two rejection causes and name the op.
+  struct Case {
+    const char *op;
+    const char *key;
+    const char *expected; // nullptr == valid, expect std::nullopt
+  };
+
+  const Case cases[] = {
+      {"SET", "k", nullptr},
+      {"DELETE", "k", nullptr},
+      // The op is quoted so an op that is empty or pure whitespace is still
+      // legible in a log line or an HTTP error body.
+      {"PATCH", "k", "unknown operation: \"PATCH\""},
+      {"set", "k", "unknown operation: \"set\""},
+      {"", "k", "unknown operation: \"\""},
+      // An unrecognized op is reported even when the key is also empty - the
+      // op is checked first because "SET with no key" only makes sense to say
+      // about an op the store actually knows.
+      {"PATCH", "", "unknown operation: \"PATCH\""},
+      {"SET", "", "empty key for operation \"SET\""},
+      {"DELETE", "", "empty key for operation \"DELETE\""},
+  };
+
+  for (const Case &c : cases) {
+    KVCommand cmd;
+    cmd.op = c.op;
+    cmd.key = c.key;
+    cmd.value = "v";
+
+    const std::optional<std::string> reason = cmd.validation_error();
+
+    if (c.expected == nullptr) {
+      EXPECT_FALSE(reason.has_value())
+          << "op=[" << c.op << "] key=[" << c.key << "] was rejected";
+      continue;
+    }
+
+    ASSERT_TRUE(reason.has_value())
+        << "op=[" << c.op << "] key=[" << c.key << "] was accepted";
+    EXPECT_EQ(*reason, c.expected);
   }
 }
 

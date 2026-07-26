@@ -101,3 +101,92 @@ no-op backend connect retry.
 - `go test -race ./...`, `ctest`, then `/cluster-smoke-test`.
 - Manual: `curl -i` each error path against the live cluster (follower write, missing
   key, wrong content type) and confirm status lines and JSON bodies.
+
+## Outcome
+
+**Status: ✅ Complete.** All eleven requirements landed and were verified against a
+real 3-node cluster, not just in unit tests.
+
+### Verified results
+
+| Layer | Result |
+|---|---|
+| Go | `gofmt` clean, `go vet` clean, `go test -race` stable over 2 consecutive runs |
+| Go coverage | `fsm` 100%, `rpc` 100% (new), `management` 97.1%, `cluster` 96.2%, `config` 87.5%, `backend` 87.2% (new) |
+| C++ | **97 tests**, 100% pass via CTest — up from 56 in Phase 0 |
+| C++ sanitizers | 97/97 under `-fsanitize=address,undefined`, via the FetchContent GoogleTest path CI actually takes |
+| clang-format | gate clean across `cpp-app/src` and `cpp-app/tests` |
+| e2e | **9/9** against a clean cluster built from the Phase 1 image (was 4) |
+
+Still untested on the Go side: `internal/raftnode` and `cmd/sidecar`.
+
+### The HTTP contract, confirmed by `curl -i` against a live cluster
+
+```
+SET on leader        200 application/json          {"ok":true}
+SET on follower      503 Service Unavailable       {"error":"not leader","leader":"172.18.0.4:8088"}
+GET hit              200 text/plain; charset=utf-8 <raw value>
+GET miss             404 Not Found                 {"error":"key not found"}
+GET without ?key=    400 Bad Request               {"error":"missing required query parameter: key"}
+wrong Content-Type   415 Unsupported Media Type    {"error":"unsupported media type","expected":"application/msgpack"}
+empty body           400 Bad Request               {"error":"empty request body"}
+unknown route        404 Not Found                 {"error":"not found"}
+```
+
+Reason phrases are correct on the status line — R1.7 fixed the hardcoded
+`HTTP/1.1 404 OK`. The `leader` field is raft's resolved peer address
+(`172.18.0.4:8088`), not the HTTP base URL, because `createTransport` resolves the
+advertised name to a TCP address.
+
+### The bug Phase 0 found, now fixed
+
+`Content-Length: abc` used to be a **remote denial of service**: `std::stoi` threw,
+the exception unwound out of `handle_connection` and `run()` into `main.cpp`'s
+catch-all, and the node exited 1 — verified in Phase 0 by moving a node to
+`Exited (1)` with a single unauthenticated request. It now returns
+`400 {"error":"malformed Content-Length"}` and all three nodes stay `Up`;
+`test_r1_8_malformed_content_length_is_rejected_without_killing_the_node` guards it.
+
+### Invalid commands are now reported instead of silently applied
+
+```
+empty key    502 {"error":"fsm: failed to apply raft log entry index=12 term=2: empty key for operation \"SET\""}
+unknown op   502 ... unknown operation: "FROB"
+bad msgpack  502 ... rpc error: code = Internal desc = parse error
+```
+
+`{op:"SET", key:""}` previously ran `store_.set("", value)` and reported success.
+
+### Decisions taken during implementation
+
+- **Propose timeouts were racing.** Both sides used 5s, so the C++ gRPC deadline
+  usually fired before the sidecar could answer and a slow commit surfaced as a bare
+  `DEADLINE_EXCEEDED` instead of the structured reason this phase exists to produce.
+  The Go `proposeTimeout` is now 4s, below the C++ 5s deadline; both sides carry a
+  comment pointing at the other.
+- **"Divergence" is now used accurately.** A `Success == false` rejection is a pure
+  function of the entry's bytes, so every replica rejects it identically and the
+  cluster stays consistent — it is logged as a deterministic rejection, not as
+  divergence. The transport-failure and nil-response branches, where this node may
+  genuinely differ from peers, are the ones that warn about divergence.
+- **Only `raft.ErrNotLeader` carries the `not_leader:` prefix**, exactly as R1.5
+  specifies. `ErrLeadershipLost` and `ErrLeadershipTransferInProgress` therefore
+  report as 502 rather than 503. That is arguably wrong for a client that could
+  usefully retry, but those errors also leave the write's outcome *uncertain*, which
+  is a different thing from "definitely not applied" — see Known issues.
+- **Malformed msgpack still returns gRPC `INTERNAL`**, so its `ApplyResponse.error`
+  never reaches the sidecar. No information is lost: the reason travels in the gRPC
+  status message instead, and the FSM surfaces it. The field is set anyway so the
+  unit tests can assert on it in-process.
+
+### Known issues this phase deliberately did not fix
+
+- **Validation happens after commit.** An invalid command is accepted by `Propose`,
+  replicated, committed, and only then rejected by every state machine. The bogus
+  entry is permanent in the log, consumes an index, and is re-rejected (and re-logged)
+  on every restart replay. Moving validation to the propose boundary would give a 400
+  and keep the log clean, but it means the C++ HTTP layer parsing the msgpack body —
+  which today it deliberately forwards opaquely (see CLAUDE.md). That is an
+  architectural change, not a Phase 1 one.
+- **Client-controlled `op` strings are echoed into error bodies and logs** quoted and
+  JSON-escaped, but not length-capped. Body/header caps are R4.9.

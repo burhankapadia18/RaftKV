@@ -26,4 +26,10 @@ message ProposeResponse {
 
 message ApplyResponse {
   bool success = 1;
+  // Why the apply failed, when success == false. Empty on success.
+  // Added in Phase 1: the Go FSM previously discarded this response entirely,
+  // so an apply the state machine rejected still looked committed to Raft.
+  // New tag — old binaries simply do not set it, and old raft log entries
+  // replay unchanged (see .claude/rules/protobuf.md).
+  string error = 2;
 }

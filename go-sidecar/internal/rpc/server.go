@@ -3,27 +3,69 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"time"
 
+	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 
-	"my-raft-sidecar/internal/raftnode"
 	pb "my-raft-sidecar/pb"
 )
+
+// NotLeaderPrefix tags a ProposeResponse.error that failed purely because this
+// node is not the leader. Everything after the colon is the current leader's
+// Raft address, which is empty while no leader is known.
+//
+// This is a wire contract, not a log message: the C++ HTTP layer keys its 503
+// response (and, from Phase 4 on, request forwarding) off this exact prefix.
+// Any other failure must NOT carry it.
+const NotLeaderPrefix = "not_leader:"
+
+// proposeTimeout bounds how long a proposal may wait to be committed and
+// applied before Raft gives up on it.
+//
+// Deliberately SHORTER than the C++ client's 5s gRPC deadline
+// (kDefaultTimeout in cpp-app/src/raft/raft_client.hpp). With both at 5s the
+// two races: the client's deadline usually fires first, so a slow commit
+// surfaces to the HTTP caller as a bare "DEADLINE_EXCEEDED" instead of the
+// structured raft reason this phase exists to produce. The 1s of margin lets
+// the sidecar always win and answer with a real ProposeResponse.
+//
+// If you change either value, keep this one below the C++ deadline.
+const proposeTimeout = 4 * time.Second
+
+// RaftProposer is the consumer-side view of the Raft node that the Propose
+// handler needs. Declaring it here (rather than depending on *raftnode.Node)
+// keeps this package testable with a fake and free of any dependency on
+// package raftnode.
+//
+// *raftnode.Node satisfies this interface; the production guarantee is the
+// call site in cmd/sidecar/main.go. The
+// `var _ RaftProposer = (*raftnode.Node)(nil)` assertion deliberately lives in
+// this package's test file rather than in package raftnode, since putting it
+// there would make raftnode import rpc and invert the dependency direction the
+// interface exists to break — same reasoning as management.RaftControl.
+type RaftProposer interface {
+	// Apply replicates data through Raft and returns the value the FSM
+	// produced for the resulting entry alongside any Raft-level error.
+	Apply(data []byte, timeout time.Duration) (interface{}, error)
+	// LeaderAddr returns the current leader's Raft address, or "" if unknown.
+	LeaderAddr() string
+}
 
 // Server represents the gRPC server for Raft operations.
 type Server struct {
 	pb.UnimplementedRaftNodeServer
-	node       *raftnode.Node
+	node       RaftProposer
 	grpcServer *grpc.Server
 	listener   net.Listener
 }
 
 // NewServer creates a new gRPC server for the Raft node.
-func NewServer(node *raftnode.Node) *Server {
+func NewServer(node RaftProposer) *Server {
 	return &Server{
 		node:       node,
 		grpcServer: grpc.NewServer(),
@@ -31,13 +73,39 @@ func NewServer(node *raftnode.Node) *Server {
 }
 
 // Propose handles client proposals to the Raft cluster.
+//
+// Failures are reported in the response body with a nil gRPC error: the C++
+// client checks reply.success() and reads reply.error(), so turning these into
+// gRPC status errors would break that contract.
+//
+// There are three distinct failure shapes and they must stay distinguishable:
+//   - not the leader: nothing was written anywhere, and the caller can retry
+//     against the address carried after NotLeaderPrefix;
+//   - other Raft error: the entry never committed;
+//   - FSM error: the entry DID commit and replicate, but this node's state
+//     machine refused to apply it. That is not a "try again elsewhere"
+//     situation and must not be dressed up as one.
 func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeResponse, error) {
-	if err := s.node.Apply(cmd.Data, 5*time.Second); err != nil {
-		return &pb.ProposeResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
+	resp, err := s.node.Apply(cmd.GetData(), proposeTimeout)
+	if err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			leader := s.node.LeaderAddr()
+			log.Printf("Propose rejected: not the leader (leader=%q)", leader)
+			return &pb.ProposeResponse{
+				Success: false,
+				Error:   NotLeaderPrefix + leader,
+			}, nil
+		}
+		log.Printf("ERROR: raft apply failed: %v", err)
+		return &pb.ProposeResponse{Success: false, Error: err.Error()}, nil
 	}
+
+	if applyErr, ok := resp.(error); ok && applyErr != nil {
+		log.Printf("ERROR: entry committed but the state machine rejected it: %v",
+			applyErr)
+		return &pb.ProposeResponse{Success: false, Error: applyErr.Error()}, nil
+	}
+
 	return &pb.ProposeResponse{Success: true}, nil
 }
 

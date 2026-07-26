@@ -20,24 +20,39 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import socket
 import time
+import urllib.parse
 import uuid
+from typing import NamedTuple
 
 import msgpack
 import pytest
 import requests
 
-# The response bodies and content type the C++ engine actually emits live in
-# contracts.py, imported by the tests as well so the two cannot drift.
-from contracts import BODY_OK, MSGPACK_CONTENT_TYPE
+# The status codes, media types and message strings the C++ engine actually
+# emits live in contracts.py, imported by the tests as well so the two cannot
+# drift.
+from contracts import (
+    ERROR_KEY_NOT_FOUND,
+    HTTP_NOT_FOUND,
+    HTTP_OK,
+    MSGPACK_CONTENT_TYPE,
+    WRITE_OK_BODY,
+)
 
 # --------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------
 
 DEFAULT_NODES = "http://localhost:8080,http://localhost:8081,http://localhost:8082"
+
+#: Read chunk size for the raw-socket helper. Nothing this suite sends produces
+#: a response anywhere near this large; the loop runs until the peer closes.
+RECV_CHUNK = 4096
 
 
 def _env_float(name: str, default: float) -> float:
@@ -105,11 +120,20 @@ def pack_command(op: str, key: str, value: str = "") -> bytes:
 def decode_body(response: requests.Response) -> str:
     """Decode a response body without relying on charset sniffing.
 
-    The C++ server sends no ``Content-Type`` on responses, so
-    ``Response.text`` would fall back to encoding *detection*. The bodies we
-    assert on are ASCII; decode them explicitly.
+    The server does declare a ``Content-Type`` now, but ``requests`` only reads
+    a charset out of it for ``text/*``; for ``application/json`` it falls back
+    to encoding *detection*. Every body this suite asserts on is UTF-8, so
+    decode it explicitly rather than letting a heuristic decide.
     """
     return response.content.decode("utf-8")
+
+
+def try_json(text: str):
+    """Parse ``text`` as JSON, or return ``None`` if it is not valid JSON."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
 
 
 def post_command(base_url: str, op: str, key: str, value: str = "") -> requests.Response:
@@ -120,10 +144,21 @@ def post_command(base_url: str, op: str, key: str, value: str = "") -> requests.
     socket after every response without sending ``Connection: close``, so a
     pooled keep-alive connection would be reused after the peer hung up.
     """
+    return post_payload(base_url, pack_command(op, key, value))
+
+
+def post_payload(
+    base_url: str, payload: bytes, content_type: str = MSGPACK_CONTENT_TYPE
+) -> requests.Response:
+    """POST arbitrary bytes to ``/insert-val`` with an explicit media type.
+
+    Used by the error-path tests, which need a body or a ``Content-Type`` that
+    ``post_command`` would never produce.
+    """
     return requests.post(
         f"{base_url}/insert-val",
-        data=pack_command(op, key, value),
-        headers={"Content-Type": MSGPACK_CONTENT_TYPE},
+        data=payload,
+        headers={"Content-Type": content_type},
         timeout=HTTP_TIMEOUT,
     )
 
@@ -143,22 +178,162 @@ def get_value(base_url: str, key: str) -> requests.Response:
 
 
 # --------------------------------------------------------------------------
+# Raw socket access
+# --------------------------------------------------------------------------
+
+
+class RawResponse(NamedTuple):
+    """An HTTP response read straight off a socket."""
+
+    status: int
+    reason: str
+    headers: dict
+    body: str
+
+    def json(self):
+        """Body parsed as JSON, or ``None`` if it is not JSON."""
+        return try_json(self.body)
+
+    def __str__(self) -> str:
+        return f"HTTP {self.status} {self.reason} body={self.body!r}"
+
+
+def parse_raw_response(raw: bytes) -> RawResponse:
+    """Parse the bytes of a complete HTTP response.
+
+    Raises ``ValueError`` when the peer sent nothing or something that is not a
+    status line -- both of which mean "the node did not answer", which is
+    exactly what the R1.8 regression test needs to distinguish from a 400.
+    """
+    if not raw:
+        raise ValueError("peer closed the connection without sending a response")
+
+    head, separator, body = raw.partition(b"\r\n\r\n")
+    if not separator:
+        raise ValueError(f"response has no header terminator: {raw!r}")
+
+    lines = head.split(b"\r\n")
+    status_line = lines[0].decode("latin-1")
+    parts = status_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ValueError(f"not an HTTP status line: {status_line!r}")
+
+    headers = {}
+    for line in lines[1:]:
+        name, colon, value = line.decode("latin-1").partition(":")
+        if colon:
+            headers[name.strip().lower()] = value.strip()
+
+    reason = parts[2] if len(parts) > 2 else ""
+    return RawResponse(int(parts[1]), reason, headers, body.decode("utf-8", "replace"))
+
+
+def raw_http_request(base_url: str, request: bytes, timeout=None) -> RawResponse:
+    """Send raw bytes to a node's HTTP port and read the whole response.
+
+    ``requests`` cannot express a malformed request -- it builds
+    ``Content-Length`` itself from the body -- so the R1.8 regression test has
+    to speak the wire directly. The server closes the connection after every
+    response, so reading to EOF is the framing.
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    deadline = HTTP_TIMEOUT if timeout is None else timeout
+
+    chunks = []
+    with socket.create_connection(
+        (parsed.hostname, parsed.port or 80), timeout=deadline
+    ) as sock:
+        sock.sendall(request)
+        while True:
+            chunk = sock.recv(RECV_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+    return parse_raw_response(b"".join(chunks))
+
+
+# --------------------------------------------------------------------------
 # Cluster client
 # --------------------------------------------------------------------------
 
 
+class ReadResult(NamedTuple):
+    """What one ``GET /get-val`` attempt observed.
+
+    ``status`` is ``None`` when the request never completed; ``body`` then
+    carries the transport error instead of a response body.
+    """
+
+    status: int | None
+    body: str
+
+    @property
+    def reachable(self) -> bool:
+        return self.status is not None
+
+    def __str__(self) -> str:
+        if self.status is None:
+            return f"unreachable ({self.body})"
+        return f"HTTP {self.status} body={self.body!r}"
+
+
+def _is_value(expected: str):
+    """Predicate: the node serves ``expected`` as a 200 plain-text body."""
+
+    def matches(result: ReadResult) -> bool:
+        return result.status == HTTP_OK and result.body == expected
+
+    return matches
+
+
+def _is_missing(result: ReadResult) -> bool:
+    """Predicate: the node reports the key as absent (404 + the JSON envelope)."""
+    if result.status != HTTP_NOT_FOUND:
+        return False
+    payload = try_json(result.body)
+    return isinstance(payload, dict) and payload.get("error") == ERROR_KEY_NOT_FOUND
+
+
 class ClusterClient:
-    """Thin HTTP client bound to a discovered cluster topology."""
+    """Thin HTTP client bound to a discovered cluster topology.
+
+    Everything the tests need to talk to the cluster hangs off this object, so
+    ``test_cluster.py`` imports only ``contracts`` and never ``conftest`` by
+    name (see the note at the top of contracts.py).
+    """
 
     def __init__(self, nodes, leader: str) -> None:
         self.nodes = tuple(nodes)
         self.leader = leader
         self.followers = tuple(url for url in nodes if url != leader)
 
+    # -- decoding ----------------------------------------------------------
+
     @staticmethod
     def body(response: requests.Response) -> str:
         """Response body as text (see :func:`decode_body`)."""
         return decode_body(response)
+
+    @staticmethod
+    def json(response: requests.Response) -> dict:
+        """Response body parsed as a JSON object, or a clear failure.
+
+        Failing here rather than raising ``JSONDecodeError`` keeps the raw body
+        in the report, which is what you need when the handler answered with
+        something unexpected.
+        """
+        text = decode_body(response)
+        payload = try_json(text)
+        if not isinstance(payload, dict):
+            pytest.fail(
+                f"expected a JSON object body from {response.url}, got "
+                f"HTTP {response.status_code} "
+                f"Content-Type={response.headers.get('Content-Type')!r} "
+                f"body={text!r}",
+                pytrace=False,
+            )
+        return payload
 
     # -- writes ------------------------------------------------------------
 
@@ -168,45 +343,95 @@ class ClusterClient:
     def delete(self, base_url: str, key: str) -> requests.Response:
         return post_command(base_url, "DELETE", key, "")
 
+    def post_payload(
+        self, base_url: str, payload: bytes, content_type: str = MSGPACK_CONTENT_TYPE
+    ) -> requests.Response:
+        """POST arbitrary bytes to ``/insert-val`` (error-path tests)."""
+        return post_payload(base_url, payload, content_type)
+
     # -- reads -------------------------------------------------------------
 
     def get(self, base_url: str, key: str) -> requests.Response:
         return get_value(base_url, key)
 
-    def read(self, base_url: str, key: str):
-        """Body of ``GET /get-val``, or ``None`` if the node is unreachable.
+    @staticmethod
+    def visit(base_url: str, path: str) -> requests.Response:
+        """GET an arbitrary path, for the routes with no happy path at all."""
+        return requests.get(f"{base_url}{path}", timeout=HTTP_TIMEOUT)
+
+    def probe_read(self, base_url: str, key: str) -> ReadResult:
+        """One ``GET /get-val``, with transport errors folded into the result.
 
         Transport errors are swallowed only so that polling survives a node
         that is momentarily busy; the caller's deadline still expires and the
-        assertion still fails, reporting ``None`` as the last body seen.
+        assertion still fails, reporting the last observation.
         """
         try:
-            return decode_body(self.get(base_url, key))
-        except requests.RequestException:
-            return None
+            response = self.get(base_url, key)
+        except requests.RequestException as exc:
+            return ReadResult(None, f"{type(exc).__name__}: {exc}")
+        return ReadResult(response.status_code, decode_body(response))
 
-    def wait_for_body(self, base_url: str, key: str, expected: str, timeout=None):
-        """Poll one node until ``GET /get-val`` returns ``expected``.
+    # -- raw wire ----------------------------------------------------------
 
-        Returns ``(matched, last_body_seen)``.
+    @staticmethod
+    def send_raw(base_url: str, request: bytes) -> RawResponse:
+        """Send handcrafted request bytes to a node (see :func:`raw_http_request`)."""
+        return raw_http_request(base_url, request)
+
+    @staticmethod
+    def malformed_content_length_request(base_url: str, value: str = "abc") -> bytes:
+        """A ``POST /insert-val`` whose ``Content-Length`` is not a number.
+
+        ``requests`` will not emit this: it computes ``Content-Length`` from the
+        body. Byte-for-byte construction is the only way to reproduce the
+        Phase 0 crash.
+        """
+        host = urllib.parse.urlsplit(base_url).netloc
+        return (
+            "POST /insert-val HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Content-Type: {MSGPACK_CONTENT_TYPE}\r\n"
+            f"Content-Length: {value}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+    # -- polling -----------------------------------------------------------
+
+    def wait_for(self, base_url: str, key: str, matches, timeout=None):
+        """Poll one node's ``GET /get-val`` until ``matches(ReadResult)`` holds.
+
+        Returns ``(matched, last_observation)``.
         """
         deadline = REPLICATION_TIMEOUT if timeout is None else timeout
-        seen = [None]
+        seen = [ReadResult(None, "never probed")]
 
-        def matches() -> bool:
-            seen[0] = self.read(base_url, key)
-            return seen[0] == expected
+        def check() -> bool:
+            seen[0] = self.probe_read(base_url, key)
+            return matches(seen[0])
 
-        matched = wait_until(matches, timeout=deadline, interval=POLL_INTERVAL)
+        matched = wait_until(check, timeout=deadline, interval=POLL_INTERVAL)
         return bool(matched), seen[0]
 
-    def wait_for_body_on_all(self, key: str, expected: str, timeout=None):
-        """Poll every node; returns ``{base_url: last_body_seen}`` for mismatches."""
+    def wait_for_value_on_all(self, key: str, expected: str, timeout=None) -> dict:
+        """Poll every node until it serves ``expected``.
+
+        Returns ``{base_url: last_observation}`` for the nodes that never did --
+        empty means every node converged.
+        """
+        return self._wait_on_all(key, _is_value(expected), timeout)
+
+    def wait_for_missing_on_all(self, key: str, timeout=None) -> dict:
+        """Poll every node until it reports ``key`` as absent (404)."""
+        return self._wait_on_all(key, _is_missing, timeout)
+
+    def _wait_on_all(self, key: str, matches, timeout) -> dict:
         mismatches = {}
         for url in self.nodes:
-            matched, last = self.wait_for_body(url, key, expected, timeout=timeout)
+            matched, last = self.wait_for(url, key, matches, timeout=timeout)
             if not matched:
-                mismatches[url] = last
+                mismatches[url] = str(last)
         return mismatches
 
 
@@ -254,11 +479,16 @@ def leader(nodes: list[str], run_id: str) -> str:
     The management API (:6000 ``/status``) is **not** published to the host by
     docker-compose.yml, so we cannot ask the cluster who leads. Instead we
     exploit the current no-forwarding contract: a write only succeeds on the
-    leader. Followers answer ``error`` because ``raft.Apply`` returns
-    ``ErrNotLeader`` (go-sidecar/internal/rpc/server.go) and the C++ handler
-    turns a failed propose into the body ``error``.
+    leader. Since Phase 1 that is unambiguous on the wire -- the leader answers
+    ``200 {"ok":true}`` and a follower answers ``503`` with
+    ``{"error":"not leader","leader":"<raft address>"}``, because
+    ``raft.Apply`` returns ``ErrNotLeader``, the sidecar tags it
+    ``not_leader:<addr>`` (go-sidecar/internal/rpc/server.go) and the C++
+    handler maps that prefix to 503.
 
-    The probe is retried until ``RAFTKV_LEADER_TIMEOUT`` so a cluster still
+    The probe deliberately keys off the success shape rather than "not a 503",
+    so a node answering 502 (sidecar unreachable) is never mistaken for a
+    leader. It is retried until ``RAFTKV_LEADER_TIMEOUT`` so a cluster still
     holding an election is tolerated.
     """
     last_round: list[str] = []
@@ -274,7 +504,7 @@ def leader(nodes: list[str], run_id: str) -> str:
                 continue
             body = decode_body(response)
             last_round.append(f"{url} -> HTTP {response.status_code} body={body!r}")
-            if response.status_code == 200 and body == BODY_OK:
+            if response.status_code == HTTP_OK and try_json(body) == WRITE_OK_BODY:
                 return url
         return None
 
@@ -284,6 +514,9 @@ def leader(nodes: list[str], run_id: str) -> str:
         pytest.fail(
             "No node accepted a write within "
             f"{LEADER_TIMEOUT:g}s -- the RaftKV cluster does not look ready.\n"
+            f"Expected exactly one node to answer HTTP 200 {WRITE_OK_BODY!r}; "
+            "a follower answers 503 {'error': 'not leader', ...} and a node "
+            "whose sidecar is down answers 502.\n"
             f"Probed nodes: {', '.join(nodes)}\n"
             f"Last probe round:\n  {detail}\n"
             "These tests do not manage docker. Start the cluster first:\n"

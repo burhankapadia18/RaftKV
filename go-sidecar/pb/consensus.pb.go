@@ -142,8 +142,14 @@ func (x *ProposeResponse) GetError() string {
 }
 
 type ApplyResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Success bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	// Why the apply failed, when success == false. Empty on success.
+	// Added in Phase 1: the Go FSM previously discarded this response entirely,
+	// so an apply the state machine rejected still looked committed to Raft.
+	// New tag — old binaries simply do not set it, and old raft log entries
+	// replay unchanged (see .claude/rules/protobuf.md).
+	Error         string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -185,6 +191,13 @@ func (x *ApplyResponse) GetSuccess() bool {
 	return false
 }
 
+func (x *ApplyResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_consensus_proto protoreflect.FileDescriptor
 
 const file_consensus_proto_rawDesc = "" +
@@ -197,9 +210,10 @@ const file_consensus_proto_rawDesc = "" +
 	"\x04data\x18\x04 \x01(\fR\x04data\"A\n" +
 	"\x0fProposeResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\")\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"?\n" +
 	"\rApplyResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess2E\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error2E\n" +
 	"\bRaftNode\x129\n" +
 	"\aPropose\x12\x12.consensus.Command\x1a\x1a.consensus.ProposeResponse2E\n" +
 	"\fStateMachine\x125\n" +

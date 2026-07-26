@@ -23,7 +23,8 @@ protoc -I ../proto --go_out=. --go-grpc_out=. ../proto/consensus.proto
 Output lands in `go-sidecar/pb/` (driven by `option go_package = "./pb";`). Commit the regenerated files. Then verify:
 
 ```bash
-go build -o /dev/null ./cmd/sidecar
+test -z "$(gofmt -l .)" && go vet ./... && go build -o /dev/null ./cmd/sidecar
+go test -race ./...
 ```
 
 ## C++ (automatic — do nothing)
@@ -40,4 +41,12 @@ cd cpp-app/build && cmake .. && make -j4
 
 1. Update both sides' code for the new fields/RPCs (`cpp-app/src/raft/`, `go-sidecar/internal/rpc/`, `go-sidecar/internal/fsm/`).
 2. Mind compatibility: committed raft log entries are replayed through `StateMachine.Apply` on restart, so the apply path must still decode old payloads. Never renumber existing field tags.
-3. Run the full verification: invoke the `cluster-smoke-test` skill (docker build + compose + test_client.py).
+3. Keep the client-visible contract in step: if the change alters what a client sees, update the README API tables and `tests/e2e/contracts.py` in the same commit (`contracts.py` is the suite's single source of truth for status codes and bodies).
+4. Run the full verification: invoke the `cluster-smoke-test` skill — `docker build`, `docker compose up -d`, then the asserting end-to-end suite:
+
+   ```bash
+   pip install -r tests/e2e/requirements.txt   # once
+   pytest tests/e2e -v
+   ```
+
+   Not `test_client.py`: it asserts nothing and only touches one node.

@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "consensus.grpc.pb.h"
@@ -32,11 +33,19 @@ public:
   /**
    * @brief Apply a committed command from the Raft log.
    *
-   * Deserializes the MsgPack command and applies it to the store.
+   * Deserializes the MsgPack command, validates it, and applies it to the
+   * store. This is the only place the client payload is ever inspected (the
+   * HTTP layer forwards the body opaquely), so it is also the only place a
+   * bad command can be caught.
    *
-   * @param context gRPC server context
+   * Rejections (R1.2/R1.3) are reported in the response body
+   * (`success=false` plus a reason in `error`) with gRPC status OK, so the
+   * caller can tell "the state machine refused this entry" apart from "the
+   * call did not get through".
+   *
+   * @param context gRPC server context (unused)
    * @param request The command containing MsgPack-encoded data
-   * @param reply Response indicating success/failure
+   * @param reply Response indicating success/failure and why
    * @return gRPC status
    */
   grpc::Status Apply(grpc::ServerContext *context,
@@ -46,6 +55,18 @@ public:
       // Deserialize the command from MsgPack
       KVCommand cmd = KVCommand::from_msgpack(request->data().data(),
                                               request->data().size());
+
+      // R1.2/R1.3: validate BEFORE touching the store. This check used to be
+      // dead code, which is why {op:"SET", key:""} was written to the store
+      // and reported as a success, and why an unknown op failed with no
+      // reason attached.
+      const std::optional<std::string> reason = cmd.validation_error();
+      if (reason.has_value()) {
+        std::cerr << "[StateMachine] Rejected: " << *reason << std::endl;
+        reply->set_success(false);
+        reply->set_error(*reason);
+        return grpc::Status::OK;
+      }
 
       std::cout << "[StateMachine] Applied: " << cmd.op << " " << cmd.key
                 << std::endl;
@@ -59,9 +80,11 @@ public:
         store_.remove(cmd.key);
         break;
       case Operation::UNKNOWN:
-        std::cerr << "[StateMachine] Unknown operation: " << cmd.op
-                  << std::endl;
+        // Unreachable: validation_error() rejects UNKNOWN above. Kept so the
+        // switch stays exhaustive for -Wswitch and can never fall through to
+        // success=true should the two ever drift apart.
         reply->set_success(false);
+        reply->set_error("unhandled operation: \"" + cmd.op + "\"");
         return grpc::Status::OK;
       }
 
@@ -69,8 +92,17 @@ public:
       return grpc::Status::OK;
 
     } catch (const std::exception &e) {
+      // Malformed MsgPack. Note this arm returns a non-OK gRPC status, which
+      // means the fields set on `reply` never reach the caller: gRPC does
+      // not deliver a response message alongside an error status. The error
+      // is set anyway so the two failure shapes stay consistent for in-process
+      // callers (and unit tests), and because the Go FSM treats a transport
+      // error and success=false identically. Preserving the pre-Phase-1 status
+      // here is deliberate: changing it would change which of the two paths a
+      // malformed payload takes.
       std::cerr << "[StateMachine] Error: " << e.what() << std::endl;
       reply->set_success(false);
+      reply->set_error(e.what());
       return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
     }
   }

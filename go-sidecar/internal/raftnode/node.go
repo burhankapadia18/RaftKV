@@ -135,10 +135,26 @@ func (n *Node) AddVoter(id, address string) error {
 	return future.Error()
 }
 
-// Apply proposes a command to the Raft cluster.
-func (n *Node) Apply(data []byte, timeout time.Duration) error {
+// Apply proposes a command to the Raft cluster and waits for it to be applied
+// locally.
+//
+// Both halves of the outcome are surfaced, because they fail independently:
+//   - the returned error is the Raft-level failure (not leader, enqueue
+//     timeout, leadership lost) — the entry was never committed;
+//   - the returned value is whatever the FSM's Apply returned for this entry
+//     (nil on success, an *fsm.ApplyError when the local state machine
+//     rejected a committed entry). Collapsing that to a bare nil error is what
+//     made state-machine failures invisible to callers.
+//
+// Response() is only read once Error() has returned nil: Raft populates the
+// future's response before unblocking it, and the value is meaningless when
+// the entry never committed.
+func (n *Node) Apply(data []byte, timeout time.Duration) (interface{}, error) {
 	future := n.Raft.Apply(data, timeout)
-	return future.Error()
+	if err := future.Error(); err != nil {
+		return nil, err
+	}
+	return future.Response(), nil
 }
 
 // IsLeader returns true if this node is currently the leader.

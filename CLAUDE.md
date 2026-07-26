@@ -41,9 +41,9 @@ Use `docker compose` (the CLI plugin), not the standalone `docker-compose` binar
 
 There are three test layers, all of which must stay green:
 
-1. **Go unit tests** (`go-sidecar/internal/*/*_test.go`) — `internal/fsm`, `internal/config`, `internal/cluster`, `internal/management`, run with `go test -race ./...`. `internal/backend`, `internal/raftnode`, `internal/rpc` and `cmd/sidecar` have no tests yet.
-2. **C++ unit tests** (`cpp-app/tests/*.cpp`, GoogleTest via CTest) — `KVCommand::from_msgpack`, `PersistentKVStore`, `HttpRequestParser`. Built only when `-DKVDB_BUILD_TESTS=ON`; uses the system GoogleTest when present, otherwise fetches it. Also run under `-fsanitize=address,undefined` in CI.
-3. **End-to-end** (`tests/e2e/`, pytest) — asserts that a write on the leader is readable on **all three** nodes, DELETE round-trips, missing keys, and follower-write rejection. Requires a live cluster; exits 1 with a "cluster does not look ready" message if there isn't one.
+1. **Go unit tests** (`go-sidecar/internal/*/*_test.go`) — `internal/fsm`, `internal/config`, `internal/cluster`, `internal/management`, `internal/backend`, `internal/rpc`, run with `go test -race ./...`. `internal/raftnode` and `cmd/sidecar` have no tests yet.
+2. **C++ unit tests** (`cpp-app/tests/*.cpp`, GoogleTest via CTest) — `KVCommand::from_msgpack`, `PersistentKVStore`, `HttpRequestParser`, `StateMachineService::Apply`, `KVHttpHandler`. Built only when `-DKVDB_BUILD_TESTS=ON`; uses the system GoogleTest when present, otherwise fetches it. Also run under `-fsanitize=address,undefined` in CI. Test sources are **listed explicitly** in `CMakeLists.txt`, not globbed — a new test file is a visible diff.
+3. **End-to-end** (`tests/e2e/`, pytest) — asserts that a write on the leader is readable on **all three** nodes, DELETE round-trips, and the full HTTP status-code contract (404 on a miss, 503 naming the leader on a follower write, 415/400 on bad requests, and a regression test proving a malformed `Content-Length` no longer kills a node). Requires a live cluster; exits 1 with a "cluster does not look ready" message if there isn't one.
 
 `test_client.py` is retained only as a manual one-shot demo — it asserts nothing and checks a single node. Use `pytest tests/e2e` for verification. If you add tests, follow [.claude/rules/testing.md](.claude/rules/testing.md).
 
@@ -58,14 +58,16 @@ Understanding writes vs. reads is the key to this codebase:
 2. C++ forwards the **raw MsgPack bytes opaquely** in `Command.data` via `GrpcRaftClient.propose()` → Go sidecar's `RaftNode.Propose` (port 50052) (`cpp-app/src/raft/raft_client.hpp`, `go-sidecar/internal/rpc/server.go`)
 3. Go calls `raft.Apply()`; the leader replicates the log entry to followers
 4. Once committed, every node's `CppFSM.Apply` (`go-sidecar/internal/fsm/fsm.go`) calls back into its local C++ `StateMachine.Apply` (port 50051)
-5. C++ **only now** deserializes the MsgPack into a `KVCommand` (`cpp-app/src/commands/kv_command.hpp`) and applies SET/DELETE to `PersistentKVStore`, which rewrites `kv.db`
+5. C++ **only now** deserializes the MsgPack into a `KVCommand` (`cpp-app/src/commands/kv_command.hpp`), validates it (`validation_error()` — unknown op, empty key), and applies SET/DELETE to `PersistentKVStore`, which rewrites `kv.db`
+6. Every failure on that path is reported truthfully back down it: `StateMachine.Apply` fills `ApplyResponse.error`, `CppFSM.Apply` turns a failed apply into an `*fsm.ApplyError` (never `nil`), `rpc.Server.Propose` surfaces it in `ProposeResponse.error`, `GrpcRaftClient::propose` returns a `ProposeResult{success, error}`, and `KVHttpHandler` maps that onto a status code and a JSON body
 
 **Read path** (no consensus): `GET /get-val?key=...` is served directly from the local in-memory store. Reads on followers can be stale.
 
 Important consequences:
-- The proto `Command.op/key/value` fields are **unused in transit** — the payload rides in `Command.data` as opaque MsgPack. Only the C++ state machine parses it, at apply time. Changing the wire format means touching `kv_command.hpp`, `cpp-app/tests/kv_command_test.cpp`, `tests/e2e/conftest.py`, `test_client.py`, and the README API docs together.
-- Writes sent to a follower **fail** (`raft.Apply` returns `ErrNotLeader`; there is no leader forwarding). The client gets `error`.
-- Startup order matters: the C++ app must be up before the sidecar connects (the sidecar retries; see `entrypoint.sh` for launch order and CLI args of both binaries).
+- The proto `Command.op/key/value` fields are **unused in transit** — the payload rides in `Command.data` as opaque MsgPack. Only the C++ state machine parses it, at apply time. Changing the wire format means touching `kv_command.hpp`, `cpp-app/tests/kv_command_test.cpp`, `tests/e2e/contracts.py`, `test_client.py`, and the README API docs together.
+- Writes sent to a follower are **rejected, not forwarded**. `raft.Apply` returns `ErrNotLeader`; `rpc.Server.Propose` reports `ProposeResponse{success:false, error:"not_leader:<raft addr>"}` using `rpc.NotLeaderPrefix` and the address from `LeaderWithID`; the C++ handler maps that prefix onto **503** with `{"error":"not leader","leader":"node1:8088"}`. That prefix is a wire contract, not a log message — Phase 4 leader forwarding is built on it, so any other failure must not carry it (those become **502**).
+- The exact HTTP status/body for every path is tabulated in [README.md](README.md#api-reference) and mirrored as constants in `tests/e2e/contracts.py`. Change the handler and both of those in the same commit.
+- Startup order matters: the C++ app must be up before the sidecar connects. `entrypoint.sh` probes `/dev/tcp/127.0.0.1/50051` in a bounded loop (`APP_WAIT_TIMEOUT`, default 30s) before launching the sidecar, and `backend.Connect` additionally waits for the gRPC channel to reach `Ready` with its own retry budget. See `entrypoint.sh` for launch order and the CLI args of both binaries.
 
 ## Component Map
 
@@ -98,10 +100,12 @@ See [.claude/rules/protobuf.md](.claude/rules/protobuf.md) for the regeneration 
 
 These are acknowledged simplifications. If a task touches one, call it out and confirm scope before redesigning.
 
-Phase 0 removed none of these — it **pinned** them with tests that assert the current (wrong) behavior, each commented with the phase that will change it. Fixing a limitation therefore means updating its pinning tests in the same PR: see the pinned-behavior tables in `tests/e2e/README.md` and the `CURRENT LOSSY BEHAVIOR` / `PINNED` comments in `cpp-app/tests/` and `go-sidecar/internal/fsm/fsm_test.go`.
+Phase 0 removed none of these — it **pinned** them with tests that assert the current (wrong) behavior, each commented with the phase that will change it. Fixing a limitation therefore means updating its pinning tests in the same PR: see the pinned-behavior tables in `tests/e2e/README.md` and the `CURRENT LOSSY BEHAVIOR` / `PINNED` comments in `cpp-app/tests/` and `go-sidecar/internal/fsm/fsm_test.go`. This list shrinks as phases land — Phase 1 removed the stringly-error entry, so do not reintroduce it.
 
 - **No snapshots**: `CppFSM` returns a `DummySnapshot` and the raft node uses `NewDiscardSnapshotStore()` — the raft log grows unbounded and restarts replay the full log.
 - **Durability**: `PersistentKVStore::persist()` rewrites the entire `kv.db` on every write, without `fsync` or WAL.
-- **HTTP server**: single-threaded accept loop, one 4KB read per request, no keep-alive; responses always say `OK` regardless of status code.
+- **HTTP server**: single-threaded accept loop, one 4KB read per request, no keep-alive, no body-size cap, no URL decoding. (Status lines and error bodies are truthful as of Phase 1; a negative `Content-Length` is still unhandled.)
+- **No leader forwarding**: a write to a follower is answered with 503 and the leader's *Raft* address, which is not something a client can dial. Phase 4.
+- **Stale reads**: `GET /get-val` is served from the local store with no read-index check, and there is no way to request a linearizable read. Phase 4.
+- **Validation happens after commit**: a command with an unknown op or an empty key is replicated first and rejected at apply time, costing a raft log entry and returning 502.
 - **No TLS/auth anywhere**: all gRPC channels and HTTP endpoints are insecure; the management `/join` endpoint is unauthenticated.
-- **Errors are stringly reported**: write failures return HTTP 200 with body `error`.

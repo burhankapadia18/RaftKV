@@ -184,17 +184,22 @@ if(KVDB_BUILD_TESTS)
         tests/kv_command_test.cpp
         tests/kv_store_test.cpp
         tests/http_request_test.cpp
+        tests/state_machine_test.cpp
+        tests/http_handler_test.cpp
     )
 
     target_include_directories(kvdb_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROTO_BINARY_DIR}
     )
 
-    # Deliberately NOT linked against consensus_proto / gRPC: the three units
-    # under test (KVCommand, PersistentKVStore, HttpRequestParser) include only
-    # msgpack and the standard library.
+    # Phase 1 links consensus_proto: StateMachineService::Apply and
+    # KVHttpHandler are now under test, and both sit on the generated
+    # consensus.pb.h / grpc.pb.h types. The pure units (KVCommand,
+    # PersistentKVStore, HttpRequestParser) still need nothing but msgpack.
     target_link_libraries(kvdb_tests PRIVATE
         GTest::gtest_main
+        consensus_proto
         msgpackc
     )
 

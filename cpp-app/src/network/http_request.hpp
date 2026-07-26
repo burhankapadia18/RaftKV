@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 namespace kvdb {
@@ -22,6 +23,14 @@ struct HttpRequest {
   std::string body;
   bool is_msgpack = false;
   int content_length = 0;
+
+  /**
+   * @brief Set when a Content-Length header was present but unparseable.
+   *
+   * @c content_length stays 0 in that case. The handler answers 400 rather
+   * than guessing at a body length.
+   */
+  bool bad_content_length = false;
 
   /**
    * @brief Parse query parameters from the query string.
@@ -104,7 +113,19 @@ public:
 
       if (lower_line.find("content-length:") != std::string::npos) {
         size_t colon = line.find(':');
-        request.content_length = std::stoi(line.substr(colon + 1));
+        // std::stoi throws on garbage ("abc"), on an empty value and on
+        // anything wider than an int. parse() must stay total: an exception
+        // here would unwind out of the accept loop and take the process down,
+        // which makes a single unauthenticated header a remote kill switch.
+        try {
+          request.content_length = std::stoi(line.substr(colon + 1));
+        } catch (const std::invalid_argument &) {
+          request.bad_content_length = true;
+          request.content_length = 0;
+        } catch (const std::out_of_range &) {
+          request.bad_content_length = true;
+          request.content_length = 0;
+        }
       }
 
       if (lower_line.find("content-type:") != std::string::npos &&
