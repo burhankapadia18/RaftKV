@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -16,6 +17,7 @@
 #include "../raft/raft_client.hpp"
 #include "../storage/kv_store.hpp"
 #include "http_request.hpp"
+#include "thread_pool.hpp"
 
 namespace kvdb {
 
@@ -486,16 +488,14 @@ public:
    * @param port Port to listen on
    * @param handler Request handler for processing requests
    */
-  HttpServer(int port, KVHttpHandler handler, RequestLimits limits = {})
-      : port_(port), handler_(std::move(handler)), limits_(limits) {
+  HttpServer(int port, KVHttpHandler handler, RequestLimits limits = {},
+             size_t workers = 0)
+      : port_(port), handler_(std::move(handler)), limits_(limits),
+        pool_(workers == 0 ? ThreadPool::default_workers() : workers) {
     setup_socket();
   }
 
-  ~HttpServer() {
-    if (server_fd_ >= 0) {
-      close(server_fd_);
-    }
-  }
+  ~HttpServer() { stop(); }
 
   // Non-copyable
   HttpServer(const HttpServer &) = delete;
@@ -507,14 +507,50 @@ public:
    * This method blocks indefinitely, accepting and handling connections.
    */
   void run() {
-    std::cout << "[HTTP] Server listening on port " << port_ << std::endl;
+    std::cout << "[HTTP] Server listening on port " << port_ << " with "
+              << pool_.size() << " worker threads" << std::endl;
 
-    while (true) {
-      int client_socket = accept(server_fd_, nullptr, nullptr);
-      if (client_socket >= 0) {
-        handle_connection(client_socket);
+    while (!stopping_.load(std::memory_order_relaxed)) {
+      const int client_socket = accept(server_fd_, nullptr, nullptr);
+      if (client_socket < 0) {
+        // stop() closes the listen socket to break us out of accept(), so an
+        // error here is expected during shutdown and is not worth reporting.
+        if (stopping_.load(std::memory_order_relaxed)) {
+          break;
+        }
+        // EINTR and friends: a transient accept failure must not kill the loop.
+        // Spinning on a permanently broken listener is the lesser evil compared
+        // to a node that silently stops accepting connections.
+        continue;
+      }
+
+      // R4.10: hand the connection to a worker instead of serving it inline.
+      // Serving inline is what let one slow client hold the whole HTTP surface.
+      if (!pool_.submit(
+              [this, client_socket] { handle_connection(client_socket); })) {
+        // Pool is shutting down and refused the task. WE still own this fd, so
+        // close it here — dropping it would leak a descriptor per connection.
+        close(client_socket);
       }
     }
+  }
+
+  /**
+   * @brief Stop accepting connections and let in-flight ones finish (R4.10).
+   *
+   * Closing the listen socket is what unblocks the accept() the run loop is
+   * parked in; a flag alone would leave it waiting for a connection that may
+   * never come. Workers then drain the queue and join, so every accepted
+   * connection is still answered.
+   */
+  void stop() {
+    stopping_.store(true, std::memory_order_relaxed);
+    if (server_fd_ >= 0) {
+      ::shutdown(server_fd_, SHUT_RDWR);
+      close(server_fd_);
+      server_fd_ = -1;
+    }
+    pool_.stop();
   }
 
 private:
@@ -524,6 +560,18 @@ private:
 
   /** @brief Inbound request bounds (R4.9). */
   RequestLimits limits_;
+
+  /**
+   * @brief Worker pool serving accepted connections (R4.10).
+   *
+   * Everything a worker touches must be thread-safe: PersistentKVStore locks
+   * internally, and GrpcRaftClient shares one gRPC channel (channels are
+   * thread-safe) with a per-call ClientContext. See R4.11.
+   */
+  ThreadPool pool_;
+
+  /** @brief Set by stop() to break the accept loop. */
+  std::atomic<bool> stopping_{false};
 
   static constexpr size_t kBufferSize = 4096;
 

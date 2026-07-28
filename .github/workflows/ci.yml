@@ -182,6 +182,57 @@ jobs:
       - name: Run tests
         run: ctest --test-dir cpp-app/build-asan --output-on-failure
 
+  # --- R4.11: the same tests under ThreadSanitizer ------------------------
+  #
+  # Phase 4 replaced the single-threaded accept loop with a worker pool, so
+  # "is everything a worker touches actually thread-safe" became a question CI
+  # has to answer rather than a claim in a comment.
+  cpp-tsan:
+    name: C++ tests (TSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: debian:bookworm-slim
+      # REQUIRED, not belt-and-braces. TSan disables ASLR via
+      # personality(ADDR_NO_RANDOMIZE), which Docker's default seccomp profile
+      # blocks; without this the binary dies at startup with
+      # "CHECK failed: tsan_platform_linux.cpp ... personality" and the failure
+      # surfaces during gtest_discover_tests as a build-time segfault, which
+      # looks nothing like the actual cause. Found the hard way.
+      options: --security-opt seccomp=unconfined
+    env:
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      # No libgtest-dev, same reasoning as the ASan job: a non-instrumented
+      # GoogleTest linked into instrumented objects produces false reports, so
+      # CMakeLists falls back to FetchContent and builds it under -fsanitize=thread.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            pkg-config \
+            libmsgpack-dev \
+            git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (TSan)
+        run: |
+          cmake -S cpp-app -B cpp-app/build-tsan \
+            -DKVDB_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build test target
+        run: cmake --build cpp-app/build-tsan --target kvdb_tests -j "$(nproc)"
+
+      - name: Run tests
+        run: ctest --test-dir cpp-app/build-tsan --output-on-failure
+
   # --- R0.15: full cluster end-to-end ------------------------------------
   e2e:
     name: End-to-end cluster
