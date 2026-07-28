@@ -432,5 +432,50 @@ TEST(JsonEscapeTest, PassesUtf8ThroughUnchanged) {
   EXPECT_EQ(json_escape(utf8), utf8);
 }
 
+// --- R4.1/R4.5: transient vs fatal propose failures ------------------------
+
+TEST_F(KVHttpHandlerTest, UnavailablePrefixBecomes503NotAFatal502) {
+  // A routine leader failover produces "could not reach the leader" for a
+  // second or two. It must not look fatal: a client that retries on 503 and
+  // gives up on 502 would abandon a write the cluster is about to be able to
+  // accept.
+  raft_.result = ProposeResult::failure(std::string(kUnavailablePrefix) +
+                                        "could not reach leader node1:8088");
+
+  const HttpResponse response =
+      handler_.handle(insert_request(std::string("\x82\x00\xff", 3)));
+
+  EXPECT_EQ(response.status_code, 503);
+  EXPECT_EQ(HttpResponse::reason_phrase(503),
+            std::string("Service Unavailable"));
+  // The prefix is a wire tag, not something a client should ever see.
+  EXPECT_EQ(response.body.find(kUnavailablePrefix), std::string::npos)
+      << "the machine-readable prefix leaked into the client-facing body: "
+      << response.body;
+  EXPECT_NE(response.body.find("could not reach leader"), std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, AnUntaggedFailureIsStill502) {
+  // Untagged means "the client cannot fix this by retrying" — it must stay 502,
+  // or the retryable/fatal distinction the prefixes exist for is lost.
+  raft_.result = ProposeResult::failure("state machine rejected the entry");
+
+  const HttpResponse response =
+      handler_.handle(insert_request(std::string("\x82\x00\xff", 3)));
+
+  EXPECT_EQ(response.status_code, 502);
+}
+
+TEST_F(KVHttpHandlerTest, NotLeaderStillWinsOverUnavailable) {
+  raft_.result =
+      ProposeResult::failure(std::string(kNotLeaderPrefix) + "node2:8088");
+
+  const HttpResponse response =
+      handler_.handle(insert_request(std::string("\x82\x00\xff", 3)));
+
+  EXPECT_EQ(response.status_code, 503);
+  EXPECT_NE(response.body.find("\"leader\":\"node2:8088\""), std::string::npos);
+}
+
 } // namespace
 } // namespace kvdb

@@ -24,6 +24,18 @@ import (
 // Any other failure must NOT carry it.
 const NotLeaderPrefix = "not_leader:"
 
+// UnavailablePrefix tags a failure that is TRANSIENT and worth retrying: this
+// node knows who the leader is but could not reach it, which is the normal
+// state of the world for a second or two during a leader failover.
+//
+// Distinct from NotLeaderPrefix because the two call for different client
+// behavior — not_leader carries an address to retry AGAINST, this one just means
+// "try again shortly" — and distinct from an untagged error because those are
+// the ones a client cannot do anything about. The C++ layer maps this onto 503
+// rather than 502: a routine failover must not look fatal to a client that
+// retries on 503 and gives up on 502.
+const UnavailablePrefix = "unavailable:"
+
 // proposeTimeout bounds how long a proposal may wait to be committed and
 // applied before Raft gives up on it.
 //
@@ -232,10 +244,11 @@ func (s *Server) forwardRead(ctx context.Context, req *pb.ReadRequest) *pb.ReadR
 	log.Printf("Forwarding linearizable read to the leader at %s", leader)
 	resp, err := readForwarder.ForwardRead(ctx, leader, req.GetKey())
 	if err != nil {
+		// Same reasoning as the write path: transient, so retryable.
 		log.Printf("Forwarding read to %s failed: %v", leader, err)
 		return &pb.ReadResponse{
-			Error: fmt.Sprintf("forwarding read to the leader at %s failed: %v",
-				leader, err),
+			Error: fmt.Sprintf("%scould not reach leader %s: %v",
+				UnavailablePrefix, leader, err),
 		}
 	}
 	return resp
@@ -273,10 +286,16 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 					// itself, NOT as not_leader: the client should not be told
 					// "retry at the leader" when the problem is that we could
 					// not reach the leader.
+					// Tagged unavailable, not not_leader: the client should not be
+					// told "retry at the leader" when reaching the leader is the
+					// thing that just failed. But it IS retryable — during an
+					// election the address we have is a node that has just died —
+					// so it must not surface as a fatal 502 either.
 					log.Printf("ERROR: forwarding to leader %s failed: %v", leader, ferr)
 					return &pb.ProposeResponse{
 						Success: false,
-						Error:   fmt.Sprintf("could not reach leader %s: %v", leader, ferr),
+						Error: fmt.Sprintf("%scould not reach leader %s: %v",
+							UnavailablePrefix, leader, ferr),
 					}, nil
 				}
 				return forwarded, nil

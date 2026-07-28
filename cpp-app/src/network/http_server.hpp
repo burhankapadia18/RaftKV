@@ -41,6 +41,16 @@ inline constexpr const char *kMsgpackContentType = "application/msgpack";
 inline constexpr const char *kNotLeaderPrefix = "not_leader:";
 
 /**
+ * @brief Prefix on a transient failure the client should simply retry.
+ *
+ * Emitted by the sidecar when it knows who the leader is but could not reach it
+ * — the normal state of the world for a second or two during a failover. Mapped
+ * to 503, not 502: a routine leader change must not look fatal to a client that
+ * retries on 503 and gives up on 502.
+ */
+inline constexpr const char *kUnavailablePrefix = "unavailable:";
+
+/**
  * @brief Read consistency modes for GET (R4.4).
  *
  * `local` is the default and the pre-Phase-4 behavior: answered from this
@@ -341,11 +351,28 @@ private:
     if (result.success) {
       return HttpResponse::json(200, "{\"ok\":true}");
     }
-    const std::optional<std::string> leader = not_leader_address(result.error);
+    return failure_response(result.error);
+  }
+
+  /**
+   * @brief Map a sidecar failure string onto a status code.
+   *
+   * Three shapes, and the distinction is the whole point of Phase 1's error
+   * vocabulary:
+   *   - not_leader:<addr>  -> 503 naming an address to retry against;
+   *   - unavailable:<why>  -> 503, transient, retry the same node shortly;
+   *   - anything else      -> 502, the client cannot fix this by retrying.
+   */
+  [[nodiscard]] static HttpResponse failure_response(const std::string &error) {
+    const std::optional<std::string> leader = not_leader_address(error);
     if (leader.has_value()) {
       return HttpResponse::json(503, not_leader_body(*leader));
     }
-    return HttpResponse::json_error(502, result.error);
+    const std::string unavailable(kUnavailablePrefix);
+    if (error.rfind(unavailable, 0) == 0) {
+      return HttpResponse::json_error(503, error.substr(unavailable.size()));
+    }
+    return HttpResponse::json_error(502, error);
   }
 
   /**
@@ -377,11 +404,7 @@ private:
 
     // Not-the-leader is the one failure a client can act on by itself, so it
     // gets a retryable status and the address to retry against.
-    const std::optional<std::string> leader = not_leader_address(result.error);
-    if (leader) {
-      return HttpResponse::json(503, not_leader_body(*leader));
-    }
-    return HttpResponse::json_error(502, result.error);
+    return failure_response(result.error);
   }
 
   /**
@@ -434,12 +457,7 @@ private:
     const ReadResult result = raft_client_.read(key);
 
     if (!result.ok) {
-      const std::optional<std::string> leader =
-          not_leader_address(result.error);
-      if (leader.has_value()) {
-        return HttpResponse::json(503, not_leader_body(*leader));
-      }
-      return HttpResponse::json_error(502, result.error);
+      return failure_response(result.error);
     }
 
     if (!result.found) {
