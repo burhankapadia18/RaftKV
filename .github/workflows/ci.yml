@@ -407,6 +407,47 @@ jobs:
         run: docker compose down -v
 
   # ---------------------------------------------------------------------------
+  # bench/ is a SEPARATE Go module, so the `go` job above — which is scoped to
+  # go-sidecar — never compiles it. Without this job kvbench rots silently and is
+  # discovered broken the next time someone tries to reproduce a benchmark, which
+  # is the worst possible moment.
+  #
+  # No test step: it has none. It is a measurement tool whose output is checked by
+  # reading it, and a fake test asserting that a throughput number is positive
+  # would be worse than nothing.
+  # ---------------------------------------------------------------------------
+  bench-build:
+    name: Benchmark client builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: bench
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: bench/go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reported files needing formatting:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+  # ---------------------------------------------------------------------------
   # Phase 6: the same cluster, brought up with TLS everywhere.
   #
   # A separate job rather than another step in `e2e`, because the two profiles
