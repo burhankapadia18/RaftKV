@@ -119,50 +119,53 @@ pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v
 ```
 
-It checks that a write on the leader replicates to **all three** nodes, that
-DELETE round-trips, that a missing key returns `404`, that a write sent to a
-follower returns `503` naming the leader, and that a malformed `Content-Length`
-returns `400` without killing the node. See
-[tests/e2e/README.md](tests/e2e/README.md) for configuration, the full contract
-table, and the assertions that still deliberately pin known-wrong behavior.
+~28 assertions: a write replicates to **all three** nodes, DELETE round-trips, a
+missing key returns 404, a write sent to a **follower** is forwarded and succeeds,
+the full status-code contract holds (400/404/405/413/415/431/502/503), the request
+caps reject oversized input without killing the node, and cluster membership is
+closed without a token. See [tests/e2e/README.md](tests/e2e/README.md) for
+configuration and the opt-in markers.
 
-The crash-recovery test is opt-in, because it is the one test that touches
-docker — it `SIGKILL`s a node and restarts it:
+Crash, snapshot and TLS scenarios are opt-in, because they drive docker directly:
 
 ```bash
-pytest tests/e2e -m requires_docker -v
+pytest tests/e2e -m requires_docker -v -rs   # SIGKILLs a node; wipes a volume
 ```
 
-`test_client.py` is still around as a one-shot manual demo, but it asserts
-nothing and only touches a single node — use the suite above for verification.
+`test_client.py` is still around as a one-shot manual demo, but it asserts nothing
+and only touches a single node — use the suite above for verification.
 
-Or use curl directly:
+### Or by hand
+
+The `/kv/{key}` routes need no MsgPack — the body is the value:
 
 ```bash
-# Write a value (using Python for MsgPack encoding)
-python3 -c "
-import requests, msgpack
-data = msgpack.packb({'op': 'SET', 'key': 'hello', 'value': 'world'})
-r = requests.post('http://localhost:8080/insert-val', data=data,
-                  headers={'Content-Type': 'application/msgpack'})
-print(r.status_code, r.text)          # 200 {\"ok\":true}
-"
+# Write. Send it to node2 (a FOLLOWER) on purpose: it is forwarded to the leader.
+curl -i -X PUT --data-binary 'world' http://localhost:8081/kv/hello
+# HTTP/1.1 200 OK
+# {"ok":true}
 
-# Read a value
-curl -i "http://localhost:8080/get-val?key=hello"
+# Read it back, guaranteed fresh
+curl -i "http://localhost:8081/kv/hello?consistency=linearizable"
+# HTTP/1.1 200 OK
+# world
 
-# Read a key that is not there
-curl -i "http://localhost:8080/get-val?key=nope"   # 404 {"error":"key not found"}
+# A default read is served locally and may lag: immediately after the write above
+# this can still be a 404 on a node that has not applied it yet.
+curl -i http://localhost:8081/kv/hello
 
-# Send the same write to a follower
-python3 -c "
-import requests, msgpack
-data = msgpack.packb({'op': 'SET', 'key': 'hello', 'value': 'world'})
-r = requests.post('http://localhost:8081/insert-val', data=data,
-                  headers={'Content-Type': 'application/msgpack'})
-print(r.status_code, r.text)
-# 503 {\"error\":\"not leader\",\"leader\":\"node1:8088\"}
-"
+# A key that was never written
+curl -i http://localhost:8080/kv/nope
+# HTTP/1.1 404 Not Found
+# {"error":"key not found"}
+
+# Delete it (idempotent — deleting an absent key is also 200)
+curl -i -X DELETE http://localhost:8081/kv/hello
+# HTTP/1.1 200 OK
+# {"ok":true}
+
+# Who leads, and how far along each node is
+curl -s http://localhost:6000/status
 ```
 
 ### Running the tests
@@ -251,10 +254,27 @@ leader rather than refusing it.
 | Empty key (`/kv/`) | `400 Bad Request` | `{"error":"key must not be empty"}` |
 | Method other than PUT/GET/DELETE | `405 Method Not Allowed` | `{"error":"method not allowed on /kv/{key}: use PUT, GET or DELETE"}` |
 
-**The 502/503 distinction is the retry contract.** 503 means try again — the
-cluster is between leaders and nothing was lost. 502 means a real failure; retrying
-the identical request will usually fail identically. Clients should back off and
-retry on 503, and surface a 502.
+**The 502/503 distinction is the retry contract**, and it is about whether
+retrying is worthwhile, not about what happened:
+
+- **503 — retry.** The cluster is between leaders, or this node could not reach
+  the one it knows about. Back off and send it again.
+- **502 — a real failure.** Retrying the identical request will usually fail
+  identically; surface it.
+
+**Neither status tells you whether the write was applied.** A 503 in particular
+does *not* mean nothing happened: when a follower's forwarded proposal fails as a
+transport matter, the follower reports 503 while the leader may already have
+committed the entry. Writes are therefore **at-least-once** under failure. That is
+safe for `PUT` and `DELETE`, which are idempotent — retrying stores the same value
+or deletes the same key — but a client must not infer from a 503 that its previous
+attempt had no effect. There are no idempotency tokens, so a
+read-modify-write built on top of this needs its own compare-and-set, which this
+store does not provide.
+
+This is not theoretical: the chaos harness found it by assuming the opposite. Its
+load generator treated 503 as "the key is untouched" and reported the store holding
+a value fifteen writes newer than its last acknowledged one.
 
 ### Read a key
 

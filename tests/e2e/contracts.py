@@ -69,6 +69,7 @@ HTTP_NOT_FOUND = 404
 HTTP_UNSUPPORTED_MEDIA_TYPE = 415
 HTTP_PAYLOAD_TOO_LARGE = 413
 HTTP_HEADERS_TOO_LARGE = 431
+HTTP_METHOD_NOT_ALLOWED = 405
 HTTP_BAD_GATEWAY = 502
 HTTP_SERVICE_UNAVAILABLE = 503
 
@@ -109,6 +110,9 @@ ERROR_UNSUPPORTED_MEDIA_TYPE = "unsupported media type"
 ERROR_NOT_FOUND = "not found"
 ERROR_BODY_TOO_LARGE = "request body too large"
 ERROR_HEADERS_TOO_LARGE = "request headers too large"
+ERROR_EMPTY_KEY = "key must not be empty"
+ERROR_BAD_CONSISTENCY = 'consistency must be "local" or "linearizable"'
+ERROR_METHOD_NOT_ALLOWED_KV = "method not allowed on /kv/{key}: use PUT, GET or DELETE"
 
 # Phase 4 request caps, mirrored from RequestLimits in cpp-app/src/config/
 # config.hpp. Duplicated here on purpose: these tests exist to catch the caps

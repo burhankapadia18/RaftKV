@@ -223,6 +223,24 @@ it. The full status/body table is in the [README](../README.md#api-reference) an
 mirrored as constants in `tests/e2e/contracts.py`; the handler and both of those
 change together.
 
+### Writes are at-least-once under failure
+
+Neither 502 nor 503 tells a client whether the write was applied, and 503 is the
+surprising one. `rpc.Server.Propose` returns `unavailable:` — which the handler maps
+to 503 — when *forwarding* to the leader fails as a transport matter. The leader may
+already have received and committed the entry before that connection broke. The
+client sees a retryable failure for a write that succeeded.
+
+There are no idempotency tokens and no request deduplication, so this is inherent
+rather than a bug: a client that retries gets at-least-once semantics. `PUT` and
+`DELETE` are idempotent, so a retry is harmless. Anything built on top that needs
+exactly-once, or a read-modify-write, needs a compare-and-set primitive this store
+does not provide.
+
+Found by the chaos harness, whose load generator initially encoded the intuitive
+reading of the contract ("503 means the key is untouched") and reported the store
+holding a value fifteen writes newer than the last one it had been told about.
+
 One asymmetry to know about: `CppFSM.Apply` treats a failed apply as a
 *deterministic* rejection. That is accurate for a malformed command — every replica
 decodes the same bytes and reaches the same verdict — and **not** accurate for a
@@ -305,3 +323,6 @@ Stated here rather than left to be discovered:
 - **`50052` is peer-reachable and unauthenticated.** A peer that can reach it can
   propose writes. It is inside the same trust boundary as the raft port but,
   unlike the raft port, has no credential.
+- **Writes are at-least-once under failure, with no way to detect a duplicate.**
+  See above. There is no compare-and-set, so a client cannot build exactly-once
+  semantics on top of this.

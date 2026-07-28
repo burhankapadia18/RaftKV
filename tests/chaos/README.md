@@ -57,18 +57,32 @@ disagreement it saw would be reporting replication lag as data loss.
 
 ## Why the journal is trustworthy
 
-Two rules, both load-bearing:
+Three rules, all load-bearing:
 
 **One writer per key.** Client *i* owns `chaos-<run>-c<i>-k<n>`. Without that,
 two clients writing the same key concurrently produce two acknowledgements with
 no order between them — HTTP acknowledgement order is not raft commit order — and
 "what should this key hold?" has no answer.
 
-**An unknown outcome poisons its key.** A write that times out or returns 502 may
-have committed anyway; the entry can be replicated and applied while the response
-is lost. Recording it as acknowledged would invent a guarantee. So the key is
-marked indeterminate: no claim is made about its value, but the nodes must still
-agree on it.
+**An unknown outcome poisons its key.** A write that times out or returns 500, 502,
+503 or 504 may have committed anyway; the entry can be replicated and applied while
+the response is lost. Recording it as acknowledged would invent a guarantee. So the
+key is marked indeterminate: no claim is made about its value, but the nodes must
+still agree on it.
+
+**503 is in that list, and working out why was this harness's first real result.**
+The first version treated 503 as a definite refusal — "no leader available, so the
+key is untouched", which is how the HTTP contract reads. A five-minute run then
+reported the store holding `v7-2629` where the journal's last acknowledged value
+was `v7-2614`: fifteen later writes had been answered 503 and at least one had
+landed.
+
+The cause is in `rpc.Server.Propose`. When a follower's forwarded proposal fails as
+a *transport* matter it reports `unavailable:` → 503, and the leader may already
+have committed the entry before the connection broke. So RaftKV's write is
+**at-least-once** under failure, and 503 means "retrying is safe", not "nothing
+happened". The README and `docs/architecture.md` now say so; they previously said
+"nothing was lost", which is true but reads as more than it means.
 
 **Poisoned keys are reclaimed, and that is what makes the run mean anything.**
 After 15 seconds — longer than every retry the write path can perform, since
@@ -115,5 +129,9 @@ harness, not the product.
 
 `.github/workflows/chaos.yml` runs a 10-minute pass nightly, not per-PR (R7.4) —
 it takes too long for a pull request and its value is in repetition. The journal
-and container logs are uploaded on failure, which is the only way to reconstruct
-what happened after the fact.
+and container logs are uploaded on EVERY run, pass or fail — a passing journal is
+what makes the next failure readable, because it shows what normal looks like.
+
+The seed is the workflow run number rather than a constant, so consecutive nights
+explore different fault sequences. A fixed seed would make three green nights much
+weaker evidence than they appear to be.

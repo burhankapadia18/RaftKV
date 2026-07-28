@@ -15,14 +15,24 @@ is not raft commit order — and "what should this key hold at the end?" has no
 answer. With it, every key has exactly one writer, so its history is a total
 order and the last acknowledged operation on it is unambiguous.
 
-**A request whose outcome is unknown poisons its key.** A write that times out,
-or returns 502, may have committed anyway: the entry can be replicated and
+**A request whose outcome is unknown poisons its key.** A write that times out or
+returns 502 or 503 may have committed anyway: the entry can be replicated and
 applied while the response is lost. Journaling it as acknowledged would invent a
 guarantee; ignoring it entirely would be worse, because the key may now hold that
 value and a later exact-value check would fail on correct behavior. So the client
-stops writing that key and marks it INDETERMINATE. The checker then makes no
-claim about its value — but still requires all three nodes to agree on it, which
-is the part that actually catches a bug.
+stops writing that key and marks it INDETERMINATE. The checker then makes no claim
+about its value — but still requires all three nodes to agree on it, which is the
+part that actually catches a bug.
+
+**503 counts as unknown, and finding that out was the harness's first real
+result.** The first version treated 503 as a definite refusal — "no leader, so the
+key is untouched" — because that is how the HTTP contract reads. A run then
+reported the store holding `v7-2629` where the journal's last acknowledged value
+was `v7-2614`: fifteen later writes had been answered 503 and one of them had
+landed anyway. The cause is in rpc.Server.Propose: when forwarding to the leader
+fails as a TRANSPORT matter, the follower reports `unavailable:` → 503, and the
+leader may already have committed the entry. So RaftKV's write is at-least-once
+under failure, and 503 means "retry is safe", not "nothing happened".
 """
 
 from __future__ import annotations
@@ -43,6 +53,16 @@ OP_SET = "set"
 OP_DELETE = "delete"
 OP_INDETERMINATE = "indeterminate"
 OP_RECLAIM = "reclaim"
+
+#: Statuses after which the fate of a mutation is genuinely unknown.
+#:
+#: 503 is in here and that is the point. It reads like a definite refusal — "no
+#: leader available" — but rpc.Server.Propose returns `unavailable:` (→ 503) when
+#: FORWARDING to the leader fails as a transport matter, and the leader may have
+#: committed the entry before the connection broke. Treating 503 as "the key is
+#: untouched" produced a false violation on the first long run: the store held a
+#: value fifteen writes newer than the journal's last acknowledged one.
+UNKNOWN_OUTCOME_STATUSES = frozenset({500, 502, 503, 504})
 
 #: How long a key stays indeterminate before a client tries to reclaim it.
 #:
@@ -287,7 +307,7 @@ class LoadGenerator:
             return
 
         if response.status_code != 200:
-            if response.status_code in (502, 500, 504):
+            if response.status_code in UNKNOWN_OUTCOME_STATUSES:
                 self.stats.bump("unknown")
                 self._mark_indeterminate(key, f"reclaim HTTP {response.status_code}")
             else:
@@ -319,15 +339,12 @@ class LoadGenerator:
             )
             return
 
-        if response.status_code in (502, 500, 504):
-            # 502 here is "the propose failed", which in this codebase covers both
-            # "never committed" and "committed but the reply was lost". Cannot
-            # distinguish from the client, so do not pretend to.
+        if response.status_code in UNKNOWN_OUTCOME_STATUSES:
             self.stats.bump("unknown")
             self._mark_indeterminate(key, f"write HTTP {response.status_code}")
             return
 
-        # 503 (no leader yet), 4xx: a definite refusal. The key is untouched.
+        # 4xx only: a request the server refused to act on at all.
         self.stats.bump("rejected")
 
     def _do_delete(self, node: Node, key: str) -> None:
@@ -347,7 +364,7 @@ class LoadGenerator:
             )
             return
 
-        if response.status_code in (502, 500, 504):
+        if response.status_code in UNKNOWN_OUTCOME_STATUSES:
             self.stats.bump("unknown")
             self._mark_indeterminate(key, f"delete HTTP {response.status_code}")
             return

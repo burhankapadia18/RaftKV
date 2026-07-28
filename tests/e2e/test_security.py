@@ -303,3 +303,78 @@ def _send_raw(host: str, port: int, request: bytes, timeout: float) -> bytes:
             if b"\r\n\r\n" in b"".join(chunks):
                 break
     return b"".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# The rest of the /kv/{key} status contract
+#
+# These live here rather than in test_cluster.py because they are the same kind of
+# assertion as the caps above: a specific status and body for a specific malformed
+# request. They exist because README.md claims every documented code is mirrored in
+# contracts.py, and four of them were not — a claim that is only true if something
+# checks it.
+# ---------------------------------------------------------------------------
+
+
+def test_empty_key_is_rejected(nodes):
+    response = requests.get(f"{nodes[0]}/kv/", timeout=HTTP_TIMEOUT)
+
+    assert response.status_code == contracts.HTTP_BAD_REQUEST
+    body = try_json(response.text)
+    assert body is not None, f"not JSON: {response.text!r}"
+    assert body.get("error") == contracts.ERROR_EMPTY_KEY
+
+
+@pytest.mark.parametrize("value", ["bogus", "strong", "eventual", ""])
+def test_unknown_consistency_is_rejected(nodes, value):
+    """Only `local` and `linearizable` exist.
+
+    An unrecognised value must not be silently treated as `local`: a client that
+    misspells `linearizable` would then get stale reads while believing it had
+    asked for fresh ones, which is the worst possible outcome for this parameter.
+    """
+    response = requests.get(
+        f"{nodes[0]}/kv/anything",
+        params={"consistency": value},
+        timeout=HTTP_TIMEOUT,
+    )
+
+    assert response.status_code == contracts.HTTP_BAD_REQUEST, (
+        f"consistency={value!r} returned {response.status_code}; an unrecognised "
+        "value must be refused, not read as 'local'"
+    )
+    body = try_json(response.text)
+    assert body is not None, f"not JSON: {response.text!r}"
+    assert body.get("error") == contracts.ERROR_BAD_CONSISTENCY
+
+
+@pytest.mark.parametrize("method", ["POST", "PATCH", "HEAD"])
+def test_wrong_method_on_kv_returns_405(nodes, method):
+    response = requests.request(
+        method, f"{nodes[0]}/kv/some-key", data=b"x", timeout=HTTP_TIMEOUT
+    )
+
+    assert response.status_code == contracts.HTTP_METHOD_NOT_ALLOWED, (
+        f"{method} /kv/key returned {response.status_code}, want 405"
+    )
+    if method != "HEAD":  # HEAD has no body by definition
+        body = try_json(response.text)
+        assert body is not None, f"not JSON: {response.text!r}"
+        assert body.get("error") == contracts.ERROR_METHOD_NOT_ALLOWED_KV
+
+
+def test_delete_of_a_missing_key_is_idempotent(nodes, unique_key):
+    """Documented in the README as returning 200.
+
+    The response describes the resulting state — the key is absent — not whether
+    anything changed. Worth pinning: returning 404 here would be defensible in the
+    abstract and would break every client that treats DELETE as idempotent.
+    """
+    response = requests.delete(
+        f"{nodes[0]}/kv/{unique_key}-never-existed", timeout=HTTP_TIMEOUT
+    )
+
+    assert response.status_code == contracts.HTTP_OK, (
+        f"DELETE of an absent key returned {response.status_code}, want 200"
+    )
+    assert try_json(response.text) == contracts.WRITE_OK_BODY

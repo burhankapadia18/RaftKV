@@ -328,7 +328,20 @@ README, CHANGELOG, tagged `v1.0.0` with multi-arch images pushed to a registry.
 | 1 | ✅ Complete | Truthful errors | S–M | 2, 3, 4 |
 | 2 | ✅ Complete | Durability (WAL, atomic persist) | M | 3 |
 | 3 | ✅ Complete | Snapshots + compaction | L | 4 (wiped-node rejoin) |
-| 4 | Not started | Leader forwarding, consistency, HTTP rework | L | 5, 7 |
-| 5 | Not started | Logging, metrics, lifecycle | M | 7 |
-| 6 | Not started | TLS/auth, fuzzing | M | release |
-| 7 | Not started | Chaos, bench, v1.0 | M | — |
+| 4 | ✅ Complete | Leader forwarding, consistency, HTTP rework | L | 5, 7 |
+| 5 | ✅ Complete | Logging, metrics, lifecycle | M | 7 |
+| 6 | ✅ Complete | TLS/auth, fuzzing | M | release |
+| 7 | ✅ Complete (one item deferred) | Chaos, bench, v1.0 | M | — |
+
+**The one deferred item is the release itself.** `.github/workflows/release.yml`
+exists and is lint-clean, but nothing has been tagged: pushing a `v1.0.0` tag
+publishes images to a public registry and creates a public GitHub release under
+this account, which is not a step to take without the owner asking for it. Run
+
+    git tag v1.0.0-rc1 && git push origin v1.0.0-rc1
+
+for a dry run first — the workflow marks any tag containing a hyphen as a
+prerelease and deliberately does not move `latest` for one.
+
+Everything the tag would gate has been verified locally: the full test suite, the
+image build, and the e2e suite against a cluster started from that image.
