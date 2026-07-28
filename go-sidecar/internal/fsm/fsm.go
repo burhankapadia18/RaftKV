@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"time"
 
 	"github.com/hashicorp/raft"
 
+	"my-raft-sidecar/internal/metrics"
 	pb "my-raft-sidecar/pb"
 )
 
@@ -136,8 +138,17 @@ func NewCppFSM(client StateMachineClient) *CppFSM {
 // entry is applied on this node when it is not, silently diverging this
 // replica's state from the log.
 func (f *CppFSM) Apply(l *raft.Log) interface{} {
+	// Observed for every entry, success or not: apply latency is the single best
+	// indicator of whether the C++ side is keeping up with consensus, and it is
+	// invisible from the raft metrics alone (R5.3).
+	start := time.Now()
+	defer func() { metrics.ApplyLatency.Observe(time.Since(start).Seconds()) }()
+
 	resp, err := f.client.Apply(context.Background(), &pb.Command{Data: l.Data})
 	if err != nil {
+		// Counted as transport, not rejected: this is the branch that can leave
+		// this replica behind its peers, so it must be separately alertable.
+		metrics.ApplyErrors.WithLabelValues(metrics.ApplyErrorTransport).Inc()
 		applyErr := &ApplyError{
 			Index:  l.Index,
 			Term:   l.Term,
@@ -154,6 +165,7 @@ func (f *CppFSM) Apply(l *raft.Log) interface{} {
 	}
 
 	if resp == nil {
+		metrics.ApplyErrors.WithLabelValues(metrics.ApplyErrorTransport).Inc()
 		applyErr := &ApplyError{
 			Index:  l.Index,
 			Term:   l.Term,
@@ -165,6 +177,9 @@ func (f *CppFSM) Apply(l *raft.Log) interface{} {
 	}
 
 	if !resp.GetSuccess() {
+		// Deterministic: every replica reaches the same verdict, so this is a bad
+		// command rather than a sick node. Separate label, separate alert.
+		metrics.ApplyErrors.WithLabelValues(metrics.ApplyErrorRejected).Inc()
 		reason := resp.GetError()
 		if reason == "" {
 			reason = "state machine reported failure without a reason"
@@ -294,6 +309,9 @@ func (f *CppFSM) Restore(rc io.ReadCloser) error {
 			sent)
 	}
 	if !resp.GetSuccess() {
+		// Deterministic: every replica reaches the same verdict, so this is a bad
+		// command rather than a sick node. Separate label, separate alert.
+		metrics.ApplyErrors.WithLabelValues(metrics.ApplyErrorRejected).Inc()
 		reason := resp.GetError()
 		if reason == "" {
 			reason = "state machine reported failure without a reason"

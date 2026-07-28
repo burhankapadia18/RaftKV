@@ -41,6 +41,17 @@ type RaftControl interface {
 	FirstLogIndex() (uint64, error)
 }
 
+// BackendProbe reports whether the local C++ state machine is answering (R5.5).
+//
+// Readiness has to include this: a sidecar whose raft is perfectly healthy but
+// whose state machine is unreachable cannot apply anything, so routing traffic to
+// it is pointless. Liveness deliberately does NOT include it — the process is up,
+// and restarting it would not fix a dead neighbour.
+type BackendProbe interface {
+	// Probe returns nil when the backend answered.
+	Probe(ctx context.Context) error
+}
+
 // Server represents the HTTP management server.
 type Server struct {
 	node       RaftControl
@@ -53,6 +64,26 @@ type Server struct {
 	// keeps a half-configured server explicit rather than silently degraded.
 	resolver  PeerResolver
 	forwarder Forwarder
+
+	// probe is optional; when nil the backend check is reported as skipped
+	// rather than silently passing. A readiness endpoint that quietly drops a
+	// check it could not run is worse than one that says so.
+	probe BackendProbe
+
+	// metricsHandler is mounted at /metrics when set (R5.3).
+	metricsHandler http.Handler
+}
+
+// WithBackendProbe adds the state-machine reachability check to /ready.
+func (s *Server) WithBackendProbe(probe BackendProbe) *Server {
+	s.probe = probe
+	return s
+}
+
+// WithMetricsHandler mounts a Prometheus handler at /metrics.
+func (s *Server) WithMetricsHandler(handler http.Handler) *Server {
+	s.metricsHandler = handler
+	return s
 }
 
 // NewServer creates a new management server.
@@ -74,6 +105,10 @@ func (s *Server) Start() {
 	mux.HandleFunc("/remove", s.handleRemove)
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
+	if s.metricsHandler != nil {
+		mux.Handle("/metrics", s.metricsHandler)
+	}
 
 	addr := "0.0.0.0:" + s.port
 	s.httpServer = &http.Server{
@@ -285,8 +320,101 @@ func statIndex(stats map[string]string, key string) uint64 {
 	return value
 }
 
-// handleHealth returns a simple health check response.
+// handleHealth is pure LIVENESS: the process is running and serving (R5.5).
+//
+// Deliberately says nothing about raft or the backend. An orchestrator uses
+// liveness to decide whether to RESTART a container, and restarting this node
+// because it cannot see a leader would be actively harmful — it would destroy the
+// one member that might still be needed for quorum. Readiness is the endpoint
+// that answers "should traffic go here", and that is /ready.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
+}
+
+// readyCheck is one named condition and its outcome.
+type readyCheck struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// readyResponse is the /ready payload: the verdict plus every check behind it.
+//
+// Listing the checks matters more than the status code. "503" tells an operator
+// to look; "raft_state: Candidate" tells them what at.
+type readyResponse struct {
+	Ready  bool         `json:"ready"`
+	Checks []readyCheck `json:"checks"`
+}
+
+// backendProbeTimeout bounds the state-machine probe. Short on purpose: /ready is
+// polled by an orchestrator's healthcheck, so a slow probe must fail rather than
+// hold the request open and make the healthcheck itself time out.
+const backendProbeTimeout = 2 * time.Second
+
+// handleReady reports whether this node should receive traffic (R5.5).
+//
+// 200 only when raft is in a serving state, a leader is known, and the local C++
+// state machine answers. Any one of those failing means requests sent here cannot
+// be served correctly — a Candidate cannot commit, an unknown leader means writes
+// have nowhere to go, and a dead backend cannot apply.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	checks := make([]readyCheck, 0, 3)
+
+	state := s.node.Stats()["state"]
+	// Leader and Follower can both serve: a follower forwards writes and
+	// barriers reads (Phase 4). Candidate and Shutdown cannot.
+	serving := state == "Leader" || state == "Follower"
+	checks = append(checks, readyCheck{
+		Name:   "raft_state",
+		OK:     serving,
+		Detail: state,
+	})
+
+	leader := s.node.LeaderAddr()
+	checks = append(checks, readyCheck{
+		Name:   "leader_known",
+		OK:     leader != "",
+		Detail: leader,
+	})
+
+	if s.probe == nil {
+		// Reported as a failed check rather than skipped-and-passing: a readiness
+		// endpoint that silently drops a check is how a broken node looks healthy.
+		checks = append(checks, readyCheck{
+			Name:   "backend_reachable",
+			OK:     false,
+			Detail: "no backend probe configured",
+		})
+	} else {
+		ctx, cancel := context.WithTimeout(r.Context(), backendProbeTimeout)
+		defer cancel()
+		err := s.probe.Probe(ctx)
+		check := readyCheck{Name: "backend_reachable", OK: err == nil}
+		if err != nil {
+			check.Detail = err.Error()
+		}
+		checks = append(checks, check)
+	}
+
+	ready := true
+	for _, check := range checks {
+		if !check.OK {
+			ready = false
+		}
+	}
+
+	payload, err := json.Marshal(readyResponse{Ready: ready, Checks: checks})
+	if err != nil {
+		log.Printf("Failed to encode readiness: %v", err)
+		http.Error(w, "Failed to encode readiness", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	w.Write(payload)
 }

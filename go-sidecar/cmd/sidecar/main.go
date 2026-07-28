@@ -8,11 +8,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"my-raft-sidecar/internal/backend"
 	"my-raft-sidecar/internal/cluster"
 	"my-raft-sidecar/internal/config"
 	"my-raft-sidecar/internal/fsm"
 	"my-raft-sidecar/internal/management"
+	"my-raft-sidecar/internal/metrics"
 	"my-raft-sidecar/internal/peers"
 	"my-raft-sidecar/internal/raftnode"
 	"my-raft-sidecar/internal/rpc"
@@ -61,8 +65,19 @@ func main() {
 	// Start management server. The forwarder lets /join and /remove be sent to
 	// any node: a follower relays them to the leader rather than failing the
 	// leader-only Raft call where it landed.
+	// The reader doubles as the readiness probe (R5.5) and as the linearizable
+	// read path (R4.5) — same call, same connection, so /ready fails exactly when
+	// a real read would.
+	storeReader := backend.NewStoreReader(backendClient.StateMachineClient)
+
+	// Raft gauges are registered here rather than in the metrics package because
+	// they need the live node, which does not exist until now.
+	prometheus.MustRegister(metrics.NewRaftCollector(node))
+
 	mgmtServer := management.NewServer(node, cfg.MgmtPort, resolver,
-		management.NewHTTPForwarder(mgmtForwardTimeout))
+		management.NewHTTPForwarder(mgmtForwardTimeout)).
+		WithBackendProbe(storeReader).
+		WithMetricsHandler(promhttp.Handler())
 	mgmtServer.Start()
 
 	// Join cluster if requested
@@ -83,8 +98,7 @@ func main() {
 	// WithLocalReader is what makes linearizable reads (R4.5) available: after
 	// the Barrier and the quorum check, the leader answers from its own C++
 	// store through this.
-	grpcServer := rpc.NewServer(node, forwarder).
-		WithLocalReader(backend.NewStoreReader(backendClient.StateMachineClient))
+	grpcServer := rpc.NewServer(node, forwarder).WithLocalReader(storeReader)
 
 	// Setup graceful shutdown
 	go func() {

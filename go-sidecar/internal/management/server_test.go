@@ -970,3 +970,213 @@ func TestHandleRemove(t *testing.T) {
 		}
 	})
 }
+
+// --- R5.5: readiness, distinct from liveness ------------------------------
+
+// fakeProbe stands in for the C++ state machine reachability check.
+type fakeProbe struct {
+	err    error
+	blocks time.Duration
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *fakeProbe) Probe(ctx context.Context) error {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if f.blocks > 0 {
+		select {
+		case <-time.After(f.blocks):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return f.err
+}
+
+func (f *fakeProbe) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// TestHandleReady covers every combination that decides whether traffic should be
+// routed here. A readiness endpoint that reports ready while one of these is
+// broken is worse than having none at all.
+func TestHandleReady(t *testing.T) {
+	tests := []struct {
+		name       string
+		state      string
+		leaderAddr string
+		probeErr   error
+		noProbe    bool
+		wantStatus int
+		wantFailed string // the check expected to be false, "" when all pass
+	}{
+		{
+			name:       "leader with a reachable backend is ready",
+			state:      "Leader",
+			leaderAddr: "node1:8088",
+			wantStatus: http.StatusOK,
+		},
+		{
+			// A follower serves too since Phase 4: it forwards writes and
+			// barriers reads. Requiring leadership would leave two of three nodes
+			// permanently out of rotation.
+			name:       "follower with a known leader is ready",
+			state:      "Follower",
+			leaderAddr: "node1:8088",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "candidate is not ready",
+			state:      "Candidate",
+			leaderAddr: "",
+			wantStatus: http.StatusServiceUnavailable,
+			wantFailed: "raft_state",
+		},
+		{
+			name:       "shutdown is not ready",
+			state:      "Shutdown",
+			leaderAddr: "",
+			wantStatus: http.StatusServiceUnavailable,
+			wantFailed: "raft_state",
+		},
+		{
+			// The lost-quorum shape: still a Follower, but no leader exists, so a
+			// write sent here has nowhere to go.
+			name:       "follower with no known leader is not ready",
+			state:      "Follower",
+			leaderAddr: "",
+			wantStatus: http.StatusServiceUnavailable,
+			wantFailed: "leader_known",
+		},
+		{
+			// Raft is fine but the state machine is dead: this node cannot apply
+			// anything, so routing to it is pointless.
+			name:       "unreachable backend is not ready",
+			state:      "Leader",
+			leaderAddr: "node1:8088",
+			probeErr:   errors.New("connection refused"),
+			wantStatus: http.StatusServiceUnavailable,
+			wantFailed: "backend_reachable",
+		},
+		{
+			// A check that could not be run must FAIL, not silently pass.
+			name:       "a missing probe fails rather than passing quietly",
+			state:      "Leader",
+			leaderAddr: "node1:8088",
+			noProbe:    true,
+			wantStatus: http.StatusServiceUnavailable,
+			wantFailed: "backend_reachable",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &fakeRaftControl{
+				leaderAddr: tc.leaderAddr,
+				stats:      map[string]string{"state": tc.state},
+			}
+			server := NewServer(node, "6000", nil, nil)
+			if !tc.noProbe {
+				server = server.WithBackendProbe(&fakeProbe{err: tc.probeErr})
+			}
+
+			rec := httptest.NewRecorder()
+			server.handleReady(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body %s)", rec.Code, tc.wantStatus,
+					rec.Body.String())
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", got)
+			}
+
+			var payload readyResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("body is not valid JSON: %v (%s)", err, rec.Body.String())
+			}
+			if payload.Ready != (tc.wantStatus == http.StatusOK) {
+				t.Errorf("ready = %v, want %v", payload.Ready,
+					tc.wantStatus == http.StatusOK)
+			}
+
+			// The body must NAME the failing check. "503" tells an operator to
+			// look; the check name tells them where, which is the whole point of
+			// listing them.
+			if tc.wantFailed != "" {
+				found := false
+				for _, check := range payload.Checks {
+					if check.Name == tc.wantFailed {
+						found = true
+						if check.OK {
+							t.Errorf("check %q reported ok, want it to be the failure",
+								tc.wantFailed)
+						}
+					}
+				}
+				if !found {
+					t.Errorf("no check named %q in %+v", tc.wantFailed, payload.Checks)
+				}
+			}
+		})
+	}
+}
+
+// TestReadyIsNotLiveness pins the distinction. Conflating them is actively
+// harmful: an orchestrator restarts on failed LIVENESS, and restarting a node
+// because it cannot see a leader would destroy the member that might still be
+// needed for quorum.
+func TestReadyIsNotLiveness(t *testing.T) {
+	node := &fakeRaftControl{
+		leaderAddr: "",
+		stats:      map[string]string{"state": "Candidate"},
+	}
+	server := NewServer(node, "6000", nil, nil).
+		WithBackendProbe(&fakeProbe{err: errors.New("down")})
+
+	live := httptest.NewRecorder()
+	server.handleHealth(live, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if live.Code != http.StatusOK {
+		t.Errorf("/health = %d, want 200: the process IS up, and a restart would "+
+			"not fix a missing leader", live.Code)
+	}
+
+	ready := httptest.NewRecorder()
+	server.handleReady(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if ready.Code != http.StatusServiceUnavailable {
+		t.Errorf("/ready = %d, want 503: nothing can be served here", ready.Code)
+	}
+}
+
+// TestReadyBoundsASlowProbe: /ready is polled by a container healthcheck, so a
+// hanging backend must produce a fast 503 rather than holding the request open
+// until the healthcheck itself times out.
+func TestReadyBoundsASlowProbe(t *testing.T) {
+	node := &fakeRaftControl{
+		leaderAddr: "node1:8088",
+		stats:      map[string]string{"state": "Leader"},
+	}
+	probe := &fakeProbe{blocks: 30 * time.Second}
+	server := NewServer(node, "6000", nil, nil).WithBackendProbe(probe)
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	server.handleReady(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("took %v; the probe timeout (%v) is not being applied",
+			elapsed, backendProbeTimeout)
+	}
+	if probe.callCount() != 1 {
+		t.Errorf("probe called %d times, want 1", probe.callCount())
+	}
+}

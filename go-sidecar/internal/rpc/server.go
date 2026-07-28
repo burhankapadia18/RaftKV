@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
 
+	"my-raft-sidecar/internal/metrics"
 	pb "my-raft-sidecar/pb"
 )
 
@@ -177,7 +179,15 @@ func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespons
 	// to gain from a Barrier or a quorum check, so forward immediately. The
 	// authoritative VerifyLeader happens below, after the barrier.
 	if !s.node.IsLeader() {
-		return s.forwardRead(ctx, req), nil
+		resp := s.forwardRead(ctx, req)
+		if resp.GetError() == "" {
+			metrics.ReadTotal.WithLabelValues(metrics.OutcomeForwarded).Inc()
+		} else if strings.HasPrefix(resp.GetError(), NotLeaderPrefix) {
+			metrics.ReadTotal.WithLabelValues(metrics.OutcomeNotLeader).Inc()
+		} else {
+			metrics.ReadTotal.WithLabelValues(metrics.OutcomeError).Inc()
+		}
+		return resp, nil
 	}
 
 	if s.reader == nil {
@@ -208,6 +218,7 @@ func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespons
 		}, nil
 	}
 
+	metrics.ReadTotal.WithLabelValues(metrics.OutcomeOK).Inc()
 	return &pb.ReadResponse{Found: found, Value: value}, nil
 }
 
@@ -298,6 +309,7 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 							UnavailablePrefix, leader, ferr),
 					}, nil
 				}
+				metrics.ProposeTotal.WithLabelValues(metrics.OutcomeForwarded).Inc()
 				return forwarded, nil
 			}
 
@@ -307,21 +319,25 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 			} else {
 				log.Printf("Propose rejected: not the leader (leader=%q)", leader)
 			}
+			metrics.ProposeTotal.WithLabelValues(metrics.OutcomeNotLeader).Inc()
 			return &pb.ProposeResponse{
 				Success: false,
 				Error:   NotLeaderPrefix + leader,
 			}, nil
 		}
 		log.Printf("ERROR: raft apply failed: %v", err)
+		metrics.ProposeTotal.WithLabelValues(metrics.OutcomeError).Inc()
 		return &pb.ProposeResponse{Success: false, Error: err.Error()}, nil
 	}
 
 	if applyErr, ok := resp.(error); ok && applyErr != nil {
 		log.Printf("ERROR: entry committed but the state machine rejected it: %v",
 			applyErr)
+		metrics.ProposeTotal.WithLabelValues(metrics.OutcomeError).Inc()
 		return &pb.ProposeResponse{Success: false, Error: applyErr.Error()}, nil
 	}
 
+	metrics.ProposeTotal.WithLabelValues(metrics.OutcomeOK).Inc()
 	return &pb.ProposeResponse{Success: true}, nil
 }
 

@@ -34,3 +34,25 @@ func (r *StoreReader) Get(ctx context.Context, key string) (bool, []byte, error)
 	}
 	return resp.GetFound(), resp.GetValue(), nil
 }
+
+// Probe reports whether the C++ state machine is answering (R5.5).
+//
+// Implemented as a Get of a key that will never exist. That is deliberate: a
+// lookup exercises the whole path — gRPC channel, the server's dispatch, and the
+// store's lock — while being a pure read that cannot alter state. An Apply would
+// prove more but would write a raft entry on every healthcheck poll, which over a
+// day is a lot of log for no information.
+//
+// A miss is a SUCCESS. The probe asks "did the backend answer", not "was the key
+// there"; treating found=false as a failure would report every healthy node as
+// broken.
+func (r *StoreReader) Probe(ctx context.Context) error {
+	if _, _, err := r.Get(ctx, probeKey); err != nil {
+		return fmt.Errorf("state machine probe failed: %w", err)
+	}
+	return nil
+}
+
+// probeKey is namespaced so it cannot collide with real data even if something
+// ever did write it.
+const probeKey = "__raftkv_readiness_probe__"
