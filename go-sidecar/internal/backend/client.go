@@ -4,7 +4,8 @@ package backend
 import (
 	"context"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"time"
 
 	"google.golang.org/grpc"
@@ -32,6 +33,24 @@ const (
 )
 
 // ConnectionConfig holds configuration for connecting to the backend.
+
+// logger is this package's structured logger (R5.1). Package-level and settable
+// rather than threaded through every constructor: the alternative was changing
+// the signature of every New* in the codebase for a cross-cutting concern, and
+// these are libraries with one instance per process.
+//
+// Defaults to DISCARDING rather than to os.Stdout. A package used without
+// SetLogger — which is every unit test — should be silent, not spray JSON through
+// the test output. main.go is the only caller of SetLogger.
+var logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// SetLogger installs the process logger for this package.
+func SetLogger(l *slog.Logger) {
+	if l != nil {
+		logger = l
+	}
+}
+
 type ConnectionConfig struct {
 	Address    string
 	MaxRetries int
@@ -105,7 +124,7 @@ func Connect(cfg *ConnectionConfig) (*Client, error) {
 
 		state = waitForReady(ctx, conn, retryDelay)
 		if state == connectivity.Ready {
-			log.Printf("Connected to C++ backend at %s", cfg.Address)
+			logger.Info(fmt.Sprintf("Connected to C++ backend at %s", cfg.Address))
 			return &Client{
 				conn:               conn,
 				StateMachineClient: pb.NewStateMachineClient(conn),
@@ -115,8 +134,8 @@ func Connect(cfg *ConnectionConfig) (*Client, error) {
 			break
 		}
 
-		log.Printf("Waiting for C++ backend at %s (attempt %d/%d, state %s)",
-			cfg.Address, attempts, cfg.MaxRetries, state)
+		logger.Info(fmt.Sprintf("Waiting for C++ backend at %s (attempt %d/%d, state %s)",
+			cfg.Address, attempts, cfg.MaxRetries, state))
 
 		if ctx.Err() != nil {
 			// The overall budget is gone: the remaining attempt windows would
@@ -128,7 +147,7 @@ func Connect(cfg *ConnectionConfig) (*Client, error) {
 	// Never hand back a half-open connection: the caller only gets an error, so
 	// nobody would be left to Close this one.
 	if cerr := conn.Close(); cerr != nil {
-		log.Printf("Failed to close unready connection to %s: %v", cfg.Address, cerr)
+		logger.Error(fmt.Sprintf("Failed to close unready connection to %s: %v", cfg.Address, cerr))
 	}
 
 	return nil, fmt.Errorf("failed to connect to C++ backend at %s after %d attempts within %v (last state %s)",

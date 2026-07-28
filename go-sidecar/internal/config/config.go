@@ -32,6 +32,9 @@ const (
 	// 10240 entries never shrinks at all, however often it is snapshotted. Any
 	// test that wants to observe the first log index advancing must lower this.
 	DefaultTrailingLogs uint64 = 10240
+
+	// DefaultLogLevel is the slog threshold when -log-level is not given.
+	DefaultLogLevel = "info"
 )
 
 // Config holds all configuration values for the sidecar application.
@@ -52,6 +55,8 @@ type Config struct {
 	SnapshotInterval  time.Duration
 	SnapshotThreshold uint64
 	TrailingLogs      uint64
+	// LogLevel is the slog threshold: debug|info|warn|error (R5.1).
+	LogLevel string
 }
 
 // flags holds the command-line flag pointers
@@ -69,6 +74,7 @@ var flags struct {
 	snapshotInterval  *time.Duration
 	snapshotThreshold *uint64
 	trailingLogs      *uint64
+	logLevel          *string
 }
 
 func init() {
@@ -90,6 +96,7 @@ func init() {
 	flags.snapshotInterval = flag.Duration("snapshot-interval", DefaultSnapshotInterval, "How often to check whether a Raft snapshot is due")
 	flags.snapshotThreshold = flag.Uint64("snapshot-threshold", DefaultSnapshotThreshold, "Applied entries since the last snapshot before a new one is taken")
 	flags.trailingLogs = flag.Uint64("trailing-logs", DefaultTrailingLogs, "Log entries to retain behind a snapshot")
+	flags.logLevel = flag.String("log-level", DefaultLogLevel, "Log threshold: debug|info|warn|error")
 }
 
 // Parse parses command-line flags and returns a Config.
@@ -110,6 +117,7 @@ func Parse() *Config {
 		SnapshotInterval:  *flags.snapshotInterval,
 		SnapshotThreshold: *flags.snapshotThreshold,
 		TrailingLogs:      *flags.trailingLogs,
+		LogLevel:          *flags.logLevel,
 	}
 }
 

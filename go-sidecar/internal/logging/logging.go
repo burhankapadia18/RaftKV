@@ -61,6 +61,33 @@ func New(nodeID, level string) *slog.Logger {
 func NewWithWriter(w io.Writer, nodeID, level string) *slog.Logger {
 	handler := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: ParseLevel(level),
+		// Normalize the schema to match the C++ logger's exactly (cpp-app/src/
+		// common/log.hpp): "ts" not "time", and a lowercase level.
+		//
+		// Both processes write into the SAME `docker compose logs` stream, so a
+		// disagreement here means no single jq expression can filter it —
+		// `select(.level=="error")` would silently miss half the cluster's errors
+		// because slog spells it "ERROR" and the C++ side spells it "error".
+		// Cosmetic-looking, operationally not.
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			switch a.Key {
+			case slog.TimeKey:
+				if len(groups) == 0 {
+					a.Key = "ts"
+					// RFC3339 with milliseconds, the same precision the C++ side
+					// emits, so timestamps sort correctly when the two are
+					// interleaved.
+					a.Value = slog.StringValue(
+						a.Value.Time().UTC().Format("2006-01-02T15:04:05.000Z"))
+				}
+			case slog.LevelKey:
+				if len(groups) == 0 {
+					a.Value = slog.StringValue(
+						strings.ToLower(a.Value.String()))
+				}
+			}
+			return a
+		},
 	})
 	return slog.New(handler).With(slog.String("node_id", nodeID))
 }

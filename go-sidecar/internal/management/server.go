@@ -4,7 +4,9 @@ package management
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -118,10 +120,10 @@ func (s *Server) Start() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Printf("Management API listening on %s", addr)
+	logger.Info(fmt.Sprintf("Management API listening on %s", addr))
 	go func() {
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Management server error: %v", err)
+			logger.Error(fmt.Sprintf("Management server error: %v", err))
 		}
 	}()
 }
@@ -149,14 +151,14 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Received join request for %s at %s", peerID, peerAddress)
+	logger.Info(fmt.Sprintf("Received join request for %s at %s", peerID, peerAddress))
 
 	if s.relayToLeader(w, r, "/join") {
 		return
 	}
 
 	if err := s.node.AddVoter(peerID, peerAddress); err != nil {
-		log.Printf("Failed to add voter: %v", err)
+		logger.Error(fmt.Sprintf("Failed to add voter: %v", err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -178,14 +180,14 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Received remove request for %s", peerID)
+	logger.Info(fmt.Sprintf("Received remove request for %s", peerID))
 
 	if s.relayToLeader(w, r, "/remove") {
 		return
 	}
 
 	if err := s.node.RemoveServer(peerID); err != nil {
-		log.Printf("Failed to remove server: %v", err)
+		logger.Error(fmt.Sprintf("Failed to remove server: %v", err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -211,7 +213,7 @@ func (s *Server) relayToLeader(w http.ResponseWriter, r *http.Request, path stri
 	// Already relayed once: answer truthfully instead of bouncing it onward.
 	// Leadership moved between the first hop and this one.
 	if r.Header.Get(ForwardedHeader) != "" {
-		log.Printf("Refusing already-forwarded %s: this node is not the leader", path)
+		logger.Warn(fmt.Sprintf("Refusing already-forwarded %s: this node is not the leader", path))
 		http.Error(w,
 			"not the leader, and this request was already forwarded once",
 			http.StatusServiceUnavailable)
@@ -226,16 +228,16 @@ func (s *Server) relayToLeader(w http.ResponseWriter, r *http.Request, path stri
 
 	mgmtAddr, err := s.resolver.MgmtAddr(s.node.LeaderAddr())
 	if err != nil {
-		log.Printf("Cannot forward %s: %v", path, err)
+		logger.Info(fmt.Sprintf("Cannot forward %s: %v", path, err))
 		http.Error(w, "not the leader: "+err.Error(),
 			http.StatusServiceUnavailable)
 		return true
 	}
 
-	log.Printf("Forwarding %s to the leader at %s", path, mgmtAddr)
+	logger.Info(fmt.Sprintf("Forwarding %s to the leader at %s", path, mgmtAddr))
 	result, err := s.forwarder.Forward(r.Context(), mgmtAddr, path, r.URL.RawQuery)
 	if err != nil {
-		log.Printf("Forwarding %s to %s failed: %v", path, mgmtAddr, err)
+		logger.Error(fmt.Sprintf("Forwarding %s to %s failed: %v", path, mgmtAddr, err))
 		http.Error(w, "forwarding to the leader failed: "+err.Error(),
 			http.StatusServiceUnavailable)
 		return true
@@ -286,7 +288,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	firstLogIndex, err := s.node.FirstLogIndex()
 	if err != nil {
-		log.Printf("Failed to read first log index for /status: %v", err)
+		logger.Error(fmt.Sprintf("Failed to read first log index for /status: %v", err))
 		status.LogStoreError = err.Error()
 	} else {
 		status.FirstLogIndex = firstLogIndex
@@ -296,7 +298,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	// would have already committed a 200 and half a body by the time it failed.
 	payload, err := json.Marshal(status)
 	if err != nil {
-		log.Printf("Failed to encode status: %v", err)
+		logger.Error(fmt.Sprintf("Failed to encode status: %v", err))
 		http.Error(w, "Failed to encode status", http.StatusInternalServerError)
 		return
 	}
@@ -353,6 +355,23 @@ type readyResponse struct {
 // hold the request open and make the healthcheck itself time out.
 const backendProbeTimeout = 2 * time.Second
 
+// logger is this package's structured logger (R5.1). Package-level and settable
+// rather than threaded through every constructor: the alternative was changing
+// the signature of every New* in the codebase for a cross-cutting concern, and
+// these are libraries with one instance per process.
+//
+// Defaults to DISCARDING rather than to os.Stdout. A package used without
+// SetLogger — which is every unit test — should be silent, not spray JSON through
+// the test output. main.go is the only caller of SetLogger.
+var logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// SetLogger installs the process logger for this package.
+func SetLogger(l *slog.Logger) {
+	if l != nil {
+		logger = l
+	}
+}
+
 // handleReady reports whether this node should receive traffic (R5.5).
 //
 // 200 only when raft is in a serving state, a leader is known, and the local C++
@@ -407,7 +426,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 
 	payload, err := json.Marshal(readyResponse{Ready: ready, Checks: checks})
 	if err != nil {
-		log.Printf("Failed to encode readiness: %v", err)
+		logger.Error(fmt.Sprintf("Failed to encode readiness: %v", err))
 		http.Error(w, "Failed to encode readiness", http.StatusInternalServerError)
 		return
 	}

@@ -3,7 +3,8 @@ package raftnode
 
 import (
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -21,6 +22,24 @@ import (
 const snapshotsRetained = 2
 
 // Node wraps the Raft instance and provides high-level operations.
+
+// logger is this package's structured logger (R5.1). Package-level and settable
+// rather than threaded through every constructor: the alternative was changing
+// the signature of every New* in the codebase for a cross-cutting concern, and
+// these are libraries with one instance per process.
+//
+// Defaults to DISCARDING rather than to os.Stdout. A package used without
+// SetLogger — which is every unit test — should be silent, not spray JSON through
+// the test output. main.go is the only caller of SetLogger.
+var logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// SetLogger installs the process logger for this package.
+func SetLogger(l *slog.Logger) {
+	if l != nil {
+		logger = l
+	}
+}
+
 type Node struct {
 	Raft      *raft.Raft
 	Transport *raft.NetworkTransport
@@ -125,7 +144,7 @@ func New(cfg *config.Config, fsm raft.FSM, opts *Options) (*Node, error) {
 	)
 	if err != nil {
 		if closeErr := transport.Close(); closeErr != nil {
-			log.Printf("Failed to close transport after Raft setup error: %v", closeErr)
+			logger.Error(fmt.Sprintf("Failed to close transport after Raft setup error: %v", closeErr))
 		}
 		closeLogStore(logStore)
 		return nil, fmt.Errorf("failed to create raft instance: %w", err)
@@ -144,7 +163,7 @@ func New(cfg *config.Config, fsm raft.FSM, opts *Options) (*Node, error) {
 // and must not be dropped silently, so it is logged.
 func closeLogStore(logStore *raftboltdb.BoltStore) {
 	if err := logStore.Close(); err != nil {
-		log.Printf("Failed to close log store after Raft setup error: %v", err)
+		logger.Error(fmt.Sprintf("Failed to close log store after Raft setup error: %v", err))
 	}
 }
 
@@ -175,7 +194,7 @@ func createTransport(cfg *config.Config, opts *Options) (*raft.NetworkTransport,
 
 // Bootstrap bootstraps the Raft cluster with this node as the initial leader.
 func (n *Node) Bootstrap() error {
-	log.Println("Bootstrapping cluster...")
+	logger.Info("Bootstrapping cluster...")
 	future := n.Raft.BootstrapCluster(raft.Configuration{
 		Servers: []raft.Server{
 			{

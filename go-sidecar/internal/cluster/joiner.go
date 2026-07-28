@@ -4,12 +4,30 @@ package cluster
 import (
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 )
 
 // JoinConfig holds configuration for joining a cluster.
+
+// logger is this package's structured logger (R5.1). Package-level and settable
+// rather than threaded through every constructor: the alternative was changing
+// the signature of every New* in the codebase for a cross-cutting concern, and
+// these are libraries with one instance per process.
+//
+// Defaults to DISCARDING rather than to os.Stdout. A package used without
+// SetLogger — which is every unit test — should be silent, not spray JSON through
+// the test output. main.go is the only caller of SetLogger.
+var logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// SetLogger installs the process logger for this package.
+func SetLogger(l *slog.Logger) {
+	if l != nil {
+		logger = l
+	}
+}
+
 type JoinConfig struct {
 	LeaderMgmtAddr string
 	NodeID         string
@@ -62,16 +80,16 @@ func (j *Joiner) Join() error {
 			time.Sleep(j.config.RetryInterval)
 		}
 
-		log.Printf("Attempting to join cluster via %s (attempt %d/%d)...",
-			url, i+1, j.config.MaxRetries)
+		logger.Info(fmt.Sprintf("Attempting to join cluster via %s (attempt %d/%d)...",
+			url, i+1, j.config.MaxRetries))
 
 		if err := j.attemptJoin(url); err != nil {
 			lastErr = err
-			log.Printf("Join attempt %d failed: %v", i+1, err)
+			logger.Error(fmt.Sprintf("Join attempt %d failed: %v", i+1, err))
 			continue
 		}
 
-		log.Println("Successfully joined the cluster!")
+		logger.Info("Successfully joined the cluster!")
 		return nil
 	}
 
@@ -84,7 +102,7 @@ func (j *Joiner) Join() error {
 func (j *Joiner) JoinAsync() {
 	go func() {
 		if err := j.Join(); err != nil {
-			log.Printf("CRITICAL: %v", err)
+			logger.Error(fmt.Sprintf("CRITICAL: %v", err))
 		}
 	}()
 }

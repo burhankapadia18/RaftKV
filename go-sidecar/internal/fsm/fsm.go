@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -23,6 +23,23 @@ import (
 // per-message framing overhead negligible, and it is the same size the C++
 // GetSnapshot handler emits — see docs/phases/phase-3-snapshots.md (R3.1).
 const snapshotChunkSize = 64 * 1024
+
+// logger is this package's structured logger (R5.1). Package-level and settable
+// rather than threaded through every constructor: the alternative was changing
+// the signature of every New* in the codebase for a cross-cutting concern, and
+// these are libraries with one instance per process.
+//
+// Defaults to DISCARDING rather than to os.Stdout. A package used without
+// SetLogger — which is every unit test — should be silent, not spray JSON through
+// the test output. main.go is the only caller of SetLogger.
+var logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// SetLogger installs the process logger for this package.
+func SetLogger(l *slog.Logger) {
+	if l != nil {
+		logger = l
+	}
+}
 
 // ApplyError reports a Raft log entry that this node could not apply to its
 // local C++ state machine.
@@ -158,9 +175,9 @@ func (f *CppFSM) Apply(l *raft.Log) interface{} {
 		// Local, non-deterministic failure: peers that could reach their own
 		// state machine have applied this entry and this node has not. This is
 		// the branch that genuinely risks divergence.
-		log.Printf("ERROR: %v (could not reach the C++ state machine; peers may "+
+		logger.Error(fmt.Sprintf("ERROR: %v (could not reach the C++ state machine; peers may "+
 			"have applied this entry, so THIS REPLICA MAY NOW BE DIVERGED)",
-			applyErr)
+			applyErr))
 		return applyErr
 	}
 
@@ -171,8 +188,8 @@ func (f *CppFSM) Apply(l *raft.Log) interface{} {
 			Term:   l.Term,
 			Reason: "state machine returned a nil response",
 		}
-		log.Printf("ERROR: %v (outcome unknown, so THIS REPLICA MAY NOW BE DIVERGED)",
-			applyErr)
+		logger.Error(fmt.Sprintf("ERROR: %v (outcome unknown, so THIS REPLICA MAY NOW BE DIVERGED)",
+			applyErr))
 		return applyErr
 	}
 
@@ -191,9 +208,9 @@ func (f *CppFSM) Apply(l *raft.Log) interface{} {
 		// Saying "diverged" here would send an operator hunting a problem that
 		// does not exist, and this path is reached by any client sending a bad
 		// command, so it would cry wolf constantly.
-		log.Printf("ERROR: %v (state machine rejected the entry; this verdict is "+
+		logger.Error(fmt.Sprintf("ERROR: %v (state machine rejected the entry; this verdict is "+
 			"deterministic, so all replicas reject it identically and stay "+
-			"consistent — the entry is a permanent no-op in the log)", applyErr)
+			"consistent — the entry is a permanent no-op in the log)", applyErr))
 		return applyErr
 	}
 
@@ -261,7 +278,7 @@ func (f *CppFSM) Snapshot() (raft.FSMSnapshot, error) {
 		state.Write(chunk.GetData())
 	}
 
-	log.Printf("fsm: captured a %d byte snapshot of the C++ state machine", state.Len())
+	logger.Info(fmt.Sprintf("fsm: captured a %d byte snapshot of the C++ state machine", state.Len()))
 	return &cppSnapshot{state: state.Bytes()}, nil
 }
 
@@ -329,7 +346,7 @@ func (f *CppFSM) Restore(rc io.ReadCloser) error {
 			sent)
 	}
 
-	log.Printf("fsm: restored a %d byte snapshot into the C++ state machine", sent)
+	logger.Info(fmt.Sprintf("fsm: restored a %d byte snapshot into the C++ state machine", sent))
 	return nil
 }
 

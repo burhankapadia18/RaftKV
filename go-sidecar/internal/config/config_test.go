@@ -50,6 +50,9 @@ var expectedFlags = []struct {
 	{name: "snapshot-interval", defValue: "2m0s", usage: "How often to check whether a Raft snapshot is due"},
 	{name: "snapshot-threshold", defValue: "8192", usage: "Applied entries since the last snapshot before a new one is taken"},
 	{name: "trailing-logs", defValue: "10240", usage: "Log entries to retain behind a snapshot"},
+	// R5.1: the slog threshold. Part of the same contract — an operator turns
+	// debug on through this flag or the LOG_LEVEL env var entrypoint.sh forwards.
+	{name: "log-level", defValue: "info", usage: "Log threshold: debug|info|warn|error"},
 }
 
 // TestSnapshotFlagDefaultsMatchConstants ties the flag defaults to the exported
@@ -63,6 +66,7 @@ func TestSnapshotFlagDefaultsMatchConstants(t *testing.T) {
 		{flagName: "snapshot-interval", want: DefaultSnapshotInterval.String()},
 		{flagName: "snapshot-threshold", want: strconv.FormatUint(DefaultSnapshotThreshold, 10)},
 		{flagName: "trailing-logs", want: strconv.FormatUint(DefaultTrailingLogs, 10)},
+		{flagName: "log-level", want: DefaultLogLevel},
 	}
 
 	for _, tt := range tests {

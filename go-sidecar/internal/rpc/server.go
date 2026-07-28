@@ -5,7 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
@@ -64,6 +65,23 @@ const proposeTimeout = 4 * time.Second
 // wait, so a leader that cannot make progress fails the read instead of hanging
 // the client.
 const readTimeout = 4 * time.Second
+
+// logger is this package's structured logger (R5.1). Package-level and settable
+// rather than threaded through every constructor: the alternative was changing
+// the signature of every New* in the codebase for a cross-cutting concern, and
+// these are libraries with one instance per process.
+//
+// Defaults to DISCARDING rather than to os.Stdout. A package used without
+// SetLogger — which is every unit test — should be silent, not spray JSON through
+// the test output. main.go is the only caller of SetLogger.
+var logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// SetLogger installs the process logger for this package.
+func SetLogger(l *slog.Logger) {
+	if l != nil {
+		logger = l
+	}
+}
 
 // RaftProposer is the consumer-side view of the Raft node that the Propose
 // handler needs. Declaring it here (rather than depending on *raftnode.Node)
@@ -197,7 +215,7 @@ func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespons
 	}
 
 	if err := s.node.Barrier(readTimeout); err != nil {
-		log.Printf("ERROR: read barrier failed: %v", err)
+		logger.Error(fmt.Sprintf("ERROR: read barrier failed: %v", err))
 		return &pb.ReadResponse{
 			Error: fmt.Sprintf("read barrier failed: %v", err),
 		}, nil
@@ -206,13 +224,13 @@ func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRespons
 	// After the barrier, not before — see step 3 above.
 	if err := s.node.VerifyLeader(); err != nil {
 		leader := s.node.LeaderAddr()
-		log.Printf("Read rejected: leadership not confirmed (%v, leader=%q)", err, leader)
+		logger.Warn(fmt.Sprintf("Read rejected: leadership not confirmed (%v, leader=%q)", err, leader))
 		return &pb.ReadResponse{Error: NotLeaderPrefix + leader}, nil
 	}
 
 	found, value, err := s.reader.Get(ctx, req.GetKey())
 	if err != nil {
-		log.Printf("ERROR: local read failed: %v", err)
+		logger.Error(fmt.Sprintf("ERROR: local read failed: %v", err))
 		return &pb.ReadResponse{
 			Error: fmt.Sprintf("local read failed: %v", err),
 		}, nil
@@ -229,7 +247,7 @@ func (s *Server) forwardRead(ctx context.Context, req *pb.ReadRequest) *pb.ReadR
 	// One hop only, same reasoning as Propose: if a peer sent this here
 	// believing we lead and we do not, our hint is no better than theirs.
 	if req.GetForwarded() {
-		log.Printf("Refusing already-forwarded read: this node is not the leader")
+		logger.Warn("Refusing already-forwarded read: this node is not the leader")
 		return &pb.ReadResponse{Error: NotLeaderPrefix + leader}
 	}
 	if s.forwarder == nil {
@@ -243,7 +261,7 @@ func (s *Server) forwardRead(ctx context.Context, req *pb.ReadRequest) *pb.ReadR
 	// surface a resolver error and map onto a 502, telling the client the
 	// cluster is broken when it is merely mid-election.
 	if leader == "" {
-		log.Printf("Read rejected: no leader known")
+		logger.Warn("Read rejected: no leader known")
 		return &pb.ReadResponse{Error: NotLeaderPrefix}
 	}
 
@@ -252,11 +270,11 @@ func (s *Server) forwardRead(ctx context.Context, req *pb.ReadRequest) *pb.ReadR
 		return &pb.ReadResponse{Error: NotLeaderPrefix + leader}
 	}
 
-	log.Printf("Forwarding linearizable read to the leader at %s", leader)
+	logger.Info(fmt.Sprintf("Forwarding linearizable read to the leader at %s", leader))
 	resp, err := readForwarder.ForwardRead(ctx, leader, req.GetKey())
 	if err != nil {
 		// Same reasoning as the write path: transient, so retryable.
-		log.Printf("Forwarding read to %s failed: %v", leader, err)
+		logger.Error(fmt.Sprintf("Forwarding read to %s failed: %v", leader, err))
 		return &pb.ReadResponse{
 			Error: fmt.Sprintf("%scould not reach leader %s: %v",
 				UnavailablePrefix, leader, err),
@@ -290,7 +308,7 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 			// two nodes with stale hints ping-pong a request between them. Refuse
 			// instead, and let the original client see the truth.
 			if s.forwarder != nil && !cmd.GetForwarded() && leader != "" {
-				log.Printf("Propose: not the leader, forwarding to %s", leader)
+				logger.Warn(fmt.Sprintf("Propose: not the leader, forwarding to %s", leader))
 				forwarded, ferr := s.forwarder.ForwardPropose(ctx, leader, cmd)
 				if ferr != nil {
 					// Forwarding failed as a transport matter. Report it as
@@ -302,7 +320,7 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 					// thing that just failed. But it IS retryable — during an
 					// election the address we have is a node that has just died —
 					// so it must not surface as a fatal 502 either.
-					log.Printf("ERROR: forwarding to leader %s failed: %v", leader, ferr)
+					logger.Error(fmt.Sprintf("ERROR: forwarding to leader %s failed: %v", leader, ferr))
 					return &pb.ProposeResponse{
 						Success: false,
 						Error: fmt.Sprintf("%scould not reach leader %s: %v",
@@ -314,10 +332,10 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 			}
 
 			if cmd.GetForwarded() {
-				log.Printf("Propose rejected: arrived forwarded but this node is "+
-					"not the leader (leader=%q) — refusing to forward again", leader)
+				logger.Warn(fmt.Sprintf("Propose rejected: arrived forwarded but this node is "+
+					"not the leader (leader=%q) — refusing to forward again", leader))
 			} else {
-				log.Printf("Propose rejected: not the leader (leader=%q)", leader)
+				logger.Warn(fmt.Sprintf("Propose rejected: not the leader (leader=%q)", leader))
 			}
 			metrics.ProposeTotal.WithLabelValues(metrics.OutcomeNotLeader).Inc()
 			return &pb.ProposeResponse{
@@ -325,14 +343,14 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 				Error:   NotLeaderPrefix + leader,
 			}, nil
 		}
-		log.Printf("ERROR: raft apply failed: %v", err)
+		logger.Error(fmt.Sprintf("ERROR: raft apply failed: %v", err))
 		metrics.ProposeTotal.WithLabelValues(metrics.OutcomeError).Inc()
 		return &pb.ProposeResponse{Success: false, Error: err.Error()}, nil
 	}
 
 	if applyErr, ok := resp.(error); ok && applyErr != nil {
-		log.Printf("ERROR: entry committed but the state machine rejected it: %v",
-			applyErr)
+		logger.Error(fmt.Sprintf("ERROR: entry committed but the state machine rejected it: %v",
+			applyErr))
 		metrics.ProposeTotal.WithLabelValues(metrics.OutcomeError).Inc()
 		return &pb.ProposeResponse{Success: false, Error: applyErr.Error()}, nil
 	}
@@ -352,7 +370,7 @@ func (s *Server) Start(port string) error {
 
 	pb.RegisterRaftNodeServer(s.grpcServer, s)
 
-	log.Printf("gRPC server listening on %s", addr)
+	logger.Info(fmt.Sprintf("gRPC server listening on %s", addr))
 	return s.grpcServer.Serve(lis)
 }
 

@@ -3,7 +3,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +18,7 @@ import (
 	"my-raft-sidecar/internal/cluster"
 	"my-raft-sidecar/internal/config"
 	"my-raft-sidecar/internal/fsm"
+	"my-raft-sidecar/internal/logging"
 	"my-raft-sidecar/internal/management"
 	"my-raft-sidecar/internal/metrics"
 	"my-raft-sidecar/internal/peers"
@@ -40,7 +43,22 @@ const shutdownTimeout = 5 * time.Second
 func main() {
 	// Parse configuration
 	cfg := config.Parse()
-	log.Printf("Starting sidecar with config: %s", cfg)
+
+	// R5.1: one root logger carrying node_id, then a component-scoped child per
+	// package. With three nodes writing into a single `docker compose logs`
+	// stream, a line that cannot be filtered by node and component is nearly
+	// useless during an incident — which is the only time anyone reads logs.
+	root := logging.New(cfg.NodeID, cfg.LogLevel)
+	slog.SetDefault(root)
+	fsm.SetLogger(logging.For(root, logging.ComponentFSM))
+	rpc.SetLogger(logging.For(root, logging.ComponentRPC))
+	management.SetLogger(logging.For(root, logging.ComponentMgmt))
+	cluster.SetLogger(logging.For(root, logging.ComponentJoiner))
+	backend.SetLogger(logging.For(root, logging.ComponentBackend))
+	raftnode.SetLogger(logging.For(root, logging.ComponentRaft))
+
+	mainLog := logging.For(root, logging.ComponentMain)
+	mainLog.Info("starting sidecar", slog.String("config", cfg.String()))
 
 	// Connect to C++ backend
 	backendClient, err := backend.Connect(backend.DefaultConnectionConfig(cfg.AppAddr))
@@ -62,7 +80,7 @@ func main() {
 	// Bootstrap if requested
 	if cfg.Bootstrap {
 		if err := node.Bootstrap(); err != nil {
-			log.Printf("Warning: Bootstrap failed (may already be bootstrapped): %v", err)
+			mainLog.Error(fmt.Sprintf("Warning: Bootstrap failed (may already be bootstrapped): %v", err))
 		}
 	}
 
@@ -124,10 +142,10 @@ func main() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		sig := <-sigCh
-		log.Printf("Received %s, shutting down gracefully", sig)
+		mainLog.Info(fmt.Sprintf("Received %s, shutting down gracefully", sig))
 
 		if node.IsLeader() {
-			log.Println("This node is the leader; transferring leadership before exit")
+			mainLog.Info("This node is the leader; transferring leadership before exit")
 			// Bounded, and a failure is logged rather than fatal: there may be no
 			// other voter to hand off to (a single-node cluster, or peers already
 			// gone), and refusing to shut down over that would be worse than
@@ -137,20 +155,20 @@ func main() {
 			select {
 			case err := <-done:
 				if err != nil {
-					log.Printf("Leadership transfer failed (continuing shutdown): %v", err)
+					mainLog.Error(fmt.Sprintf("Leadership transfer failed (continuing shutdown): %v", err))
 				} else {
-					log.Println("Leadership transferred")
+					mainLog.Info("Leadership transferred")
 				}
 			case <-time.After(leadershipTransferTimeout):
-				log.Printf("Leadership transfer did not complete within %s; "+
-					"continuing shutdown", leadershipTransferTimeout)
+				mainLog.Info(fmt.Sprintf("Leadership transfer did not complete within %s; "+
+					"continuing shutdown", leadershipTransferTimeout))
 			}
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := mgmtServer.Stop(ctx); err != nil {
-			log.Printf("Management server shutdown: %v", err)
+			mainLog.Info(fmt.Sprintf("Management server shutdown: %v", err))
 		}
 
 		// GracefulStop, not Stop: in-flight proposals have already been accepted
@@ -158,18 +176,18 @@ func main() {
 		grpcServer.Stop()
 
 		if err := node.Shutdown(); err != nil {
-			log.Printf("Raft shutdown: %v", err)
+			mainLog.Info(fmt.Sprintf("Raft shutdown: %v", err))
 		}
-		log.Println("Shutdown complete")
+		mainLog.Info("Shutdown complete")
 	}()
 
 	// Log startup info
-	log.Printf("Go Sidecar %s running (Bind: %s, Adv: %s). Mgmt: %s",
+	mainLog.Info(fmt.Sprintf("Go Sidecar %s running (Bind: %s, Adv: %s). Mgmt: %s",
 		cfg.NodeID,
 		cfg.BindAddr(),
 		cfg.AdvertiseAddr(),
 		cfg.MgmtPort,
-	)
+	))
 
 	// Start serving (blocks until shutdown)
 	if err := grpcServer.Start(cfg.SidecarPort); err != nil {
