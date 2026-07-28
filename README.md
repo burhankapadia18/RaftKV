@@ -29,6 +29,7 @@
 - **gRPC Communication** — Fast inter-service communication between components
 - **Fault Tolerant** — Automatic leader election and cluster recovery
 - **HTTP API** — Simple REST-like interface for client applications
+- **Secure by configuration** — mutual TLS between Raft peers, HTTPS + bearer-token auth on the management API, and TLS termination for clients ([Security](#security))
 
 ## Architecture
 
@@ -171,20 +172,37 @@ ctest --test-dir cpp-app/build --output-on-failure
 pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v
 
-# 4. Crash recovery — also needs the LOCAL compose cluster: it SIGKILLs a node.
-#    Deselected from the run above by pytest.ini, opt in with the marker.
-pytest tests/e2e -m requires_docker -v
+# 4. Crash recovery and snapshots — also need the LOCAL compose cluster: they
+#    SIGKILL a node and wipe a volume. Deselected from the run above by
+#    pytest.ini, opt in with the marker. -rs prints skip reasons.
+pytest tests/e2e -m requires_docker -v -rs
+
+# 5. TLS profile — needs the cluster brought up with docker-compose.secure.yml
+#    and a CA in ./certs. Skips (never fails) when that is not the case.
+./scripts/gen-certs.sh
+export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
+docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
+pytest tests/e2e -m requires_secure -v -rs
+
+# 6. Fuzzers — clang only, not part of the default build.
+cmake -S cpp-app -B cpp-app/fuzz-build -DKVDB_BUILD_FUZZERS=ON \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build cpp-app/fuzz-build -j4
+./cpp-app/fuzz-build/fuzz_kv_command cpp-app/fuzz/corpus/kv_command -max_total_time=60
 ```
 
 **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every
-push to `main` and every pull request, with four independent jobs:
+push to `main` and every pull request, with independent jobs:
 
 | Job | Gates |
 |---|---|
-| `go` | `gofmt -l` (blocking), `go vet ./...`, `go test -race ./...` + coverage summary |
+| `go` | `gofmt -l` (blocking), `go vet ./...`, `go test -race ./...` + coverage summary, `gosec` |
 | `cpp` | `clang-format` check against `.clang-format` (blocking), cmake build with the project warning flags, `ctest` |
 | `cpp-sanitizers` | the same C++ tests under `-fsanitize=address,undefined` |
-| `e2e` | `docker build`, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, then the crash test (`-m requires_docker`), `docker compose down -v` |
+| `cpp-tsan` | the same C++ tests under `-fsanitize=thread` |
+| `fuzz` | both libFuzzer targets, 60s each, crash inputs uploaded as artifacts |
+| `e2e` | `docker build`, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, then the docker-gated tests, `docker compose down -v` |
+| `e2e-secure` | the same cluster under `docker-compose.secure.yml`: TLS profile tests, plus a forced leader failover (the Phase 6 advertise-address bug only appears after an election) |
 
 ## API Reference
 
@@ -259,10 +277,35 @@ Keys must be URL-safe: the query parser does no percent-decoding.
 ### Cluster Management (Sidecar)
 
 ```http
-GET http://<leader>:6000/join?peerID=<node_id>&peerAddress=<raft_address>
+GET  http://<any-node>:6000/join?peerID=<node_id>&peerAddress=<raft_address>
+GET  http://<any-node>:6000/remove?peerID=<node_id>
+GET  http://<any-node>:6000/status
+GET  http://<any-node>:6000/health
+GET  http://<any-node>:6000/ready
+GET  http://<any-node>:6000/metrics
 ```
 
-Adds a new node to the Raft cluster.
+`/join` and `/remove` change cluster membership and **require the cluster-admin
+bearer token**; the rest are read-only and unauthenticated, because container
+health probes and Prometheus cannot present a credential.
+
+```bash
+curl -H "Authorization: Bearer $RAFTKV_MGMT_TOKEN" \
+  "http://localhost:6000/join?peerID=node4&peerAddress=node4:8088"
+```
+
+| Situation | Status | Meaning |
+|---|---|---|
+| No `Authorization` header | 401 | A credential is required; `WWW-Authenticate: Bearer` is returned |
+| Wrong token | 403 | The credential was presented and rejected |
+| No token configured on the node | 403 | The endpoint is **disabled**, not open — see below |
+| Valid token, missing parameters | 400 | Authenticated; the request itself is malformed |
+
+The "no token configured" case is the important one: with `RAFTKV_MGMT_TOKEN`
+unset, `/join` and `/remove` are closed rather than open. A cluster that forgets
+to set it cannot grow — which is a much better failure than one that anybody can
+join. Either node of a join may receive the request: a follower relays it to the
+leader, authenticating as itself.
 
 ## Configuration
 
@@ -273,6 +316,15 @@ Adds a new node to the Raft cluster.
 | `NODE_ID` | Unique identifier for this node | `node1` |
 | `BOOTSTRAP` | Set to `true` for the initial leader | `false` |
 | `JOIN_ADDR` | Leader's management address for joining | - |
+| `RAFTKV_MGMT_TOKEN` | Cluster-admin bearer token for `/join` and `/remove`. Unset **disables** those endpoints | - |
+| `RAFT_TLS_CERT` / `RAFT_TLS_KEY` / `RAFT_TLS_CA` | Mutual TLS for the Raft peer transport. Unset means plaintext | - |
+| `MGMT_TLS_CERT` / `MGMT_TLS_KEY` / `MGMT_TLS_CA` | TLS for the management API. Unset means HTTP | - |
+| `SNAPSHOT_INTERVAL` / `SNAPSHOT_THRESHOLD` / `TRAILING_LOGS` | Raft snapshot tunables. Unset uses HashiCorp Raft's defaults | - |
+
+The token is read from the environment rather than a flag on purpose: a
+`-mgmt-token <secret>` would put it in the process's command line, where any
+local user can read it out of `ps`. TLS **paths** are passed as flags, because
+they are not secrets.
 
 ### Port Mapping
 
@@ -281,8 +333,89 @@ Adds a new node to the Raft cluster.
 | 8080 | HTTP API | Client-facing REST API |
 | 8088 | Raft | Raft consensus protocol |
 | 6000 | Management | Cluster join/leave operations |
-| 50051 | gRPC | C++ StateMachine service |
-| 50052 | gRPC | Go RaftNode service |
+| 50051 | gRPC | C++ StateMachine service — bound to `127.0.0.1`, never published |
+| 50052 | gRPC | Go RaftNode service — peer-reachable (write/read forwarding) |
+| 8443 | HTTPS | Client API via the TLS proxy, in the secure profile only |
+
+50051 is bound to loopback (R6.6): its only caller is this node's own sidecar,
+and it is an unauthenticated interface that can read and overwrite the entire
+store. 50052 is deliberately *not* loopback-only — Phase 4 made it the target of
+write and read forwarding from peers.
+
+## Security
+
+Security is **opt-in by configuration** and the default `docker compose up` is
+deliberately insecure: a demo that needs a CA before it prints anything is a demo
+nobody runs. The supported secure deployment is `docker-compose.secure.yml`, and
+it is exercised by its own CI job.
+
+```bash
+./scripts/gen-certs.sh                                # dev CA + node certs -> ./certs
+export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
+docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
+
+curl --cacert certs/ca.pem https://localhost:6000/status
+curl --cacert certs/ca.pem -X PUT --data-binary 'v' https://localhost:8443/kv/k
+```
+
+`scripts/gen-certs.sh` is a development helper, not a CA — it writes unencrypted
+keys and has no revocation or rotation story. In a real deployment the
+certificates should come from whatever already issues them there; the sidecar
+only takes three file paths.
+
+### What each surface gets
+
+| Surface | Port | Default profile | Secure profile |
+|---|---|---|---|
+| Client HTTP API | 8080 / 8443 | Plaintext, unauthenticated | HTTPS via a reverse proxy, **still unauthenticated** |
+| Management API | 6000 | HTTP; `/join`+`/remove` behind a bearer token | HTTPS + bearer token |
+| Raft peer transport | 8088 | Plaintext, **anyone who can reach it can append entries** | Mutual TLS against one cluster CA |
+| C++ StateMachine gRPC | 50051 | Plaintext on `127.0.0.1` | Same — see below |
+| Sidecar RaftNode gRPC | 50052 | Plaintext, peer-reachable | Same — see below |
+
+### What is deliberately not protected
+
+Stated plainly, because a security section that only lists wins is worse than
+none at all:
+
+- **There is no client authentication, in either profile.** Anyone who can reach
+  the client API can read and write every key. The bearer token guards cluster
+  *membership*, not data. Put the API behind something that authenticates.
+- **The intra-node gRPC pair (50051/50052) is plaintext.** 50051 never leaves the
+  container's loopback interface, so encrypting it would buy nothing. 50052 is
+  reachable by peers, because Phase 4 forwarding made it so — a peer that can
+  reach it can propose writes. It is inside the same trust boundary as the Raft
+  port, but unlike the Raft port it is not authenticated. This is a real gap.
+- **The proxy-to-node hop is plaintext** (see `deploy/caddy/Caddyfile`). It is
+  acceptable only because both ends are in the same compose network; a proxy on a
+  different host would give you encryption to the proxy and clear text for the
+  rest of the way.
+- **Certificates do not rotate.** Restart a node to pick up a new one.
+- **There is no authorization model** — no per-key ACLs, no roles. One
+  cluster-admin credential, and that is all.
+
+### Why TLS is terminated by a proxy (R6.5)
+
+The C++ engine's HTTP server is a hand-rolled accept loop over raw sockets.
+Adding a TLS state machine to it would put certificate parsing and session
+handling — a large, historically vulnerable surface — inside the process that
+owns the data, to reimplement what almost every deployment already runs in front
+of it. The proxy keeps the engine dependency-light and the TLS code maintained by
+someone else. The trade-off is the plaintext hop noted above.
+
+### Hardening in the code itself
+
+- Every byte read off disk or off a socket is treated as untrusted and
+  bounds-checked before it is used to index or allocate. Fuzzing this boundary
+  found a 17-byte MsgPack payload that made a node try to allocate over 512 MiB —
+  and because decoding happens *after* Raft commits, it took down every replica
+  and came back on every restart. `KVCommand::from_msgpack` now decodes under an
+  explicit `msgpack::unpack_limit`.
+- `cpp-app/fuzz/` holds libFuzzer targets for both input boundaries
+  (`KVCommand::from_msgpack`, `HttpRequestParser::parse`); CI runs each for 60s
+  per PR with ASan+UBSan.
+- Request caps: 1 MiB body (413), 32 KiB headers (431).
+- CI runs `gosec` on the Go tree and the C++ tests under ASan/UBSan and TSan.
 
 ## Data directory
 
@@ -416,22 +549,31 @@ RaftKV/
 │   │   └── storage/         # PersistentKVStore, WAL, atomic file write,
 │   │                        #   binary format primitives (see Data directory)
 │   ├── tests/               # GoogleTest unit tests (-DKVDB_BUILD_TESTS=ON)
+│   ├── fuzz/                # libFuzzer targets + corpora (-DKVDB_BUILD_FUZZERS=ON)
 │   ├── CMakeLists.txt       # Build configuration
 │   └── pb/                  # Stale generated Protobuf copy (unused by the build)
 ├── go-sidecar/              # Go Raft Sidecar (module: my-raft-sidecar)
 │   ├── cmd/sidecar/main.go  # Wiring only
-│   ├── internal/            # backend, cluster, config, fsm, management,
-│   │                        #   raftnode, rpc (+ *_test.go)
+│   ├── internal/            # backend, cluster, config, fsm, logging, management,
+│   │                        #   metrics, peers, raftnode, rpc, testcerts,
+│   │                        #   tlsconfig (+ *_test.go)
 │   ├── go.mod               # Go module dependencies
 │   └── pb/                  # Generated Protobuf files (checked in)
 ├── proto/
 │   └── consensus.proto      # Service definitions
 ├── tests/e2e/               # pytest end-to-end suite (needs a running cluster;
-│                            #   test_crash.py is opt-in: -m requires_docker)
+│                            #   test_crash.py / test_snapshot.py are opt-in with
+│                            #   -m requires_docker, test_secure_profile.py with
+│                            #   -m requires_secure)
+├── scripts/gen-certs.sh     # Development CA + node certificates -> ./certs
+├── deploy/caddy/Caddyfile   # TLS termination for the client API (secure profile)
 ├── docs/phases/             # Roadmap phase specs and plans
-├── .github/workflows/ci.yml # CI: go, cpp, cpp-sanitizers, e2e
+├── .github/workflows/ci.yml # CI: go, cpp, cpp-sanitizers, cpp-tsan, fuzz, e2e,
+│                            #   e2e-secure
 ├── .clang-format            # C++ formatting (enforced by the cpp CI job)
-├── docker-compose.yml       # Multi-node cluster setup
+├── docker-compose.yml       # Multi-node cluster setup (plaintext demo)
+├── docker-compose.secure.yml # TLS everywhere + a terminating proxy
+├── docker-compose.test.yml  # Aggressive snapshot tunables for the e2e suite
 ├── Dockerfile               # Multi-stage build
 ├── entrypoint.sh            # Container startup script
 ├── ROADMAP.md               # Path to 1.0

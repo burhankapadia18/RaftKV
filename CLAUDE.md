@@ -36,23 +36,42 @@ ctest --test-dir cpp-app/build --output-on-failure
 pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v
 
-# The one exception: the Phase 2 crash test, which SIGKILLs and restarts a
-# container. Deselected by default (pytest.ini `addopts`), opt in explicitly.
-pytest tests/e2e -m requires_docker -v
+# The exceptions, both deselected by default (pytest.ini `addopts`) and opted
+# into explicitly. -rs prints skip reasons; a silent skip is an unverified
+# requirement.
+pytest tests/e2e -m requires_docker -v -rs   # crash + snapshot: drives containers
+pytest tests/e2e -m requires_secure -v -rs   # TLS profile: needs the secure cluster
+
+# Secure profile (Phase 6). Certs first, then layer the override on.
+./scripts/gen-certs.sh                        # dev CA + node certs -> ./certs (gitignored)
+export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
+docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
+curl --cacert certs/ca.pem https://localhost:6000/status
+curl --cacert certs/ca.pem -X PUT --data-binary v https://localhost:8443/kv/k
+
+# Fuzzers (clang only; not built by default)
+cmake -S cpp-app -B cpp-app/fuzz-build -DKVDB_BUILD_FUZZERS=ON \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build cpp-app/fuzz-build -j4
+./cpp-app/fuzz-build/fuzz_kv_command cpp-app/fuzz/corpus/kv_command -max_total_time=60
 ```
 
 Use `docker compose` (the CLI plugin), not the standalone `docker-compose` binary — CI and the local toolchain only guarantee the former.
 
 There are three test layers, all of which must stay green:
 
-1. **Go unit tests** (`go-sidecar/internal/*/*_test.go`) — `internal/fsm`, `internal/config`, `internal/cluster`, `internal/management`, `internal/backend`, `internal/rpc`, run with `go test -race ./...`. `internal/raftnode` and `cmd/sidecar` have no tests yet.
+1. **Go unit tests** (`go-sidecar/internal/*/*_test.go`) — `internal/fsm`, `internal/config`, `internal/cluster`, `internal/management`, `internal/backend`, `internal/rpc`, `internal/peers`, `internal/raftnode`, `internal/tlsconfig`, run with `go test -race ./...`. `cmd/sidecar`, `internal/logging` and `internal/metrics` have no tests. `internal/testcerts` is a **non-test package imported only by tests** — Go has no other way to share a cert generator across packages; it lives under `internal/` and nothing outside a `_test.go` imports it. It deliberately does not import `internal/tlsconfig`, because `tlsconfig`'s own in-package tests would then be an import cycle.
 2. **C++ unit tests** (`cpp-app/tests/*.cpp`, GoogleTest via CTest) — `KVCommand::from_msgpack`, `PersistentKVStore`, `HttpRequestParser`, `StateMachineService::Apply`, `KVHttpHandler`. Built only when `-DKVDB_BUILD_TESTS=ON`; uses the system GoogleTest when present, otherwise fetches it. Also run under `-fsanitize=address,undefined` in CI. Test sources are **listed explicitly** in `CMakeLists.txt`, not globbed — a new test file is a visible diff.
 3. **End-to-end** (`tests/e2e/`, pytest) — asserts that a write on the leader is readable on **all three** nodes, DELETE round-trips, and the full HTTP status-code contract (404 on a miss, 503 naming the leader on a follower write, 415/400 on bad requests, and a regression test proving a malformed `Content-Length` no longer kills a node). Requires a live cluster; exits 1 with a "cluster does not look ready" message if there isn't one. These tests never start, stop or build anything with docker — the compose lifecycle belongs to CI and to the `cluster-smoke-test` skill.
+   - `tests/e2e/test_security.py` (Phase 6) runs in the default suite: the request caps (413/431, plus a burst that proves the rejection path does not leak), and cluster-membership auth. Its load-bearing assertion is not a status code — it is that `last_log_index` does **not** move after a refused `/join`, because middleware that returned 403 *after* calling `AddVoter` would pass a status-code-only test and leave the cluster compromised.
+   - `tests/e2e/test_secure_profile.py` (Phase 6) carries the `requires_secure` marker: it needs the cluster brought up with `docker-compose.secure.yml` and a CA in `./certs`, and skips otherwise. It checks the properties only a deployment has — plaintext refused on the raft port, a client certificate actually required there, HTTPS management, and that the plaintext client ports are **not** published (compose concatenates `ports` across files rather than replacing, so `!override` is required and was missed the first time).
    - `tests/e2e/test_crash.py` is the deliberate exception (Phase 2): it SIGKILLs a follower, restarts it, and asserts the acknowledged writes were already on that node's disk *while it was dead* — the only way to tell durability from raft log replay, since restarts replay the whole log. It carries the `requires_docker` marker and is deselected by `addopts` so the default run stays docker-free; it *skips* (never fails) when docker, the compose project or a local cluster is unavailable.
 
 `test_client.py` is retained only as a manual one-shot demo — it asserts nothing and checks a single node. Use `pytest tests/e2e` for verification. If you add tests, follow [.claude/rules/testing.md](.claude/rules/testing.md).
 
-**CI**: `.github/workflows/ci.yml` runs on every push to `main` and every PR, with four independent jobs: `go` (blocking `gofmt -l`, `go vet`, `go test -race` + coverage summary), `cpp` (blocking `clang-format` check against `.clang-format`, cmake build with the project warning flags, `ctest`), `cpp-sanitizers` (the same tests under ASan+UBSan), and `e2e` (docker build, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, then `pytest tests/e2e -m requires_docker` for the crash test, `docker compose down -v`).
+**CI**: `.github/workflows/ci.yml` runs on every push to `main` and every PR, with independent jobs: `go` (blocking `gofmt -l`, `go vet`, `go test -race` + coverage summary, `gosec` pinned to v2.21.4 with `-exclude-dir=pb`), `cpp` (blocking `clang-format` check against `.clang-format`, cmake build with the project warning flags, `ctest`), `cpp-sanitizers` (ASan+UBSan), `cpp-tsan` (ThreadSanitizer — needs `--security-opt seccomp=unconfined`, or the build dies in `gtest_discover_tests` on a blocked `personality()` call), `fuzz` (both libFuzzer targets, 60s each, crash inputs uploaded), `e2e` (docker build, `docker compose -f docker-compose.yml -f docker-compose.test.yml up -d`, bounded readiness poll, `pytest tests/e2e`, then `-m requires_docker`), and `e2e-secure` (the same cluster under `docker-compose.secure.yml`, `-m requires_secure`, **plus a forced leader failover** — see below).
+
+The failover step in `e2e-secure` is not padding. Phase 6 found a bug where the bootstrap node advertised its *resolved container IP*, so a peer dialling it verified the certificate against `172.18.0.2` while the certificate was issued for `node1`. The cluster forms, replicates and passes every smoke test; it breaks only after the first election, permanently, because the address is in the committed raft configuration. Only an election catches it.
 
 ## Architecture — The Two Data Paths
 
@@ -99,8 +118,18 @@ Consequences worth knowing before touching this code:
 | Consensus glue | `raft/raft_client.hpp` (propose), `raft/state_machine.hpp` (apply) | `rpc/server.go` (propose), `fsm/fsm.go` (apply) |
 | Storage | `storage/kv_store.hpp` (map + recovery), `storage/wal.hpp` (append/replay/heal), `storage/atomic_file.hpp` (fsync + rename), `storage/format.hpp` (length-prefix + CRC32) | `raftnode/node.go` (BoltDB raft log in `DATA_DIR/logs.dat`) |
 | Cluster membership | — | `cluster/joiner.go` (retry-join via leader's mgmt API) |
+| TLS / auth (Phase 6) | — | `tlsconfig/` (X.509 material for every surface), `raftnode/tls_transport.go` (mutual-TLS `raft.StreamLayer`), `management/auth.go` (bearer token) |
 
-Ports: 8080 HTTP · 50051 C++ StateMachine gRPC · 50052 Go RaftNode gRPC · 8088 Raft TCP · 6000 management HTTP.
+Ports: 8080 HTTP · 50051 C++ StateMachine gRPC (**127.0.0.1 only**) · 50052 Go RaftNode gRPC (peer-reachable) · 8088 Raft TCP · 6000 management HTTP(S) · 8443 client HTTPS via the proxy in the secure profile.
+
+### Security model (Phase 6)
+
+Security is opt-in by configuration; the default compose profile is deliberately plaintext (a demo needing a CA is a demo nobody runs), and `docker-compose.secure.yml` is the documented deployment. Four rules worth knowing before touching any of it:
+
+- **`internal/tlsconfig` is the only place a `*tls.Config` is built.** The dangerous parts of a TLS config are the ones easy to omit: a server with a cert and key but no `ClientCAs` completes a handshake with anybody, and looks like mutual TLS while authenticating nobody. Centralizing it means that mistake can only be made once, under test. Do not hand-roll a `tls.Config` at a call site.
+- **`ServerConfig`'s `requireClientCert` is a separate argument, not inferred from `CAFile`.** The raft transport must refuse anyone who cannot prove cluster membership; the management listener must *not* demand client certs, because health probes and Prometheus have none (they authenticate with the bearer token instead). Inferring would silently turn "I supplied a CA" into "I demand client certs" and break every probe.
+- **The TLS raft transport advertises the configured hostname, the plaintext one advertises a resolved IP — and that asymmetry is forced.** `raft.NewTCPTransport` rejects an advertise address that is not a `*net.TCPAddr` with a concrete IP, so the plaintext path must resolve. Under TLS the resolved IP is fatal: a peer verifies the certificate against the address it dialled, and a certificate for `node1` does not cover `172.18.0.2`. `NewNetworkTransport` makes no such demand, so the TLS path passes `hostPortAddr(advertiseAddr)`. See the long comment on that type; do not "simplify" the two paths back together.
+- **A misconfigured TLS surface must fail startup, never fall back.** `Config.Validate()` runs before anything binds, and `NewJoiner`/`WithTLS` return errors rather than degrading to HTTP. A relay or a join that quietly fell back to plaintext would put the cluster-admin token on the wire in clear, which is worse than a node that refuses to boot.
 
 ## Codebase Conventions
 
@@ -121,10 +150,12 @@ See [.claude/rules/protobuf.md](.claude/rules/protobuf.md) for the regeneration 
 
 These are acknowledged simplifications. If a task touches one, call it out and confirm scope before redesigning.
 
-Phase 0 removed none of these — it **pinned** them with tests that assert the current (wrong) behavior, each commented with the phase that will change it. Fixing a limitation therefore means updating its pinning tests in the same PR: see the pinned-behavior tables in `tests/e2e/README.md` and the `CURRENT LOSSY BEHAVIOR` / `PINNED` comments in `cpp-app/tests/` and `go-sidecar/internal/fsm/fsm_test.go`. This list shrinks as phases land — Phase 1 removed the stringly-error entry, Phase 2 the durability entry (WAL + atomic base file + binary format), Phase 3 the no-snapshots entry, and Phase 4 the leader-forwarding, stale-read and single-threaded-server entries. Do not reintroduce any of them.
+Phase 0 removed none of these — it **pinned** them with tests that assert the current (wrong) behavior, each commented with the phase that will change it. Fixing a limitation therefore means updating its pinning tests in the same PR: see the pinned-behavior tables in `tests/e2e/README.md` and the `CURRENT LOSSY BEHAVIOR` / `PINNED` comments in `cpp-app/tests/` and `go-sidecar/internal/fsm/fsm_test.go`. This list shrinks as phases land — Phase 1 removed the stringly-error entry, Phase 2 the durability entry (WAL + atomic base file + binary format), Phase 3 the no-snapshots entry, Phase 4 the leader-forwarding, stale-read and single-threaded-server entries, and Phase 6 the blanket "no TLS/auth anywhere" — replaced below by three narrower statements that are actually true. Do not reintroduce any of them.
 
 - **HTTP server**: no keep-alive — the server closes the socket after every response, so a client must not pool connections. (Phase 4 added the worker pool, the read-until-terminator header loop, body/header caps and URL decoding; Phase 1 made status lines and error bodies truthful and rejects a negative `Content-Length`. None of those clauses should be reinstated.)
 - **Legacy routes do not URL-decode**: `/kv/{key}` percent-decodes its path, `/get-val?key=` and `/insert-val` do not, so the same logical key is addressed differently through the two surfaces. Deliberate — decoding the deprecated routes would silently move which key an existing client reaches. They go away a release after Phase 4.
 - **Response content negotiation is not implemented**: R4.6 asks for msgpack responses under `Accept: application/msgpack`; requests are flexible but responses are always JSON envelopes plus raw values for reads. `HttpRequest::headers` is never populated, so honoring `Accept` needs real header capture first.
 - **Validation happens after commit**: a command with an unknown op or an empty key is replicated first and rejected at apply time, costing a raft log entry and returning 502. Moving it to the propose boundary means the HTTP layer parsing the msgpack it currently forwards opaquely — an architectural change, not a small one.
-- **No TLS/auth anywhere**: all gRPC channels and HTTP endpoints are insecure; the management `/join` endpoint is unauthenticated.
+- **No client authentication or authorization**: anyone who can reach the client HTTP API can read and write every key, in both compose profiles. The Phase 6 bearer token guards cluster *membership* (`/join`, `/remove`), not data. No per-key ACLs, no roles. Phase 6 scoped this out for 1.0 deliberately — the README's Security section says so plainly rather than implying the secure profile is fully locked down.
+- **The intra-node gRPC pair is plaintext**: 50051 binds `127.0.0.1` and never leaves the container, so that one is fine. **50052 is not** — Phase 4 made it peer-reachable for write and read forwarding, so a peer that can reach it can propose writes with no credential. It sits inside the same trust boundary as the Raft port but, unlike the Raft port, is unauthenticated. A real gap, knowingly left.
+- **Certificates do not rotate**: TLS material is read once at startup. Changing a certificate means restarting the node.

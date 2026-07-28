@@ -67,14 +67,16 @@ still contains everything it printed before the restart.
 
 from __future__ import annotations
 
+import time
 import urllib.parse
 from typing import NamedTuple
 
 import pytest
+import requests
 
 from contracts import HTTP_OK
 from snapshot_support import (
-    CPP_ENTRY_MARKERS,
+    read_apply_counter,
     CPP_SNAPSHOT_RESTORED,
     CPP_SNAPSHOT_SENT,
     DOCKER_POLL_INTERVAL,
@@ -203,6 +205,47 @@ def services(compose_project: ComposeProject, cluster) -> dict[str, str]:
     return mapping
 
 
+#: How long to wait for the cluster to accept a write again. Generous: it covers
+#: a container start plus a raft election, both of which precede this module when
+#: the crash scenarios have just run.
+WRITABLE_TIMEOUT = 60.0
+
+
+def _wait_for_writable(cluster, run_id: str, timeout: float) -> str | None:
+    """Poll until EVERY node accepts a write. Returns None, or the last failure.
+
+    Every node, not just the first one that answers. The first version of this
+    helper returned as soon as any node committed, and still failed: the
+    precondition burst writes to ``cluster.leader``, so a probe satisfied by a
+    healthy node2 said nothing about the node1 that had just restarted. Since
+    Phase 4 a write to a follower is forwarded, so a node that cannot accept one
+    is a node whose sidecar is not up — which is precisely the state being waited
+    out, and the scenarios below go on to query all three anyway.
+    """
+    key = f"e2e-writable-probe-{run_id}"
+    deadline = time.monotonic() + timeout
+    last = "no attempt completed"
+
+    while time.monotonic() < deadline:
+        pending = []
+        for url in cluster.nodes:
+            try:
+                response = cluster.set(url, key, "probe")
+            except requests.exceptions.RequestException as exc:
+                pending.append(f"{url}: {exc}")
+                continue
+            if response.status_code != HTTP_OK:
+                pending.append(
+                    f"{url}: HTTP {response.status_code} {cluster.body(response)!r}"
+                )
+        if not pending:
+            return None
+        last = "; ".join(pending)
+        time.sleep(0.25)
+
+    return last
+
+
 @pytest.fixture(scope="module")
 def tunables(
     compose_project: ComposeProject, services: dict[str, str]
@@ -221,12 +264,24 @@ def tunables(
 
     unreadable = [service for service, value in seen.items() if value is None]
     if unreadable:
-        pytest.skip(
+        # FAIL, not skip. This is the one branch here that cannot be a legitimate
+        # "not verified in this environment": the sidecar logs its Config on every
+        # start, so if the line cannot be parsed then the PARSER is wrong, and the
+        # whole module quietly stops testing anything.
+        #
+        # That is not hypothetical. It happened twice — Phase 5 changed the line
+        # from prose to JSON, Phase 6 appended fields after TrailingLogs — and both
+        # times these scenarios skipped, in CI too, while the job stayed green.
+        # Phase 3's headline requirement went unverified for two phases because a
+        # broken regex looked exactly like an unsupported environment.
+        pytest.fail(
             "could not read the snapshot tunables out of the startup log of "
-            f"{unreadable}. main.go logs `Starting sidecar with config: Config{{...}}` "
-            "once per start and Config.String() carries SnapshotInterval / "
-            "SnapshotThreshold / TrailingLogs; either the log has been rotated away "
-            "or that line changed shape."
+            f"{unreadable}. The sidecar logs its whole Config once per start and "
+            "Config.String() carries SnapshotInterval / SnapshotThreshold / "
+            "TrailingLogs, so this almost certainly means CONFIG_LINE_RE in "
+            "snapshot_support.py no longer matches the log line — not that the "
+            "environment is unsupported. Check what the container actually logs:\n"
+            "  docker compose logs node1 | grep -o 'Config{[^}]*}'"
         )
 
     lazy = {
@@ -280,6 +335,25 @@ def compacted(
     already been checked by then, so a log that refuses to shrink is the product
     being wrong, not the environment.
     """
+    # Wait for the cluster to accept a write before assuming it will.
+    #
+    # This module runs after test_crash.py, which SIGKILLs a container and starts
+    # it again. That test waits for the victim to serve a READ, which is not the
+    # same thing: the C++ HTTP server is listening well before the Go sidecar has
+    # bound :50052, so a read succeeds while every write still fails with
+    # 502 "connection refused to 127.0.0.1:50052". The precondition burst below
+    # then failed on its first write.
+    #
+    # The race is real but was invisible: these scenarios were skipping (a stale
+    # log-line regex), so nothing ever ran here after the crash test. Waiting for
+    # the property this fixture actually needs — writability — is robust to
+    # whatever ran before, which patching the crash test's teardown would not be.
+    writable = _wait_for_writable(cluster, run_id, WRITABLE_TIMEOUT)
+    assert writable is None, (
+        f"no node accepted a write within {WRITABLE_TIMEOUT:g}s of this module "
+        f"starting, so the snapshot preconditions cannot be set up: {writable}"
+    )
+
     node_services = sorted(set(services.values()))
     before = {
         service: require_status(compose_project, service, COMPACTION_TIMEOUT)
@@ -687,7 +761,6 @@ def test_r3_a_normal_restart_applies_a_snapshot_and_the_tail(
     )
 
     tail = before.last_log_index - before.last_snapshot_index
-    entries_before = compose_project.count_markers(victim_service, *CPP_ENTRY_MARKERS)
     restores_before = compose_project.count_markers(victim_service, GO_SNAPSHOT_RESTORED)
 
     restarted = compose_project.run("restart", victim_service)
@@ -705,7 +778,10 @@ def test_r3_a_normal_restart_applies_a_snapshot_and_the_tail(
         f"{dict(list(outstanding.items())[:5])}"
     )
 
-    entries_after = compose_project.count_markers(victim_service, *CPP_ENTRY_MARKERS)
+    # The counter resets with the process, so what it reads now IS "entries
+    # applied since the restart" — no before/after subtraction needed, and no
+    # dependence on a log line that a level change can silence.
+    replayed = read_apply_counter(victim_url)
     restores_after = compose_project.count_markers(victim_service, GO_SNAPSHOT_RESTORED)
 
     assert restores_after > restores_before, (
@@ -716,7 +792,6 @@ def test_r3_a_normal_restart_applies_a_snapshot_and_the_tail(
         "everything."
     )
 
-    replayed = entries_after - entries_before
     assert replayed <= tail + RESTART_TAIL_SLACK, (
         f"{victim_service} replayed {replayed} log entries into its state machine on "
         f"restart, more than the {tail} entries that sat above its snapshot "

@@ -3,6 +3,7 @@ package management
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"my-raft-sidecar/internal/tlsconfig"
 )
 
 // RaftControl is the consumer-side view of the Raft node that the management
@@ -78,6 +81,9 @@ type Server struct {
 	// authToken guards the mutating endpoints (R6.1). Empty means they are
 	// DISABLED, not open — see authorize().
 	authToken string
+
+	// tls is the certificate this listener serves (R6.3). Zero value means HTTP.
+	tls tlsconfig.Material
 }
 
 // WithAuthToken sets the cluster-admin bearer token for /join and /remove.
@@ -85,6 +91,16 @@ type Server struct {
 // Without it those endpoints are disabled rather than open.
 func (s *Server) WithAuthToken(token string) *Server {
 	s.authToken = token
+	return s
+}
+
+// WithTLS makes the management listener serve HTTPS (R6.3).
+//
+// The bearer token from R6.1 is only half of the protection it looks like over
+// plain HTTP: the credential travels in a header, so anyone on the path can read
+// it and replay it. Transport encryption is what makes the token worth having.
+func (s *Server) WithTLS(material tlsconfig.Material) *Server {
+	s.tls = material
 	return s
 }
 
@@ -132,12 +148,36 @@ func (s *Server) Start() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	logger.Info(fmt.Sprintf("Management API listening on %s", addr))
+	scheme := "http"
+	if s.tls.Configured() {
+		scheme = "https"
+	}
+	logger.Info(fmt.Sprintf("Management API listening on %s://%s", scheme, addr))
+
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		err := s.serve()
+		if err != nil && err != http.ErrServerClosed {
 			logger.Error(fmt.Sprintf("Management server error: %v", err))
 		}
 	}()
+}
+
+// serve blocks on the listener, over TLS when configured.
+//
+// ListenAndServeTLS takes the paths directly rather than a *tls.Config built by
+// tlsconfig.ServerConfig, because this listener is deliberately NOT mutual: it is
+// dialed by container health probes, curl and Prometheus, none of which hold a
+// cluster certificate. Callers are authenticated by the R6.1 bearer token
+// instead, and demanding a client cert here would break every probe.
+//
+// The one thing that must not be lost is the TLS 1.2 floor, so MinVersion is set
+// on the server's own config rather than relying on the default.
+func (s *Server) serve() error {
+	if !s.tls.Configured() {
+		return s.httpServer.ListenAndServe()
+	}
+	s.httpServer.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	return s.httpServer.ListenAndServeTLS(s.tls.CertFile, s.tls.KeyFile)
 }
 
 // Stop gracefully shuts down the management server.

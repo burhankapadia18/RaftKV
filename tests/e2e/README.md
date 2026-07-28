@@ -32,6 +32,7 @@ docker compose up -d
 pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v                         # the default suite: never touches docker
 pytest tests/e2e -m requires_docker -v -rs  # crash + snapshot: kills, wipes, restarts
+pytest tests/e2e -m requires_secure -v -rs  # TLS profile: needs the secure cluster
 ```
 
 `-rs` prints skip reasons. It matters for the opt-in run: the snapshot scenarios
@@ -42,10 +43,51 @@ Exit status is pytest's: non-zero on any failure. If no node accepts a write
 within the leader-discovery deadline, the suite fails with a message telling you
 the cluster is not up and what each node answered instead.
 
+## The Phase 6 security modules
+
+`test_security.py` runs in the **default** suite — it needs nothing but a live
+plaintext cluster. Two groups:
+
+*   **Request caps (R6.9).** An oversized body is 413, oversized headers are 431,
+    and — the part a unit test cannot show — the node is still serving
+    afterwards, including after a burst of ten. Phase 1 shipped a node that a
+    malformed `Content-Length` could kill; a cap that wedges the accept loop
+    instead of answering is not a cap. There is also a just-under-the-limit case,
+    without which "return 413 unconditionally" would pass.
+*   **Cluster membership (R6.1/R6.2).** The status codes are checked, but the
+    assertion that matters is `test_refused_join_does_not_add_the_peer`: after
+    two rejected `/join` calls, `last_log_index` must not have moved. Middleware
+    that returned 403 *after* calling `AddVoter` would satisfy every
+    status-code check and leave the cluster compromised. The valid-token case
+    sends no parameters on purpose, so it proves the credential was accepted
+    (400, not 401/403) without adding a phantom voter that would poison every
+    later test.
+
+`test_secure_profile.py` carries the `requires_secure` marker and needs the
+cluster brought up with `docker-compose.secure.yml` plus a CA in `./certs`:
+
+```bash
+./scripts/gen-certs.sh
+export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
+docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
+pytest tests/e2e -m requires_secure -v -rs
+```
+
+It does **not** re-test TLS mechanics — Go unit tests in `internal/tlsconfig` and
+`internal/raftnode` already drive real sockets. It tests what only a deployment
+has: that the raft port refuses plaintext *and* refuses a peer with no client
+certificate (one-way TLS would encrypt everything and still let anyone append
+entries), that management HTTPS verifies against the CA and refuses TLS below
+1.2, and that the plaintext client ports are **not** published. That last one is
+a real mistake already made once here: compose *concatenates* `ports` across
+files rather than replacing them, so the first version of the secure profile
+left 8080 open right next to 8443.
+
 ## The `requires_docker` split
 
-`pytest.ini` sets `addopts = -m "not requires_docker"`, so the default run
-excludes `test_crash.py` and `test_snapshot.py`. That is not a convenience — it
+`pytest.ini` sets `addopts = -m "not requires_docker and not requires_secure"`,
+so the default run excludes `test_crash.py`, `test_snapshot.py` and
+`test_secure_profile.py`. That is not a convenience — it
 is what keeps the rule above true.
 
 The rule exists because it makes the suite portable: knowing nothing about *how*

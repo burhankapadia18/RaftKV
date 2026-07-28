@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"my-raft-sidecar/internal/tlsconfig"
 )
 
 // ForwardedHeader marks a management request that has already been relayed once.
@@ -47,7 +49,8 @@ type Forwarder interface {
 	Forward(ctx context.Context, mgmtAddr, path, rawQuery string) (*ForwardResult, error)
 }
 
-// HTTPForwarder relays over plain HTTP to a peer's management port.
+// HTTPForwarder relays to a peer's management port over HTTP, or HTTPS once
+// WithTLS has been called.
 type HTTPForwarder struct {
 	client *http.Client
 
@@ -55,6 +58,12 @@ type HTTPForwarder struct {
 	// relaying a join must authenticate as itself: the leader authorizes the
 	// REQUEST it receives, and it cannot see the original caller's credential.
 	token string
+
+	// scheme is "http" unless TLS material was supplied. It is derived from this
+	// node's own configuration rather than probed, because a cluster is
+	// configured uniformly and guessing per peer would mean falling back to
+	// plaintext — which is exactly how a relayed token leaks.
+	scheme string
 }
 
 // WithAuthToken sets the token presented on relayed requests.
@@ -63,19 +72,46 @@ func (f *HTTPForwarder) WithAuthToken(token string) *HTTPForwarder {
 	return f
 }
 
+// WithTLS makes relayed requests go over HTTPS, verified against material's CA
+// (R6.3).
+//
+// Returns an error rather than degrading to HTTP: a relay that quietly fell back
+// to plaintext would put the cluster-admin token on the wire in clear, which is
+// worse than a node that refuses to start.
+func (f *HTTPForwarder) WithTLS(material tlsconfig.Material) (*HTTPForwarder, error) {
+	if !material.Configured() && material.CAFile == "" {
+		return f, nil
+	}
+	cfg, err := tlsconfig.ClientConfig(material)
+	if err != nil {
+		return nil, fmt.Errorf("management forwarder TLS: %w", err)
+	}
+	f.scheme = "https"
+	f.client.Transport = &http.Transport{TLSClientConfig: cfg}
+	return f, nil
+}
+
 // NewHTTPForwarder returns a Forwarder with a bounded per-request timeout.
 //
 // The timeout matters more than it looks: this call happens while the original
 // client is still waiting on us, so an unbounded relay would turn one slow peer
 // into a stalled request on every node that forwards to it.
 func NewHTTPForwarder(timeout time.Duration) *HTTPForwarder {
-	return &HTTPForwarder{client: &http.Client{Timeout: timeout}}
+	return &HTTPForwarder{client: &http.Client{Timeout: timeout}, scheme: "http"}
 }
 
 // Forward issues the relayed request and returns the peer's status and body.
 func (f *HTTPForwarder) Forward(ctx context.Context, mgmtAddr, path, rawQuery string) (*ForwardResult, error) {
+	scheme := f.scheme
+	if scheme == "" {
+		// Zero-value HTTPForwarder (constructed as a literal in a test rather
+		// than through NewHTTPForwarder). Defaulting here keeps url.URL from
+		// producing a schemeless target that http.Client rejects.
+		scheme = "http"
+	}
+
 	target := url.URL{
-		Scheme:   "http",
+		Scheme:   scheme,
 		Host:     mgmtAddr,
 		Path:     path,
 		RawQuery: rawQuery,

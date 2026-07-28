@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"my-raft-sidecar/internal/tlsconfig"
 )
 
 // Snapshot tunables (R3.6). The defaults are hashicorp/raft's own defaults, so
@@ -62,6 +64,19 @@ type Config struct {
 	// MgmtToken is the cluster-admin bearer token guarding /join and /remove
 	// (R6.1). Empty DISABLES those endpoints rather than leaving them open.
 	MgmtToken string
+
+	// RaftTLS is the identity this node presents to, and demands from, its raft
+	// peers (R6.4). Empty means the peer transport is plaintext.
+	//
+	// Mutual by construction: one-way TLS on the raft port would encrypt the
+	// traffic and still let anyone who can reach it append entries, which is
+	// confidentiality without authentication — the wrong half of the problem.
+	RaftTLS tlsconfig.Material
+
+	// MgmtTLS is the certificate the management listener serves (R6.3). Its
+	// CAFile is used for the OTHER direction: verifying a peer's management API
+	// when this node joins a cluster or relays a /join to the leader over HTTPS.
+	MgmtTLS tlsconfig.Material
 }
 
 // flags holds the command-line flag pointers
@@ -81,6 +96,12 @@ var flags struct {
 	trailingLogs      *uint64
 	logLevel          *string
 	mgmtToken         *string
+	raftTLSCert       *string
+	raftTLSKey        *string
+	raftTLSCA         *string
+	mgmtTLSCert       *string
+	mgmtTLSKey        *string
+	mgmtTLSCA         *string
 }
 
 func init() {
@@ -106,6 +127,16 @@ func init() {
 	// Default comes from the environment so the token never has to appear in a
 	// process listing, where any local user could read it off `ps`.
 	flags.mgmtToken = flag.String("mgmt-token", os.Getenv("RAFTKV_MGMT_TOKEN"), "Cluster-admin bearer token for /join and /remove (prefer RAFTKV_MGMT_TOKEN)")
+
+	// R6.4 / R6.3. All six default to empty, so a node started without them
+	// behaves exactly as it did before Phase 6 — the zero-config demo keeps
+	// working, and security is something a deployment opts into.
+	flags.raftTLSCert = flag.String("raft-tls-cert", "", "Certificate this node presents to raft peers (enables mutual TLS on the raft port)")
+	flags.raftTLSKey = flag.String("raft-tls-key", "", "Private key for -raft-tls-cert")
+	flags.raftTLSCA = flag.String("raft-tls-ca", "", "CA that must have signed a raft peer's certificate")
+	flags.mgmtTLSCert = flag.String("mgmt-tls-cert", "", "Certificate for the management HTTPS listener")
+	flags.mgmtTLSKey = flag.String("mgmt-tls-key", "", "Private key for -mgmt-tls-cert")
+	flags.mgmtTLSCA = flag.String("mgmt-tls-ca", "", "CA used to verify a PEER's management API when joining or relaying over HTTPS")
 }
 
 // Parse parses command-line flags and returns a Config.
@@ -128,7 +159,53 @@ func Parse() *Config {
 		TrailingLogs:      *flags.trailingLogs,
 		LogLevel:          *flags.logLevel,
 		MgmtToken:         *flags.mgmtToken,
+
+		RaftTLS: tlsconfig.Material{
+			CertFile: *flags.raftTLSCert,
+			KeyFile:  *flags.raftTLSKey,
+			CAFile:   *flags.raftTLSCA,
+		},
+		MgmtTLS: tlsconfig.Material{
+			CertFile: *flags.mgmtTLSCert,
+			KeyFile:  *flags.mgmtTLSKey,
+			CAFile:   *flags.mgmtTLSCA,
+		},
 	}
+}
+
+// Validate rejects a TLS configuration that cannot work, at startup.
+//
+// Separate from Parse and called explicitly by main, because the failure mode it
+// prevents is silent: a mistyped certificate path leaves Material half-specified,
+// and a node that treats that as "TLS is off" comes up serving plaintext on a
+// port the operator believes is encrypted. Failing to boot is the correct
+// response to being unable to secure a listener.
+func (c *Config) Validate() error {
+	if err := c.RaftTLS.Validate("raft peer"); err != nil {
+		return err
+	}
+	// The raft port is the one surface where a CA is not optional: the transport
+	// is mutual, so a node with a cert but no CA could present an identity and
+	// verify nobody.
+	if c.RaftTLS.Configured() && c.RaftTLS.CAFile == "" {
+		return fmt.Errorf("-raft-tls-ca is required with -raft-tls-cert: " +
+			"the raft peer transport is mutually authenticated, so this node must " +
+			"be able to verify its peers, not only prove itself to them")
+	}
+	return c.MgmtTLS.Validate("management")
+}
+
+// RaftTLSEnabled reports whether the raft peer transport is encrypted.
+func (c *Config) RaftTLSEnabled() bool {
+	return c.RaftTLS.Configured()
+}
+
+// MgmtTLSEnabled reports whether the management listener serves HTTPS. It also
+// decides the scheme the joiner and the join/remove forwarder dial peers with:
+// a cluster is configured uniformly, so this node's own setting is the right
+// predictor of a peer's.
+func (c *Config) MgmtTLSEnabled() bool {
+	return c.MgmtTLS.Configured()
 }
 
 // BindAddr returns the address to bind the Raft transport to.
@@ -153,8 +230,12 @@ func (c *Config) AdvertiseAddr() string {
 func (c *Config) String() string {
 	return fmt.Sprintf(
 		"Config{NodeID: %s, RaftPort: %s, SidecarPort: %s, PeerRPCPort: %s, AppAddr: %s, MgmtPort: %s, Bootstrap: %v, DataDir: %s, "+
-			"SnapshotInterval: %s, SnapshotThreshold: %d, TrailingLogs: %d}",
+			"SnapshotInterval: %s, SnapshotThreshold: %d, TrailingLogs: %d, RaftTLS: %v, MgmtTLS: %v, MgmtAuth: %v}",
 		c.NodeID, c.RaftPort, c.SidecarPort, c.PeerRPCPort, c.AppAddr, c.MgmtPort, c.Bootstrap, c.DataDir,
 		c.SnapshotInterval, c.SnapshotThreshold, c.TrailingLogs,
+		// Booleans, never the paths and never the token: this line goes to the log
+		// stream. An operator needs to know whether the surface is protected, not
+		// what protects it.
+		c.RaftTLSEnabled(), c.MgmtTLSEnabled(), c.MgmtToken != "",
 	)
 }

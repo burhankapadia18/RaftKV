@@ -109,7 +109,7 @@ func TestDefaultJoinConfig(t *testing.T) {
 func TestNewJoiner(t *testing.T) {
 	cfg := DefaultJoinConfig("leader:6000", "node3", "node3:8088")
 
-	j := NewJoiner(cfg)
+	j := mustJoiner(t, cfg)
 
 	if j == nil {
 		t.Fatal("NewJoiner returned nil")
@@ -132,7 +132,7 @@ func TestJoinSucceedsOnFirstAttempt(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	if err := NewJoiner(testJoinConfig(addr, 5)).Join(); err != nil {
+	if err := mustJoiner(t, testJoinConfig(addr, 5)).Join(); err != nil {
 		t.Fatalf("Join() error = %v, want nil", err)
 	}
 
@@ -175,7 +175,7 @@ func TestJoinRetriesUntilSuccess(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			})
 
-			if err := NewJoiner(testJoinConfig(addr, tt.maxRetries)).Join(); err != nil {
+			if err := mustJoiner(t, testJoinConfig(addr, tt.maxRetries)).Join(); err != nil {
 				t.Fatalf("Join() error = %v, want nil", err)
 			}
 
@@ -209,7 +209,7 @@ func TestJoinExhaustsRetries(t *testing.T) {
 		_, _ = io.WriteString(w, body)
 	})
 
-	err := NewJoiner(testJoinConfig(addr, maxRetries)).Join()
+	err := mustJoiner(t, testJoinConfig(addr, maxRetries)).Join()
 	if err == nil {
 		t.Fatal("Join() = nil, want an error after exhausting all attempts")
 	}
@@ -248,7 +248,7 @@ func TestJoinUnreachableLeader(t *testing.T) {
 	addr := srv.Listener.Addr().String()
 	srv.Close()
 
-	err := NewJoiner(testJoinConfig(addr, 2)).Join()
+	err := mustJoiner(t, testJoinConfig(addr, 2)).Join()
 	if err == nil {
 		t.Fatal("Join() = nil, want an error when the leader is unreachable")
 	}
@@ -272,7 +272,7 @@ func TestJoinWithZeroMaxRetriesNeverContactsLeader(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	err := NewJoiner(testJoinConfig(addr, 0)).Join()
+	err := mustJoiner(t, testJoinConfig(addr, 0)).Join()
 	if err == nil {
 		t.Fatal("Join() = nil, want an error when MaxRetries is 0")
 	}
@@ -300,7 +300,7 @@ func TestJoinDoesNotEscapeQueryParameters(t *testing.T) {
 	cfg := testJoinConfig(addr, 2)
 	cfg.NodeID = "node2&injected=1"
 
-	if err := NewJoiner(cfg).Join(); err != nil {
+	if err := mustJoiner(t, cfg).Join(); err != nil {
 		t.Fatalf("Join() error = %v, want nil", err)
 	}
 
@@ -325,7 +325,7 @@ func TestJoinAsync(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	NewJoiner(testJoinConfig(addr, 5)).JoinAsync()
+	mustJoiner(t, testJoinConfig(addr, 5)).JoinAsync()
 
 	select {
 	case q := <-hits:
@@ -355,7 +355,7 @@ func TestJoinAsyncDoesNotBlockTheCaller(t *testing.T) {
 		finished <- struct{}{}
 	})
 
-	NewJoiner(testJoinConfig(addr, 5)).JoinAsync()
+	mustJoiner(t, testJoinConfig(addr, 5)).JoinAsync()
 
 	select {
 	case <-started:
@@ -372,4 +372,20 @@ func TestJoinAsyncDoesNotBlockTheCaller(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the join request never completed after being released")
 	}
+}
+
+// mustJoiner is NewJoiner for tests that are not exercising its error path.
+//
+// NewJoiner gained an error return when it learned to dial over HTTPS (R6.3):
+// unusable TLS material is not something the retry loop can fix, and joining
+// over plaintext instead would put the cluster-admin token on the wire in clear.
+// These tests configure no TLS, so the error is always nil — asserting that here
+// keeps every call site from repeating the check.
+func mustJoiner(t *testing.T, cfg *JoinConfig) *Joiner {
+	t.Helper()
+	j, err := NewJoiner(cfg)
+	if err != nil {
+		t.Fatalf("NewJoiner: %v", err)
+	}
+	return j
 }

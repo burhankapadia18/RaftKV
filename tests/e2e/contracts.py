@@ -67,6 +67,8 @@ HTTP_OK = 200
 HTTP_BAD_REQUEST = 400
 HTTP_NOT_FOUND = 404
 HTTP_UNSUPPORTED_MEDIA_TYPE = 415
+HTTP_PAYLOAD_TOO_LARGE = 413
+HTTP_HEADERS_TOO_LARGE = 431
 HTTP_BAD_GATEWAY = 502
 HTTP_SERVICE_UNAVAILABLE = 503
 
@@ -105,6 +107,15 @@ ERROR_EMPTY_BODY = "empty request body"
 ERROR_MALFORMED_CONTENT_LENGTH = "malformed Content-Length"
 ERROR_UNSUPPORTED_MEDIA_TYPE = "unsupported media type"
 ERROR_NOT_FOUND = "not found"
+ERROR_BODY_TOO_LARGE = "request body too large"
+ERROR_HEADERS_TOO_LARGE = "request headers too large"
+
+# Phase 4 request caps, mirrored from RequestLimits in cpp-app/src/config/
+# config.hpp. Duplicated here on purpose: these tests exist to catch the caps
+# changing, so reading them from the implementation would make the test agree
+# with whatever the code does — which is the opposite of a contract test.
+MAX_BODY_BYTES = 1 * 1024 * 1024
+MAX_HEADER_BYTES = 32 * 1024
 
 #: Shape of the ``leader`` member of a 503 body. It comes from raft's
 #: ``LeaderWithID`` via ``ProposeResponse.error`` ("not_leader:<addr>"), so it is

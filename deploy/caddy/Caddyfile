@@ -1,0 +1,55 @@
+# TLS termination for the client-facing HTTP API (R6.5).
+#
+# Phase 6 had a decision to make: link OpenSSL into the C++ engine behind a
+# socket seam, or terminate TLS in front of it. This file is that decision.
+# The engine's HTTP server is a hand-rolled accept loop over raw sockets; adding
+# a TLS state machine to it would put certificate parsing, session handling and
+# renegotiation — a large, historically vulnerable surface — inside the process
+# that owns the data, to reimplement what every deployment already has in front
+# of it. The proxy keeps the engine dependency-light and the TLS code audited by
+# someone else.
+#
+# What this costs, stated plainly: the hop from this proxy to a node is plaintext.
+# That is only acceptable because both ends are inside the compose network. In a
+# real deployment the proxy belongs on the node itself (a sidecar, or the same
+# host), so the plaintext hop never crosses a network boundary. A proxy on a
+# different host than the node it forwards to gives you encrypted traffic to the
+# proxy and clear traffic for the rest of the way, which is worse than it looks.
+
+{
+	# No admin API. It is unauthenticated by default and would be the most
+	# powerful endpoint in the deployment — it can rewrite this configuration.
+	admin off
+
+	# auto_https off: Caddy's default is to obtain certificates from Let's
+	# Encrypt, which cannot work for a private hostname and would spend every
+	# startup failing an ACME challenge. Here the certificate comes from the
+	# cluster CA instead.
+	auto_https off
+}
+
+:8443 {
+	tls /certs/proxy.pem /certs/proxy-key.pem
+
+	# All three nodes, round-robin. This is not load balancing for its own sake:
+	# it exercises Phase 4 forwarding, because a write that lands on a follower is
+	# relayed to the leader rather than refused. Before Phase 4 this stanza would
+	# have failed two out of every three writes with a 503.
+	reverse_proxy node1:8080 node2:8080 node3:8080 {
+		lb_policy round_robin
+
+		# /metrics is the only unconditional 200 the engine serves — it has no
+		# dedicated health route, and probing /get-val would 404 for a key that
+		# does not exist and take a node out of rotation for being correct.
+		health_uri /metrics
+		health_interval 5s
+		health_timeout 2s
+
+		# Reads are served from the local store, so a plain GET through a
+		# round-robin proxy can land on a lagging follower. That is Phase 4's
+		# documented behavior, not a proxy bug: a client that needs a fresh read
+		# asks for ?consistency=linearizable, which the node forwards to the
+		# leader. Nothing here can paper over it, and nothing here should try.
+		header_up X-Forwarded-Proto https
+	}
+}

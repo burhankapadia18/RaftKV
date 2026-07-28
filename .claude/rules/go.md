@@ -34,6 +34,18 @@ Project-specific rules for `go-sidecar/`. These extend the general Go guidance w
 - `FSM.Apply` runs on every node for every committed entry and must stay deterministic and side-effect-free apart from the C++ call.
 - Only the leader can `Apply`; `rpc.Server.Propose` surfaces `ErrNotLeader` as a failed `ProposeResponse` rather than a gRPC error — keep that contract, the C++ client checks `reply.success()`.
 
+## TLS and auth (Phase 6 — do not regress this)
+
+- **Build every `*tls.Config` through `internal/tlsconfig`.** A listener with a cert and key but no `ClientCAs` handshakes with anyone; it looks like mutual TLS and authenticates nobody. One place, under test, is the only defence against that.
+- `ServerConfig(m, requireClientCert)` — the boolean is deliberate. The raft transport passes `true`; the management listener passes `false`, because probes and Prometheus hold no certificate and are authenticated by the bearer token instead. Never infer it from whether a CA was supplied.
+- `ClientConfig` sets `RootCAs` (replacing the system pool, on purpose — a peer signed by a public CA is not a cluster peer) and never `InsecureSkipVerify`. Per-destination verification comes from `WithServerName`, which **clones**: raft dials peers concurrently, and mutating a shared config is a data race.
+- **Never fall back to plaintext on a TLS error.** `Config.Validate()` is called by `main` before anything binds; `NewJoiner` and `HTTPForwarder.WithTLS` return errors. A join or relay that degraded to HTTP would put the cluster-admin token on the wire in clear.
+- **`hostPortAddr` in `raftnode` is load-bearing.** The TLS transport advertises the configured *name*; the plaintext one advertises a resolved IP because `raft.NewTCPTransport` demands a `*net.TCPAddr`. Collapsing the two reintroduces a bug that forms a healthy cluster and breaks permanently after the first election (`x509: certificate is valid for ..., not <container IP>`). The comment on the type is the full account.
+- The bearer token comes from `RAFTKV_MGMT_TOKEN`, never a flag value in argv — `ps` is readable by any local user. An empty token **disables** `/join` and `/remove` (403); it must never mean "open".
+- `internal/testcerts` is a non-test package imported only from `_test.go` files, because Go cannot share a test helper across packages otherwise. It must not import `internal/tlsconfig` — that would make `tlsconfig`'s in-package tests an import cycle.
+
+Verification for anything here: `go test -race ./internal/tlsconfig/ ./internal/raftnode/ ./internal/management/ ./internal/cluster/`, then the real deployment — `pytest tests/e2e -m requires_secure`. A unit test cannot prove that a compose file publishes the ports it claims.
+
 ## Checks
 
 ```bash

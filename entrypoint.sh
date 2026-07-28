@@ -104,6 +104,40 @@ if [ ! -z "$TRAILING_LOGS" ]; then
     GO_ARGS="$GO_ARGS -trailing-logs $TRAILING_LOGS"
 fi
 
+# TLS material (R6.3/R6.4). Forwarded only when set, so a node started without
+# these behaves exactly as it did before Phase 6 -- the zero-config demo keeps
+# working and security is something a deployment opts into.
+#
+# Paths, unlike the token, are safe in argv: they are not secrets, and the
+# sidecar needs to report which surfaces are protected. The KEYS they point at
+# must be mounted read-only; docker-compose.secure.yml does that.
+#
+# Deliberately NOT defaulted to a conventional path like /certs/$ID.pem. A
+# default would mean a missing mount silently produces "TLS off" instead of a
+# startup failure, which is the exact confusion this phase exists to remove:
+# either the operator asks for TLS and gets it, or they do not ask.
+add_flag_if_set() {
+    # $1 = flag name, $2 = value
+    if [ -n "$2" ]; then
+        GO_ARGS="$GO_ARGS $1 $2"
+    fi
+}
+
+add_flag_if_set -raft-tls-cert "$RAFT_TLS_CERT"
+add_flag_if_set -raft-tls-key "$RAFT_TLS_KEY"
+add_flag_if_set -raft-tls-ca "$RAFT_TLS_CA"
+add_flag_if_set -mgmt-tls-cert "$MGMT_TLS_CERT"
+add_flag_if_set -mgmt-tls-key "$MGMT_TLS_KEY"
+add_flag_if_set -mgmt-tls-ca "$MGMT_TLS_CA"
+
+if [ -n "$RAFT_TLS_CERT" ]; then
+    echo "Raft peer transport: mutual TLS ($RAFT_TLS_CERT)"
+else
+    echo "WARNING: RAFT_TLS_CERT is not set; the raft peer port ($RAFT_PORT) is" >&2
+    echo "         PLAINTEXT and unauthenticated. Anything that can reach it can" >&2
+    echo "         append entries to the log. See docker-compose.secure.yml." >&2
+fi
+
 # The cluster-admin token (R6.1) is passed via the ENVIRONMENT, never as a flag.
 # `-mgmt-token <secret>` would put it in the process's command line, where any
 # local user can read it out of `ps`. internal/config already defaults the flag

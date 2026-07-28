@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+
+	"my-raft-sidecar/internal/tlsconfig"
 )
 
 // NOTE ON TESTABILITY (Phase 0 pins the current shape, it does not change it):
@@ -58,6 +60,14 @@ var expectedFlags = []struct {
 	// machine that happens to have the variable set, including a real deployment.
 	// The name and usage are the contract; the value is environment.
 	{name: "mgmt-token", defValue: anyValue, usage: "Cluster-admin bearer token for /join and /remove (prefer RAFTKV_MGMT_TOKEN)"},
+	// R6.3/R6.4. All six default to empty: security is opt-in, so a node started
+	// without them behaves exactly as it did before Phase 6.
+	{name: "raft-tls-cert", defValue: "", usage: "Certificate this node presents to raft peers (enables mutual TLS on the raft port)"},
+	{name: "raft-tls-key", defValue: "", usage: "Private key for -raft-tls-cert"},
+	{name: "raft-tls-ca", defValue: "", usage: "CA that must have signed a raft peer's certificate"},
+	{name: "mgmt-tls-cert", defValue: "", usage: "Certificate for the management HTTPS listener"},
+	{name: "mgmt-tls-key", defValue: "", usage: "Private key for -mgmt-tls-cert"},
+	{name: "mgmt-tls-ca", defValue: "", usage: "CA used to verify a PEER's management API when joining or relaying over HTTPS"},
 }
 
 // anyValue marks a flag whose default is environment-derived and therefore not
@@ -274,7 +284,7 @@ func TestConfigString(t *testing.T) {
 	want := "Config{NodeID: node1, RaftPort: 8088, SidecarPort: 50052, " +
 		"PeerRPCPort: 50052, " +
 		"AppAddr: localhost:50051, MgmtPort: 6000, Bootstrap: true, DataDir: /data, " +
-		"SnapshotInterval: 5s, SnapshotThreshold: 64, TrailingLogs: 32}"
+		"SnapshotInterval: 5s, SnapshotThreshold: 64, TrailingLogs: 32, RaftTLS: false, MgmtTLS: false, MgmtAuth: false}"
 
 	if got := cfg.String(); got != want {
 		t.Errorf("String() =\n\t%q\nwant\n\t%q", got, want)
@@ -310,9 +320,120 @@ func TestConfigStringZeroValue(t *testing.T) {
 	var cfg Config
 
 	want := "Config{NodeID: , RaftPort: , SidecarPort: , PeerRPCPort: , AppAddr: , MgmtPort: , Bootstrap: false, DataDir: , " +
-		"SnapshotInterval: 0s, SnapshotThreshold: 0, TrailingLogs: 0}"
+		"SnapshotInterval: 0s, SnapshotThreshold: 0, TrailingLogs: 0, RaftTLS: false, MgmtTLS: false, MgmtAuth: false}"
 
 	if got := cfg.String(); got != want {
 		t.Errorf("String() = %q, want %q", got, want)
+	}
+}
+
+// TestConfigStringReportsTLSStateWithoutLeakingIt is the test that matters more
+// than the exact format: String() is logged at startup, and the log stream is
+// read by anyone with access to `docker compose logs`. An operator needs to know
+// whether a surface is protected; they must not learn the token from it.
+func TestConfigStringReportsTLSStateWithoutLeakingIt(t *testing.T) {
+	cfg := Config{
+		NodeID:    "node1",
+		MgmtToken: "s3cr3t-admin-token",
+		RaftTLS: tlsconfig.Material{
+			CertFile: "/certs/node1.pem",
+			KeyFile:  "/certs/node1-key.pem",
+			CAFile:   "/certs/ca.pem",
+		},
+		MgmtTLS: tlsconfig.Material{
+			CertFile: "/certs/mgmt.pem",
+			KeyFile:  "/certs/mgmt-key.pem",
+		},
+	}
+
+	got := cfg.String()
+
+	for _, want := range []string{"RaftTLS: true", "MgmtTLS: true", "MgmtAuth: true"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("String() = %q, missing %q", got, want)
+		}
+	}
+	for _, leak := range []string{"s3cr3t-admin-token", "/certs/node1-key.pem", "/certs/mgmt-key.pem"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("String() leaked %q into the log stream: %q", leak, got)
+		}
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	pair := tlsconfig.Material{CertFile: "c", KeyFile: "k", CAFile: "a"}
+
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantErr string
+	}{
+		{
+			name: "no TLS at all is valid",
+			cfg:  Config{},
+		},
+		{
+			name: "full raft material is valid",
+			cfg:  Config{RaftTLS: pair},
+		},
+		{
+			name:    "raft cert without CA is rejected",
+			cfg:     Config{RaftTLS: tlsconfig.Material{CertFile: "c", KeyFile: "k"}},
+			wantErr: "-raft-tls-ca is required",
+		},
+		{
+			name:    "raft cert without key is rejected",
+			cfg:     Config{RaftTLS: tlsconfig.Material{CertFile: "c", CAFile: "a"}},
+			wantErr: "needs both",
+		},
+		{
+			// The management listener is deliberately NOT mutual — probes and
+			// Prometheus hold no cluster certificate — so a CA is optional here.
+			name: "management cert without CA is valid",
+			cfg:  Config{MgmtTLS: tlsconfig.Material{CertFile: "c", KeyFile: "k"}},
+		},
+		{
+			name:    "management key without cert is rejected",
+			cfg:     Config{MgmtTLS: tlsconfig.Material{KeyFile: "k"}},
+			wantErr: "needs both",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tt.wantErr != "" && err == nil:
+				t.Fatalf("expected an error containing %q, got nil", tt.wantErr)
+			case tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr):
+				t.Fatalf("error %q does not contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestTLSEnabledPredicates(t *testing.T) {
+	off := Config{}
+	if off.RaftTLSEnabled() || off.MgmtTLSEnabled() {
+		t.Error("a zero Config must report TLS off, or the default demo would try to negotiate it")
+	}
+
+	on := Config{
+		RaftTLS: tlsconfig.Material{CertFile: "c", KeyFile: "k", CAFile: "a"},
+		MgmtTLS: tlsconfig.Material{CertFile: "c", KeyFile: "k"},
+	}
+	if !on.RaftTLSEnabled() || !on.MgmtTLSEnabled() {
+		t.Error("configured material must report TLS on")
+	}
+
+	// A CA alone must NOT flip the switch. It cannot: there is no identity to
+	// present, so a listener would have nothing to serve — Validate rejects it,
+	// and the predicate agreeing keeps the two from disagreeing about the same
+	// config.
+	caOnly := Config{RaftTLS: tlsconfig.Material{CAFile: "a"}}
+	if caOnly.RaftTLSEnabled() {
+		t.Error("a CA with no key pair must not count as TLS enabled")
 	}
 }

@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+import requests
 
 from test_crash import (
     CONTAINER_DATA_DIR,
@@ -56,7 +57,7 @@ from test_crash import (
 
 __all__ = [
     "CONFIG_LINE_RE",
-    "CPP_ENTRY_MARKERS",
+    "CPP_APPLY_COUNTER",
     "CPP_SNAPSHOT_RESTORED",
     "CPP_SNAPSHOT_SENT",
     "DEFAULT_COMPOSE_FILES",
@@ -77,6 +78,7 @@ __all__ = [
     "count_markers",
     "list_snapshots",
     "parse_tunables",
+    "read_apply_counter",
     "poll",
     "read_status",
     "require_compose_project",
@@ -133,16 +135,51 @@ GO_SNAPSHOT_CAPTURED = "fsm: captured a"
 GO_SNAPSHOT_RESTORED = "fsm: restored a"
 
 #: cpp-app/src/raft/state_machine.hpp, GetSnapshot -- state streamed out.
-CPP_SNAPSHOT_SENT = "[StateMachine] Snapshot sent:"
+#:
+#: Phase 5 replaced the C++ side's `[Prefix] Message:` prose with JSON lines, so
+#: these match the `msg` field rather than a bracketed prefix. Matching the field
+#: (`"msg":"snapshot sent"`) and not the whole object keeps them stable against
+#: fields being added alongside.
+CPP_SNAPSHOT_SENT = '"msg":"snapshot sent"'
 
 #: cpp-app/src/raft/state_machine.hpp, snapshot::restore_from_payload.
-CPP_SNAPSHOT_RESTORED = "[StateMachine] Restored snapshot:"
+CPP_SNAPSHOT_RESTORED = '"msg":"restored snapshot"'
 
-#: One committed raft entry reaching the C++ state machine, applied or refused.
-#: Both are counted: a replay of history re-decides every entry, including the
-#: invalid commands other tests in this suite deliberately send, so counting
-#: only the successful ones would undercount a full replay.
-CPP_ENTRY_MARKERS = ("[StateMachine] Applied:", "[StateMachine] Rejected:")
+#: The number of committed entries this node's C++ engine has applied since the
+#: process started, read from its Prometheus endpoint.
+#:
+#: This used to count log markers, and could not continue to. Phase 5 moved the
+#: successful-apply line to DEBUG, which the containers do not emit, so the
+#: marker count silently became zero — and the assertion it feeds
+#: ("did this node replay its whole history?") passes trivially when the count is
+#: always zero. A test that cannot fail is worse than no test.
+#:
+#: The counter is better than the log line ever was: it is incremented on the
+#: apply path itself rather than beside it, it cannot be turned off by a log
+#: level, and because it resets with the process, the value read AFTER a restart
+#: is exactly "entries applied since this node came back" — which is the quantity
+#: the scenario is actually about.
+CPP_APPLY_COUNTER = "raftkv_apply_total"
+
+
+def read_apply_counter(base_url: str, timeout: float = 5.0) -> int:
+    """``raftkv_apply_total`` from a node's C++ /metrics endpoint.
+
+    Returns 0 when the endpoint answers but does not carry the counter, which is
+    what a node that has applied nothing since start looks like. A transport
+    failure is raised, not swallowed: "the node is unreachable" and "the node has
+    applied nothing" are opposite conclusions.
+    """
+    response = requests.get(f"{base_url}/metrics", timeout=timeout)
+    response.raise_for_status()
+
+    for line in response.text.splitlines():
+        if line.startswith("#"):
+            continue
+        name, _, value = line.partition(" ")
+        if name == CPP_APPLY_COUNTER:
+            return int(float(value))
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -440,15 +477,28 @@ def require_status(compose: ComposeProject, service: str, timeout: float) -> Sta
 # The snapshot tunables the containers actually got
 # --------------------------------------------------------------------------
 
-#: main.go logs `Starting sidecar with config: Config{...}` once at startup, and
-#: Config.String() carries the three snapshot tunables precisely so this is
-#: observable. Reading them out of the running container's own log beats reading
-#: the compose file: it reports what arrived, not what was intended.
+#: main.go logs the whole Config once at startup, and Config.String() carries the
+#: three snapshot tunables precisely so this is observable. Reading them out of
+#: the running container's own log beats reading the compose file: it reports what
+#: arrived, not what was intended.
+#:
+#: This pattern has been broken twice, and both breaks were invisible because the
+#: fixture that uses it SKIPPED on a parse failure. Phase 5 replaced the prose
+#: prefix "Starting sidecar with config: " with a JSON line
+#: (`{"msg":"starting sidecar",...,"config":"Config{...}"}`), and Phase 6 appended
+#: RaftTLS/MgmtTLS/MgmtAuth after TrailingLogs, breaking a `\}` anchor. So:
+#:
+#:   * anchor on `Config{` only — not on any surrounding prose, which is
+#:     formatting and will change again;
+#:   * terminate on `[,}]`, so a field appended after TrailingLogs is harmless.
+#:
+#: And the fixture now FAILS rather than skips when this does not match. See
+#: test_snapshot.py::tunables.
 CONFIG_LINE_RE = re.compile(
-    r"Starting sidecar with config: Config\{[^}]*?"
+    r"Config\{[^}]*?"
     r"SnapshotInterval:\s*(?P<interval>[^,]+),\s*"
     r"SnapshotThreshold:\s*(?P<threshold>\d+),\s*"
-    r"TrailingLogs:\s*(?P<trailing>\d+)\}"
+    r"TrailingLogs:\s*(?P<trailing>\d+)\s*[,}]"
 )
 
 

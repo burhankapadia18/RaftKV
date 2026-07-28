@@ -178,6 +178,28 @@ func createTransport(cfg *config.Config, opts *Options) (*raft.NetworkTransport,
 		return nil, fmt.Errorf("failed to resolve advertise address %s: %w", advertiseAddr, err)
 	}
 
+	// R6.4: with peer TLS configured, the same NetworkTransport runs over a
+	// mutually authenticated stream layer instead of a bare TCP one. The protocol
+	// above is identical; what changes is who may speak it.
+	if cfg.RaftTLSEnabled() {
+		logger.Info("Raft peer transport: mutual TLS",
+			slog.String("bind", bindAddr), slog.String("advertise", advertiseAddr))
+		// advertiseAddr, NOT the resolved advAddr. Peers verify the certificate
+		// against the address they dial, and a certificate issued for "node1" does
+		// not cover whatever IP Docker handed the container. See hostPortAddr.
+		//
+		// advAddr is still computed above and still worth computing: resolving is
+		// how we find out at startup that the advertise address is nonsense, which
+		// is far better than finding out during an election.
+		return newTLSTransport(bindAddr, hostPortAddr(advertiseAddr), cfg.RaftTLS, opts)
+	}
+
+	// Logged at WARN, not INFO: an unauthenticated raft port means anything that
+	// can reach it can append entries, and that deserves to stand out in a log.
+	logger.Warn("Raft peer transport: PLAINTEXT (no -raft-tls-cert); "+
+		"anything that can reach this port can modify the cluster",
+		slog.String("bind", bindAddr))
+
 	transport, err := raft.NewTCPTransport(
 		bindAddr,
 		advAddr,

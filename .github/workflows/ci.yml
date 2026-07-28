@@ -405,3 +405,155 @@ jobs:
       - name: Tear down cluster
         if: always()
         run: docker compose down -v
+
+  # ---------------------------------------------------------------------------
+  # Phase 6: the same cluster, brought up with TLS everywhere.
+  #
+  # A separate job rather than another step in `e2e`, because the two profiles
+  # cannot coexist: the secure profile stops publishing the plaintext client
+  # ports, which is precisely what one of its tests asserts. Reusing one cluster
+  # would mean testing neither profile honestly.
+  #
+  # This job is what keeps the security work from rotting. Without it, R6.3 and
+  # R6.4 are verified once by hand and never again — and the specific bug this
+  # phase found (a certificate valid for a hostname, a peer dialled by container
+  # IP) forms a perfectly healthy cluster and only breaks after a leader
+  # election, so nothing short of running the profile catches it.
+  # ---------------------------------------------------------------------------
+  e2e-secure:
+    name: End-to-end cluster (TLS profile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Build image
+        run: docker build -t raftkv:latest .
+
+      - name: Generate cluster certificates
+        run: ./scripts/gen-certs.sh
+
+      # A generated token, not the compose fallback. The fallback exists so the
+      # zero-config demo runs; a security job that used it would be asserting
+      # that a publicly known credential works.
+      - name: Start secure cluster
+        run: |
+          # Generated ONCE. The first version of this step called `openssl rand`
+          # twice — writing one token to GITHUB_ENV for later steps and starting
+          # the cluster with a different one, so every later step would have held
+          # a credential the cluster had never seen.
+          token=""
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "RAFTKV_MGMT_TOKEN=$token" >> "$GITHUB_ENV"
+          export RAFTKV_MGMT_TOKEN="$token"
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
+
+      # Readiness is polled over HTTPS with --cacert, not -k. `curl -k` would
+      # report a node healthy while it served a certificate from the wrong CA,
+      # which is the misconfiguration this whole job exists to catch.
+      - name: Wait for secure cluster readiness
+        run: |
+          deadline=$(( $(date +%s) + 150 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+            for port in 6000 6001 6002; do
+              curl -sf --max-time 2 --cacert certs/ca.pem \
+                "https://localhost:${port}/ready" >/dev/null || ready=0
+            done
+
+            if [ "$ready" -eq 1 ]; then
+              for port in 6000 6001 6002; do
+                status="$(curl -sf --max-time 2 --cacert certs/ca.pem \
+                  "https://localhost:${port}/status" || true)"
+                printf '%s' "$status" \
+                  | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+              done
+            fi
+
+            if [ "$ready" -eq 1 ]; then
+              echo "Secure cluster is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::Secure cluster did not become ready within 150s"
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml ps
+          exit 1
+
+      # -rs so a skip is visible. Every test in this module skips rather than
+      # fails when the profile is not up, which is right for a laptop and wrong
+      # for CI: here a skip means the requirement went unverified while the job
+      # went green.
+      - name: Run TLS profile tests
+        run: pytest tests/e2e -m requires_secure -v -rs
+
+      # The bug this phase found only appears AFTER a leader election: the
+      # bootstrap node advertised its resolved container IP, and a certificate
+      # issued for "node1" does not cover 172.18.0.2, so the next leader could
+      # never reach it again. A cluster that is merely up proves nothing about
+      # it, so the job forces the election.
+      - name: Survive a leader failover
+        run: |
+          set -e
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.secure.yml"
+          $COMPOSE stop node1
+
+          echo "Waiting for a new leader..."
+          deadline=$(( $(date +%s) + 90 ))
+          elected=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            for port in 6001 6002; do
+              if curl -sf --max-time 2 --cacert certs/ca.pem \
+                "https://localhost:${port}/status" 2>/dev/null \
+                | grep -q '"is_leader":true'; then
+                elected=1
+                break 2
+              fi
+            done
+            sleep 2
+          done
+          [ "$elected" -eq 1 ] || { echo "::error::no new leader was elected"; exit 1; }
+
+          $COMPOSE start node1
+
+          echo "Waiting for node1 to be replicated to again..."
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            applied="$(curl -sf --max-time 2 --cacert certs/ca.pem \
+              https://localhost:6000/status 2>/dev/null \
+              | sed -n 's/.*"applied_index":\([0-9]*\).*/\1/p')"
+            if [ -n "$applied" ] && [ "$applied" -gt 0 ]; then
+              echo "node1 rejoined and applied up to index $applied"
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "::error::node1 never caught up after the failover."
+          echo "Look for: x509: certificate is valid for ..., not <container IP>"
+          $COMPOSE logs --no-color --tail 100
+          exit 1
+
+      - name: Dump cluster logs
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            logs --no-color --timestamps
+
+      - name: Tear down secure cluster
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml down -v

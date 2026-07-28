@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"my-raft-sidecar/internal/tlsconfig"
 )
 
 // JoinConfig holds configuration for joining a cluster.
@@ -32,7 +34,18 @@ type JoinConfig struct {
 	// AuthToken is the cluster-admin bearer token the leader requires (R6.1/R6.2).
 	// Empty means none is sent, which the leader will refuse unless it too is
 	// unconfigured.
-	AuthToken      string
+	AuthToken string
+
+	// TLS is the material used to dial the leader's management API over HTTPS
+	// (R6.3). Only CAFile is strictly needed — that listener does not ask for a
+	// client certificate — but a full Material is accepted so a caller can pass
+	// the same value it gives every other TLS surface.
+	//
+	// Configured() on the CERT is what flips the scheme, matching how the sidecar
+	// decides everywhere else: a cluster is configured uniformly, so this node
+	// having a management certificate means its peers do too.
+	TLS tlsconfig.Material
+
 	LeaderMgmtAddr string
 	NodeID         string
 	RaftAddr       string
@@ -55,23 +68,42 @@ func DefaultJoinConfig(leaderAddr, nodeID, raftAddr string) *JoinConfig {
 type Joiner struct {
 	config *JoinConfig
 	client *http.Client
+	scheme string
 }
 
 // NewJoiner creates a new Joiner with the given configuration.
-func NewJoiner(config *JoinConfig) *Joiner {
-	return &Joiner{
+//
+// Returns an error only for unusable TLS material. Joining is otherwise
+// all-retries-and-no-failures by design, but a bad certificate path is not
+// something retrying can fix, and continuing over plaintext would put the
+// cluster-admin token on the wire in clear.
+func NewJoiner(config *JoinConfig) (*Joiner, error) {
+	j := &Joiner{
 		config: config,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		scheme: "http",
 	}
+
+	if config.TLS.Configured() || config.TLS.CAFile != "" {
+		cfg, err := tlsconfig.ClientConfig(config.TLS)
+		if err != nil {
+			return nil, fmt.Errorf("join client TLS: %w", err)
+		}
+		j.scheme = "https"
+		j.client.Transport = &http.Transport{TLSClientConfig: cfg}
+	}
+
+	return j, nil
 }
 
 // Join attempts to join the cluster, retrying on failure.
 // Returns an error if all attempts fail.
 func (j *Joiner) Join() error {
 	url := fmt.Sprintf(
-		"http://%s/join?peerID=%s&peerAddress=%s",
+		"%s://%s/join?peerID=%s&peerAddress=%s",
+		j.scheme,
 		j.config.LeaderMgmtAddr,
 		j.config.NodeID,
 		j.config.RaftAddr,

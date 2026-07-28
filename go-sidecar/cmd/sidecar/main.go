@@ -60,6 +60,14 @@ func main() {
 	mainLog := logging.For(root, logging.ComponentMain)
 	mainLog.Info("starting sidecar", slog.String("config", cfg.String()))
 
+	// R6.3/R6.4: refuse to start on TLS material that cannot work, rather than
+	// discovering it at the first peer connection. A half-specified pair would
+	// otherwise be read as "TLS is off" and the node would come up serving
+	// plaintext on a port the operator believes is encrypted.
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
+
 	// Connect to C++ backend
 	backendClient, err := backend.Connect(backend.DefaultConnectionConfig(cfg.AppAddr))
 	if err != nil {
@@ -102,10 +110,23 @@ func main() {
 	// they need the live node, which does not exist until now.
 	prometheus.MustRegister(metrics.NewRaftCollector(node))
 
-	mgmtServer := management.NewServer(node, cfg.MgmtPort, resolver,
-		management.NewHTTPForwarder(mgmtForwardTimeout).
-			WithAuthToken(cfg.MgmtToken)).
+	// The forwarder dials a PEER's management API, so it needs the same scheme and
+	// trust the joiner does — over HTTPS the relayed request carries the
+	// cluster-admin token, and a silent fallback to plaintext would leak it.
+	forwardTLS := cfg.MgmtTLS
+	if cfg.MgmtTLSEnabled() {
+		mainLog.Info("management API: HTTPS")
+	}
+	mgmtForwarder, err := management.NewHTTPForwarder(mgmtForwardTimeout).
 		WithAuthToken(cfg.MgmtToken).
+		WithTLS(forwardTLS)
+	if err != nil {
+		log.Fatalf("Failed to configure management forwarder: %v", err)
+	}
+
+	mgmtServer := management.NewServer(node, cfg.MgmtPort, resolver, mgmtForwarder).
+		WithAuthToken(cfg.MgmtToken).
+		WithTLS(cfg.MgmtTLS).
 		WithBackendProbe(storeReader).
 		WithMetricsHandler(promhttp.Handler())
 	mgmtServer.Start()
@@ -118,7 +139,11 @@ func main() {
 			cfg.AdvertiseAddr(),
 		)
 		joinCfg.AuthToken = cfg.MgmtToken
-		joiner := cluster.NewJoiner(joinCfg)
+		joinCfg.TLS = cfg.MgmtTLS
+		joiner, err := cluster.NewJoiner(joinCfg)
+		if err != nil {
+			log.Fatalf("Failed to configure cluster joiner: %v", err)
+		}
 		joiner.JoinAsync()
 	}
 
