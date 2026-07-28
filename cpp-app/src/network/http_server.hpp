@@ -11,6 +11,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "../commands/kv_command.hpp"
+#include "../config/config.hpp"
 #include "../raft/raft_client.hpp"
 #include "../storage/kv_store.hpp"
 #include "http_request.hpp"
@@ -130,8 +132,14 @@ struct HttpResponse {
       return "Bad Request";
     case 404:
       return "Not Found";
+    case 405:
+      return "Method Not Allowed";
+    case 413:
+      return "Content Too Large";
     case 415:
       return "Unsupported Media Type";
+    case 431:
+      return "Request Header Fields Too Large";
     case 500:
       return "Internal Server Error";
     case 502:
@@ -202,6 +210,23 @@ public:
    * gets 415 instead of silently becoming "no such route".
    */
   [[nodiscard]] HttpResponse handle(const HttpRequest &request) const {
+    // R4.6: the REST surface. Checked before the legacy routes because it is
+    // the one clients should be using.
+    if (request.path.rfind(kKvPathPrefix, 0) == 0) {
+      return handle_kv(request);
+    }
+
+    // R4.8: deprecated aliases, kept for one release so existing clients and
+    // test_client.py keep working. They go through exactly the same propose and
+    // read paths — only the routing differs.
+    //
+    // ONE DELIBERATE DIFFERENCE: these do NOT percent-decode. /kv/{key} decodes
+    // its path, so `/kv/hello%20world` addresses "hello world", while
+    // `/get-val?key=hello%20world` addresses the literal "hello%20world". The
+    // legacy routes are left exactly as they were on purpose: decoding them now
+    // would silently change which key an existing client reaches (a key
+    // containing a literal '%' or '+' would move), and they are scheduled for
+    // removal anyway. New clients should use /kv/{key}.
     if (request.method == "POST" && request.path == "/insert-val") {
       return handle_insert(request);
     }
@@ -214,6 +239,112 @@ public:
 private:
   IRaftClient &raft_client_;
   const IKVStore &store_;
+
+  /** @brief Prefix of the REST surface; everything after it is the key. */
+  static constexpr const char *kKvPathPrefix = "/kv/";
+
+  /**
+   * @brief Route and serve PUT/GET/DELETE /kv/{key} (R4.6).
+   *
+   * The key is percent-decoded, so `/kv/hello%20world` addresses the key
+   * "hello world" and `/kv/a%2Fb` addresses "a/b" rather than being mistaken
+   * for a nested path. A malformed escape is a 400 rather than a guess — see
+   * url_decode.
+   */
+  [[nodiscard]] HttpResponse handle_kv(const HttpRequest &request) const {
+    const std::string raw_key =
+        request.path.substr(std::string(kKvPathPrefix).size());
+
+    // decode_plus = false: in a PATH a '+' is a literal plus. Decoding it as a
+    // space here would make /kv/a+b and /kv/a%20b the same key, which they are
+    // not.
+    const std::optional<std::string> key = url_decode(raw_key, false);
+    if (!key.has_value()) {
+      return HttpResponse::json_error(
+          400, "malformed percent-encoding in the request path");
+    }
+    if (key->empty()) {
+      return HttpResponse::json_error(400, "key must not be empty");
+    }
+
+    if (request.method == "PUT") {
+      return handle_kv_put(request, *key);
+    }
+    if (request.method == "GET") {
+      return handle_kv_get(request, *key);
+    }
+    if (request.method == "DELETE") {
+      return handle_kv_delete(*key);
+    }
+    return HttpResponse::json_error(
+        405, "method not allowed on /kv/{key}: use PUT, GET or DELETE");
+  }
+
+  /**
+   * @brief PUT /kv/{key} - the request body IS the value.
+   *
+   * Any media type is accepted and the bytes are stored verbatim: a value is
+   * opaque to this store, so insisting on a Content-Type would be ceremony. The
+   * body may be empty — storing an empty value is legitimate and distinct from
+   * the key being absent.
+   *
+   * R4.7: the raft payload is built with KVCommand::encode_set, the same
+   * encoder the legacy route's clients use and the same one the WAL uses, so a
+   * new entry is byte-identical to an old one for the same command.
+   */
+  [[nodiscard]] HttpResponse handle_kv_put(const HttpRequest &request,
+                                           const std::string &key) const {
+    if (request.bad_content_length) {
+      return HttpResponse::json_error(400, "malformed Content-Length");
+    }
+    return propose_and_map(KVCommand::encode_set(key, request.body));
+  }
+
+  /** @brief DELETE /kv/{key}. */
+  [[nodiscard]] HttpResponse handle_kv_delete(const std::string &key) const {
+    return propose_and_map(KVCommand::encode_delete(key));
+  }
+
+  /** @brief GET /kv/{key}, honoring ?consistency= exactly as /get-val does. */
+  [[nodiscard]] HttpResponse handle_kv_get(const HttpRequest &request,
+                                           const std::string &key) const {
+    const std::map<std::string, std::string> params = request.query_params();
+    const auto consistency = params.find("consistency");
+    const std::string mode =
+        consistency == params.end() ? kConsistencyLocal : consistency->second;
+
+    if (mode == kConsistencyLinearizable) {
+      return handle_linearizable_get(key);
+    }
+    if (mode != kConsistencyLocal) {
+      return HttpResponse::json_error(
+          400, "consistency must be \"local\" or \"linearizable\"");
+    }
+
+    const std::optional<std::string> value = store_.get(key);
+    if (!value) {
+      return HttpResponse::json_error(404, "key not found");
+    }
+    return HttpResponse::ok(*value);
+  }
+
+  /**
+   * @brief Propose an encoded command and map the outcome onto a status code.
+   *
+   * Shared by the REST and legacy write paths so there is one place that
+   * decides what a propose failure means to a client.
+   */
+  [[nodiscard]] HttpResponse propose_and_map(const std::string &payload) const {
+    const ProposeResult result = raft_client_.propose(payload);
+    if (result.success) {
+      return HttpResponse::json(200, "{\"ok\":true}");
+    }
+    const std::optional<std::string> leader = not_leader_address(result.error);
+    if (leader.has_value()) {
+      return HttpResponse::json(503, not_leader_body(*leader));
+    }
+    return HttpResponse::json_error(502, result.error);
+  }
 
   /**
    * @brief POST /insert-val - validate, then propose through Raft.
@@ -355,8 +486,8 @@ public:
    * @param port Port to listen on
    * @param handler Request handler for processing requests
    */
-  HttpServer(int port, KVHttpHandler handler)
-      : port_(port), handler_(std::move(handler)) {
+  HttpServer(int port, KVHttpHandler handler, RequestLimits limits = {})
+      : port_(port), handler_(std::move(handler)), limits_(limits) {
     setup_socket();
   }
 
@@ -391,7 +522,16 @@ private:
   int server_fd_ = -1;
   KVHttpHandler handler_;
 
+  /** @brief Inbound request bounds (R4.9). */
+  RequestLimits limits_;
+
   static constexpr size_t kBufferSize = 4096;
+
+  /** @brief Write a response, ignoring a peer that has already gone away. */
+  static void send_response(int client_socket, const HttpResponse &response) {
+    const std::string serialized = response.to_string();
+    send(client_socket, serialized.c_str(), serialized.size(), 0);
+  }
 
   void setup_socket() {
     server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -419,14 +559,35 @@ private:
 
   void handle_connection(int client_socket) {
     std::vector<char> buffer(kBufferSize);
+    std::string raw_request;
 
-    int bytes_received = recv(client_socket, buffer.data(), buffer.size(), 0);
-    if (bytes_received <= 0) {
-      close(client_socket);
-      return;
+    // R4.9: read until the header terminator actually arrives, instead of
+    // assuming it fits in the first packet. It usually does, but "usually" is
+    // not a parsing rule — a client is free to dribble headers one byte per
+    // segment, and the old single-recv version simply failed to parse those.
+    //
+    // Bounded by max_header_bytes so a client that never sends the terminator
+    // cannot make this buffer without limit.
+    size_t header_end = std::string::npos;
+    while (true) {
+      header_end = raw_request.find("\r\n\r\n");
+      if (header_end != std::string::npos) {
+        break;
+      }
+      if (raw_request.size() > limits_.max_header_bytes) {
+        send_response(client_socket, HttpResponse::json_error(
+                                         431, "request headers too large"));
+        close(client_socket);
+        return;
+      }
+      const ssize_t n = recv(client_socket, buffer.data(), buffer.size(), 0);
+      if (n <= 0) {
+        // Peer gave up or closed mid-headers. Nothing to answer.
+        close(client_socket);
+        return;
+      }
+      raw_request.append(buffer.data(), static_cast<size_t>(n));
     }
-
-    std::string raw_request(buffer.data(), bytes_received);
 
     auto parsed_request = HttpRequestParser::parse(raw_request);
     if (!parsed_request) {
@@ -434,7 +595,19 @@ private:
       return;
     }
 
-    // Read remaining body if needed.
+    // Refuse an oversized body from its declared length, before reading it.
+    // Reading it first and then rejecting would let a client spend this
+    // process's memory to earn a 413.
+    if (parsed_request->content_length > 0 &&
+        static_cast<size_t>(parsed_request->content_length) >
+            limits_.max_body_bytes) {
+      send_response(client_socket,
+                    HttpResponse::json_error(413, "request body too large"));
+      close(client_socket);
+      return;
+    }
+
+    // Read the remaining body.
     //
     // The `> 0` guard is belt-and-braces against a negative content_length
     // reaching here: the cast below is to size_t, so a negative value becomes
@@ -445,10 +618,18 @@ private:
     while (parsed_request->content_length > 0 &&
            parsed_request->body.size() <
                static_cast<size_t>(parsed_request->content_length)) {
-      int n = recv(client_socket, buffer.data(), buffer.size(), 0);
+      const ssize_t n = recv(client_socket, buffer.data(), buffer.size(), 0);
       if (n <= 0)
         break;
-      parsed_request->body.append(buffer.data(), n);
+      parsed_request->body.append(buffer.data(), static_cast<size_t>(n));
+      // A body longer than advertised is also capped: content_length bounds the
+      // loop, but a pipelined follow-up request would arrive in the same read.
+      if (parsed_request->body.size() > limits_.max_body_bytes) {
+        send_response(client_socket,
+                      HttpResponse::json_error(413, "request body too large"));
+        close(client_socket);
+        return;
+      }
     }
 
     // Handle request and send response

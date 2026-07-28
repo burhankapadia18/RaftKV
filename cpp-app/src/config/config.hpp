@@ -19,6 +19,28 @@ namespace kvdb {
  * in the store. They are deliberately NOT exposed as positional CLI arguments -
  * the argv contract (http_port, grpc_port, sidecar_port, db_file) is unchanged.
  */
+/**
+ * @brief Bounds on an inbound HTTP request (R4.9).
+ *
+ * Before Phase 4 there were none: the server read one 4 KiB chunk and hoped the
+ * headers fitted, and a body could be as large as the client felt like sending.
+ * Both are now explicit, because "how much memory can a stranger make this
+ * process allocate" should be a number someone chose.
+ */
+struct RequestLimits {
+  /** @brief Largest accepted request body. Over this is a 413. */
+  size_t max_body_bytes = 1u * 1024 * 1024;
+
+  /**
+   * @brief Largest accepted header block, terminator included. Over this is a
+   * 431.
+   *
+   * A cap is what makes the read-until-blank-line loop safe: without it a
+   * client that never sends the terminator makes the server buffer forever.
+   */
+  size_t max_header_bytes = 32u * 1024;
+};
+
 struct DurabilityOptions {
   /**
    * @brief fsync policy applied to every WAL append.
@@ -50,6 +72,9 @@ struct Config {
 
   /** @brief Durability policy handed to the store (spec R2.8). */
   DurabilityOptions durability{};
+
+  /** @brief Inbound HTTP request bounds (R4.9). */
+  RequestLimits limits{};
 
   /**
    * @brief Create config with default values.

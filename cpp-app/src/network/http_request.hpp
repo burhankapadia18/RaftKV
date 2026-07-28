@@ -11,6 +11,64 @@
 namespace kvdb {
 
 /**
+ * @brief Percent-decode a URL component (R4.6).
+ *
+ * Returns nullopt on a malformed escape rather than guessing: "%zz" and a
+ * trailing "%4" are not "probably fine", they mean the client and this server
+ * disagree about the bytes being named, and silently keeping the literal text
+ * would let two different requests address the same key.
+ *
+ * @param in           The raw component.
+ * @param decode_plus  Treat '+' as a space. True for query strings (where
+ *                     application/x-www-form-urlencoded says so), false for
+ *                     path segments (where '+' is a literal plus). Getting this
+ *                     backwards silently corrupts any key containing a '+'.
+ * @return The decoded bytes, or nullopt if @p in contains a malformed escape.
+ */
+[[nodiscard]] inline std::optional<std::string>
+url_decode(const std::string &in, bool decode_plus = false) {
+  static constexpr auto hex_value = [](char c) -> int {
+    if (c >= '0' && c <= '9')
+      return c - '0';
+    if (c >= 'a' && c <= 'f')
+      return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+      return c - 'A' + 10;
+    return -1;
+  };
+
+  std::string out;
+  out.reserve(in.size());
+
+  for (size_t i = 0; i < in.size(); ++i) {
+    const char c = in[i];
+    if (c == '+' && decode_plus) {
+      out += ' ';
+      continue;
+    }
+    if (c != '%') {
+      out += c;
+      continue;
+    }
+
+    // Needs exactly two more characters, both hex. Checking the length first is
+    // what keeps this from reading past the end on a trailing "%".
+    if (i + 2 >= in.size()) {
+      return std::nullopt;
+    }
+    const int hi = hex_value(in[i + 1]);
+    const int lo = hex_value(in[i + 2]);
+    if (hi < 0 || lo < 0) {
+      return std::nullopt;
+    }
+    out += static_cast<char>((hi << 4) | lo);
+    i += 2;
+  }
+
+  return out;
+}
+
+/**
  * @brief Parsed HTTP request structure.
  *
  * Immutable value object representing a parsed HTTP request.

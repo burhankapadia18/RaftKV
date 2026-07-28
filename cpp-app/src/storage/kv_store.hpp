@@ -562,10 +562,10 @@ private:
     cmd.op = op;
     cmd.key = key;
     cmd.value = value;
-
-    msgpack::sbuffer buffer;
-    msgpack::pack(buffer, cmd);
-    return std::string(buffer.data(), buffer.size());
+    // KVCommand::to_msgpack is the single encoder — see the note there. The
+    // HTTP handler builds raft payloads with the same one, which is what keeps
+    // a WAL record and a raft entry byte-identical for the same command.
+    return cmd.to_msgpack();
   }
 
   /** @brief Atomically install an encoded state image as the base (R2.2). */

@@ -78,6 +78,39 @@ struct KVCommand {
    * @return KVCommand The deserialized command
    * @throws std::runtime_error If deserialization fails
    */
+  /**
+   * @brief Serialize this command to the MsgPack map form.
+   *
+   * The inverse of from_msgpack, and the ONE encoder in the codebase: the HTTP
+   * handler uses it to build a raft payload (R4.7) and PersistentKVStore uses
+   * it to build a WAL record. Two encoders would be free to drift, and this
+   * format is both a wire format and an on-disk format — a divergence would
+   * make old WAL records or old raft entries undecodable.
+   */
+  [[nodiscard]] std::string to_msgpack() const {
+    msgpack::sbuffer buffer;
+    msgpack::pack(buffer, *this);
+    return std::string(buffer.data(), buffer.size());
+  }
+
+  /** @brief Build an encoded SET payload. */
+  [[nodiscard]] static std::string encode_set(const std::string &key,
+                                              const std::string &value) {
+    KVCommand cmd;
+    cmd.op = "SET";
+    cmd.key = key;
+    cmd.value = value;
+    return cmd.to_msgpack();
+  }
+
+  /** @brief Build an encoded DELETE payload. */
+  [[nodiscard]] static std::string encode_delete(const std::string &key) {
+    KVCommand cmd;
+    cmd.op = "DELETE";
+    cmd.key = key;
+    return cmd.to_msgpack();
+  }
+
   static KVCommand from_msgpack(const char *data, size_t size) {
     KVCommand cmd;
     msgpack::object_handle oh = msgpack::unpack(data, size);

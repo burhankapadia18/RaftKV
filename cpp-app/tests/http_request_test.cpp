@@ -379,5 +379,63 @@ TEST(HttpRequestParserTest, QueryParamsFromAParsedRequest) {
   EXPECT_EQ(params.at("mode"), "local");
 }
 
+// --- R4.6: url_decode -----------------------------------------------------
+
+TEST(UrlDecodeTest, LeavesUnreservedCharactersAlone) {
+  const std::optional<std::string> out = url_decode("plain-key_123.txt");
+  ASSERT_TRUE(out.has_value());
+  EXPECT_EQ(*out, "plain-key_123.txt");
+}
+
+TEST(UrlDecodeTest, DecodesPercentEscapes) {
+  EXPECT_EQ(url_decode("hello%20world").value_or("<none>"), "hello world");
+  // A key containing a slash must survive: without decoding it would look like
+  // a nested path and address a different key.
+  EXPECT_EQ(url_decode("a%2Fb").value_or("<none>"), "a/b");
+  EXPECT_EQ(url_decode("%3D").value_or("<none>"), "=");
+  // Lower and upper case hex digits are both legal.
+  EXPECT_EQ(url_decode("%7e").value_or("<none>"), "~");
+  EXPECT_EQ(url_decode("%7E").value_or("<none>"), "~");
+}
+
+TEST(UrlDecodeTest, DecodesNulAndHighBytes) {
+  // Values and keys have been binary-safe since Phase 2; the URL layer must not
+  // be the thing that reintroduces a truncation.
+  const std::optional<std::string> nul = url_decode("a%00b");
+  ASSERT_TRUE(nul.has_value());
+  EXPECT_EQ(nul->size(), 3u);
+  EXPECT_EQ(*nul, std::string("a\0b", 3));
+
+  const std::optional<std::string> high = url_decode("%FF%FE");
+  ASSERT_TRUE(high.has_value());
+  EXPECT_EQ(high->size(), 2u);
+  EXPECT_EQ(static_cast<unsigned char>((*high)[0]), 0xFFu);
+}
+
+TEST(UrlDecodeTest, RejectsMalformedEscapesRatherThanGuessing) {
+  // Passing these through as literal text would let "%zz" and a genuinely
+  // percent-encoded key collide, so they are refused and the handler answers
+  // 400.
+  EXPECT_FALSE(url_decode("%zz").has_value());
+  EXPECT_FALSE(url_decode("%4").has_value());  // truncated
+  EXPECT_FALSE(url_decode("%").has_value());   // bare percent
+  EXPECT_FALSE(url_decode("ok%").has_value()); // trailing
+  EXPECT_FALSE(url_decode("a%2").has_value()); // one hex digit short
+  EXPECT_FALSE(url_decode("%g0").has_value());
+}
+
+TEST(UrlDecodeTest, PlusIsLiteralInPathsAndSpaceInQueries) {
+  // The distinction is real: /kv/a+b and /kv/a%20b are DIFFERENT keys, while in
+  // a query string "a+b" conventionally means "a b".
+  EXPECT_EQ(url_decode("a+b", false).value_or("<none>"), "a+b");
+  EXPECT_EQ(url_decode("a+b", true).value_or("<none>"), "a b");
+}
+
+TEST(UrlDecodeTest, EmptyInputDecodesToEmpty) {
+  const std::optional<std::string> out = url_decode("");
+  ASSERT_TRUE(out.has_value());
+  EXPECT_TRUE(out->empty());
+}
+
 } // namespace
 } // namespace kvdb

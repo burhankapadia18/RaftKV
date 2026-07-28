@@ -51,7 +51,7 @@ int main(int argc, char *argv[]) {
 
     // 5. Create and run the HTTP server
     KVHttpHandler handler(*raft_client, store);
-    HttpServer http_server(config.http_port, std::move(handler));
+    HttpServer http_server(config.http_port, std::move(handler), config.limits);
     http_server.run();
 
     return 0;
