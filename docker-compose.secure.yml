@@ -1,0 +1,144 @@
+# Secure deployment profile (Phase 6).
+#
+#     ./scripts/gen-certs.sh
+#     export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
+#     docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
+#
+# This is the deployment the README documents as supported. The base
+# docker-compose.yml stays plaintext on purpose: it is the zero-config demo, and
+# a demo that needs a CA before it prints anything is a demo nobody runs. Layer
+# this on top and every surface that leaves a node is encrypted:
+#
+#   raft peer transport (8088)  mutual TLS, cluster CA          R6.4
+#   management API (6000)       HTTPS + bearer token            R6.3 + R6.1
+#   client HTTP API (8443)      HTTPS, terminated by the proxy  R6.5
+#   intra-node gRPC (50051)     plaintext, bound to 127.0.0.1   R6.6
+#
+# The last line is the one worth reading twice: 50051 is not encrypted, because
+# it never leaves the container's loopback interface. Encrypting a loopback hop
+# between two processes in the same container buys nothing and costs a certificate
+# rotation story.
+#
+# What is still NOT protected, so nobody has to discover it the hard way:
+#   - There is no client authentication. Anyone who can reach :8443 can read and
+#     write every key. The bearer token guards cluster MEMBERSHIP, not data.
+#   - The proxy-to-node hop is plaintext (see deploy/caddy/Caddyfile).
+#   - Certificates do not rotate. Restart a node to pick up a new one.
+
+x-tls-env: &tls-env
+  RAFT_TLS_CA: /certs/ca.pem
+  MGMT_TLS_CA: /certs/ca.pem
+
+x-certs-mount: &certs-mount
+  # Read-only. The container never needs to write here, and the CA private key is
+  # deliberately NOT in this directory's mounted contents — gen-certs.sh leaves
+  # ca-key.pem behind at 0600 and nothing mounts it.
+  type: bind
+  source: ./certs
+  target: /certs
+  read_only: true
+
+# HTTPS healthcheck. --cacert rather than -k: `curl -k` would report a node as
+# healthy even if it served a certificate from the wrong CA, which is exactly the
+# misconfiguration this profile exists to prevent. A probe that skips verification
+# is a probe that cannot detect a broken trust chain.
+x-https-healthcheck: &https-healthcheck
+  test:
+    [
+      "CMD",
+      "curl",
+      "-fsS",
+      "--cacert",
+      "/certs/ca.pem",
+      "https://localhost:6000/ready",
+    ]
+  interval: 3s
+  timeout: 2s
+  retries: 10
+  start_period: 5s
+
+services:
+  node1:
+    environment:
+      <<: *tls-env
+      RAFT_TLS_CERT: /certs/node1.pem
+      RAFT_TLS_KEY: /certs/node1-key.pem
+      MGMT_TLS_CERT: /certs/node1.pem
+      MGMT_TLS_KEY: /certs/node1-key.pem
+    volumes:
+      - ./vol-node1:/app/data
+      - *certs-mount
+    healthcheck: *https-healthcheck
+    # !override, not a plain list. `ports` CONCATENATES across compose files
+    # (unlike `environment`, which merges key-by-key), so without this tag the
+    # base file's "8080:8080" survives and the plaintext client API stays
+    # published right next to the TLS one. Verified: the first version of this
+    # file did exactly that.
+    ports: !override
+      # The client HTTP port is NOT published in this profile: reaching the API
+      # means going through the TLS proxy on 8443. Publishing 8080 as well would
+      # leave a plaintext door open next to the locked one, which is the most
+      # common way a "TLS enabled" deployment turns out not to be.
+      #
+      # 6000 stays published so an operator can still curl /status and /ready —
+      # over HTTPS, with the CA.
+      - "6000:6000"
+
+  node2:
+    environment:
+      <<: *tls-env
+      RAFT_TLS_CERT: /certs/node2.pem
+      RAFT_TLS_KEY: /certs/node2-key.pem
+      MGMT_TLS_CERT: /certs/node2.pem
+      MGMT_TLS_KEY: /certs/node2-key.pem
+    volumes:
+      - ./vol-node2:/app/data
+      - *certs-mount
+    healthcheck: *https-healthcheck
+    ports: !override
+      - "6001:6000"
+
+  node3:
+    environment:
+      <<: *tls-env
+      RAFT_TLS_CERT: /certs/node3.pem
+      RAFT_TLS_KEY: /certs/node3-key.pem
+      MGMT_TLS_CERT: /certs/node3.pem
+      MGMT_TLS_KEY: /certs/node3-key.pem
+    volumes:
+      - ./vol-node3:/app/data
+      - *certs-mount
+    healthcheck: *https-healthcheck
+    ports: !override
+      - "6002:6000"
+
+  # R6.5: TLS for the client API, terminated here rather than in the C++ engine.
+  # The reasoning is in deploy/caddy/Caddyfile, including what this arrangement
+  # does not protect.
+  proxy:
+    image: caddy:2.8-alpine
+    depends_on:
+      node1:
+        condition: service_healthy
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - *certs-mount
+    restart: unless-stopped
+    healthcheck:
+      # Verified against the cluster CA, for the same reason as the nodes above.
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "-O",
+          "-",
+          "--ca-certificate=/certs/ca.pem",
+          "https://localhost:8443/metrics",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s

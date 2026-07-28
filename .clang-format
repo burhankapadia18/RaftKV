@@ -1,0 +1,52 @@
+---
+# Formatting for cpp-app/. The checked-in sources are already plain
+# clang-format LLVM style; the keys below are the ones that are load-bearing
+# for this codebase and are spelled out so the intent is obvious rather than
+# implied by the base style.
+Language: Cpp
+BasedOnStyle: LLVM
+
+Standard: c++17
+
+# 2-space indent, 80 columns (e.g. cpp-app/src/network/http_request.hpp wraps
+# its return type onto its own line to stay inside 80).
+IndentWidth: 2
+ColumnLimit: 80
+UseTab: Never
+
+# `public:` / `private:` sit 2 columns left of the members they introduce.
+AccessModifierOffset: -2
+
+# `namespace kvdb {` contents are not indented, and the closing brace carries
+# a `// namespace kvdb` comment.
+NamespaceIndentation: None
+FixNamespaceComments: true
+
+# Attached braces: `class Foo {`, `if (x) {`, `} else {`.
+BreakBeforeBraces: Attach
+
+# `switch` case labels are not indented relative to the `switch`
+# (see cpp-app/src/raft/state_machine.hpp).
+IndentCaseLabels: false
+
+# `const std::string &key` — `&`/`*` bind to the name, not the type.
+PointerAlignment: Right
+DerivePointerAlignment: false
+
+# Include blocks separated by a blank line are kept separate and sorted
+# independently (cpp-app/src/network/http_server.hpp relies on this to keep
+# POSIX headers in their own group).
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+# Short bodies such as `Operation operation_type() const { return ...; }` stay
+# on one line, but brace-less `if` bodies always wrap.
+#
+# Note: every key in this file must be understood by clang-format 14, the
+# version in debian:bookworm-slim that the CI `cpp` job runs in. clang-format
+# rejects the whole config on an unknown key rather than skipping it, so a
+# newer-only key (e.g. InsertBraces, added in 15) silently breaks formatting
+# for everyone using the pinned container.
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false

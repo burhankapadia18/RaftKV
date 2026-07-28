@@ -1,3 +1,21 @@
+"""Manual one-shot demo client for a running RaftKV cluster.
+
+SUPERSEDED BY ``tests/e2e`` for verification. This script prints what happened
+and always exits 0; it asserts nothing, sleeps a fixed 0.3s instead of polling,
+and only ever talks to :8080 -- so it never checks that a write actually
+replicated to the other two nodes.
+
+Use it to eyeball a single write/read by hand. To verify a change, run the
+asserting suite instead (it polls all three nodes and exits non-zero on
+failure)::
+
+    docker build -t raftkv:latest . && docker compose up -d
+    pip install -r tests/e2e/requirements.txt
+    pytest tests/e2e -v
+
+Kept deliberately unchanged as the minimal MsgPack example.
+"""
+
 import requests
 import msgpack
 import time

@@ -1,0 +1,5 @@
+# Dependencies for the RaftKV end-to-end suite (tests/e2e).
+# Pinned so CI and local runs agree.
+msgpack==1.1.0
+pytest==8.3.5
+requests==2.32.3

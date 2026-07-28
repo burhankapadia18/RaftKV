@@ -1,0 +1,608 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Superseding a PR push is fine; superseding a main push is not — it would
+  # leave the earlier commit on main with no CI result at all.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Jobs are deliberately independent (no `needs:`) so that a C++ failure still
+# reports the Go result and vice versa.
+jobs:
+  # --- R0.13: gofmt / go vet / go test -race -----------------------------
+  go:
+    name: Go unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: go-sidecar
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Single source of truth for the Go version: go-sidecar/go.mod.
+          # Paths here are workspace-relative (defaults.run.working-directory
+          # applies to `run` steps only, not to `uses` steps).
+          go-version-file: go-sidecar/go.mod
+          cache-dependency-path: go-sidecar/go.sum
+
+      - name: Check gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not gofmt-formatted:"
+            echo "$unformatted"
+            echo
+            echo "Run 'cd go-sidecar && gofmt -w .' and commit the result."
+            exit 1
+          fi
+          echo "All Go files are gofmt-clean."
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -coverprofile=coverage.out ./...
+
+      # R6.8. Pinned rather than @latest: a static analyser that changes its rule
+      # set on its own schedule turns an unrelated PR red for reasons its author
+      # cannot act on.
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+          # -exclude-dir=pb: the only G103 (unsafe) findings are in
+          # protoc-generated code. An annotation there would be erased the next
+          # time the stubs are regenerated, so excluding the directory is the
+          # honest suppression rather than a comment that cannot survive.
+          "$(go env GOPATH)/bin/gosec" -exclude-dir=pb -fmt=text ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tee coverage.txt
+          {
+            echo '### Go coverage'
+            echo
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --- R0.14 (part 1): cmake build + ctest -------------------------------
+  cpp:
+    name: C++ build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Same base image as the Dockerfile's cpp_builder stage. This is the build
+    # configuration we know works; do not swap it for bare ubuntu-latest apt
+    # packages (different gRPC/protobuf versions).
+    container:
+      image: debian:bookworm-slim
+    steps:
+      # The image has neither git nor CA certificates, both of which
+      # actions/checkout needs to clone over HTTPS. Install them first.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            pkg-config \
+            libmsgpack-dev \
+            libgtest-dev \
+            clang-format \
+            git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # R0.16: the checked-in sources are clang-format-clean against
+      # .clang-format under this container's clang-format 14, so this gate is
+      # blocking. Pinning the container pins the formatter version too, which
+      # is what makes the check deterministic.
+      - name: Check clang-format
+        run: |
+          unformatted="$(
+            find cpp-app/src cpp-app/tests \( -name '*.hpp' -o -name '*.cpp' \) \
+              -exec sh -c '
+                for f do
+                  clang-format --style=file "$f" | diff -q - "$f" >/dev/null || echo "$f"
+                done
+              ' sh {} +
+          )"
+          if [ -n "$unformatted" ]; then
+            echo "::error::The following files are not clang-format clean:"
+            echo "$unformatted"
+            echo "Fix with: clang-format -i <file>"
+            exit 1
+          fi
+          echo "All C++ files are clang-format clean."
+
+      - name: Configure
+        run: cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build cpp-app/build -j "$(nproc)"
+
+      - name: Run tests
+        run: ctest --test-dir cpp-app/build --output-on-failure
+
+  # --- R0.14 (part 2): the same tests under ASan + UBSan -----------------
+  cpp-sanitizers:
+    name: C++ tests (ASan + UBSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: debian:bookworm-slim
+      # LeakSanitizer (detect_leaks=1 below) needs ptrace. Docker's default
+      # seccomp profile usually allows it, but when it doesn't the failure is a
+      # hard "LeakSanitizer has encountered a fatal error" at every process
+      # exit — all 56 ctest entries fail at once, for reasons unrelated to the
+      # code. The capability costs nothing here.
+      options: --cap-add=SYS_PTRACE
+    env:
+      # Without halt_on_error, UBSan only prints a diagnostic and the process
+      # still exits 0 — the job would pass while reporting undefined behavior.
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:print_stacktrace=1
+      UBSAN_OPTIONS: halt_on_error=1:abort_on_error=1:print_stacktrace=1
+    steps:
+      # NOTE: libgtest-dev is deliberately NOT installed here (unlike the `cpp`
+      # job). Debian's libgtest.a is built without sanitizers; linking it into
+      # ASan-instrumented test objects puts a std::string across an
+      # instrumented/non-instrumented boundary on every assertion, which is the
+      # textbook trigger for ASan `container-overflow` false positives — and
+      # abort_on_error=1 below turns those into job failures.
+      # With no system GoogleTest, CMakeLists.txt falls back to FetchContent and
+      # builds GoogleTest from source under the same sanitizer flags. `git` and
+      # `ca-certificates` (installed below) are what that fallback needs.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            pkg-config \
+            libmsgpack-dev \
+            git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (sanitizers)
+        run: |
+          cmake -S cpp-app -B cpp-app/build-asan \
+            -DKVDB_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build test target
+        run: cmake --build cpp-app/build-asan --target kvdb_tests -j "$(nproc)"
+
+      - name: Run tests
+        run: ctest --test-dir cpp-app/build-asan --output-on-failure
+
+  # --- R4.11: the same tests under ThreadSanitizer ------------------------
+  #
+  # Phase 4 replaced the single-threaded accept loop with a worker pool, so
+  # "is everything a worker touches actually thread-safe" became a question CI
+  # has to answer rather than a claim in a comment.
+  cpp-tsan:
+    name: C++ tests (TSan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: debian:bookworm-slim
+      # REQUIRED, not belt-and-braces. TSan disables ASLR via
+      # personality(ADDR_NO_RANDOMIZE), which Docker's default seccomp profile
+      # blocks; without this the binary dies at startup with
+      # "CHECK failed: tsan_platform_linux.cpp ... personality" and the failure
+      # surfaces during gtest_discover_tests as a build-time segfault, which
+      # looks nothing like the actual cause. Found the hard way.
+      options: --security-opt seccomp=unconfined
+    env:
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      # No libgtest-dev, same reasoning as the ASan job: a non-instrumented
+      # GoogleTest linked into instrumented objects produces false reports, so
+      # CMakeLists falls back to FetchContent and builds it under -fsanitize=thread.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            pkg-config \
+            libmsgpack-dev \
+            git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (TSan)
+        run: |
+          cmake -S cpp-app -B cpp-app/build-tsan \
+            -DKVDB_BUILD_TESTS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build test target
+        run: cmake --build cpp-app/build-tsan --target kvdb_tests -j "$(nproc)"
+
+      - name: Run tests
+        run: ctest --test-dir cpp-app/build-tsan --output-on-failure
+
+  # --- R6.7: libFuzzer over the two trust boundaries ----------------------
+  fuzz:
+    name: Fuzz (libFuzzer, 60s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: debian:bookworm-slim
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake clang libmsgpack-dev git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # clang, not gcc: libFuzzer is a clang feature and CMakeLists refuses
+      # loudly rather than building a target that silently fuzzes nothing.
+      - name: Configure
+        run: |
+          cmake -S cpp-app -B cpp-app/build-fuzz \
+            -DKVDB_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build cpp-app/build-fuzz -j "$(nproc)"
+
+      # Bounded so this stays a PR gate rather than a fuzzing campaign. Any crash,
+      # OOM or sanitizer report fails the job and the input becomes a checked-in
+      # regression test — that is how the map-header amplification DoS in
+      # KVCommand was found and fixed.
+      # TWO corpus directories, and the order matters. libFuzzer writes newly
+      # interesting inputs to the FIRST directory only and treats the rest as
+      # read-only seeds. Passing the checked-in seed corpus first — which the
+      # original version of this step did — makes a 60s run deposit hundreds of
+      # hash-named files into the repository. That is how 1671 generated inputs got
+      # committed alongside 7 authored seeds.
+      - name: Fuzz KVCommand::from_msgpack
+        run: |
+          mkdir -p /tmp/corpus-kv
+          ./cpp-app/build-fuzz/fuzz_kv_command /tmp/corpus-kv cpp-app/fuzz/corpus/kv_command \
+            -max_total_time=60 -artifact_prefix=/tmp/fuzz-kv-
+
+      - name: Fuzz HttpRequestParser::parse
+        run: |
+          mkdir -p /tmp/corpus-http
+          ./cpp-app/build-fuzz/fuzz_http_parser /tmp/corpus-http cpp-app/fuzz/corpus/http_parser \
+            -max_total_time=60 -artifact_prefix=/tmp/fuzz-http-
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: /tmp/fuzz-*
+          if-no-files-found: ignore
+
+  # --- R0.15: full cluster end-to-end ------------------------------------
+  e2e:
+    name: End-to-end cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Build image
+        run: docker build -t raftkv:latest .
+
+      # `docker compose` (the CLI plugin) is preinstalled on GitHub runners;
+      # the standalone `docker-compose` binary is not guaranteed to be. The
+      # compose file's top-level `version:` key produces a deprecation warning
+      # on modern compose — that is expected and harmless.
+      # The snapshot override is applied HERE, not only in the crash/snapshot
+      # step, because the cluster is started once for the whole job. Without it
+      # tests/e2e/test_snapshot.py detects production snapshot tunables and
+      # SKIPS — which would leave Phase 3's headline requirement (a wiped
+      # follower catching up by snapshot transfer) ungated in CI while the job
+      # still reported green. `-rs` on the requires_docker run prints skip
+      # reasons so that can never happen silently again.
+      - name: Start cluster
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+
+      # Bounded readiness poll instead of a fixed sleep. Two conditions:
+      #   1. all three published HTTP ports answer a GET;
+      #   2. every node's Raft sidecar reports a non-empty leader_addr, i.e.
+      #      node2/node3 have finished joining and a leader has been elected.
+      # The C++ HTTP listener comes up long before Raft converges, so (1)
+      # alone is not sufficient. The management API on :6000 is not published
+      # to the host, so it is queried from inside the containers (the runtime
+      # image ships curl).
+      # Worst case for a join is 20 attempts x 2s = ~40s; 120s gives headroom.
+      - name: Wait for cluster readiness
+        run: |
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+
+            for port in 8080 8081 8082; do
+              if ! curl -sf --max-time 2 \
+                "http://localhost:${port}/get-val?key=__ci_readiness_probe__" \
+                >/dev/null; then
+                ready=0
+              fi
+            done
+
+            if [ "$ready" -eq 1 ]; then
+              for svc in node1 node2 node3; do
+                status="$(docker compose exec -T "$svc" \
+                  curl -sf --max-time 2 http://localhost:6000/status \
+                  2>/dev/null </dev/null || true)"
+                # Positive match on a NON-EMPTY leader_addr. Matching the
+                # negative case instead ("leader_addr": "") would be fail-open:
+                # any unexpected body — a proxy error page, or the compact
+                # `"leader_addr":""` that Phase 5 R5.6 will emit once this
+                # handler moves to encoding/json — would read as "ready" and
+                # silently hand an unconverged cluster to pytest. Whitespace
+                # around the colon is tolerated for exactly that reason.
+                printf '%s' "$status" \
+                  | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+              done
+            fi
+
+            if [ "$ready" -eq 1 ]; then
+              echo "Cluster is ready."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::Cluster did not become ready within 120s"
+          docker compose ps
+          exit 1
+
+      - name: Run e2e tests
+        run: pytest tests/e2e -v
+
+      # The Phase 2 crash test (tests/e2e/test_crash.py) is the one test allowed
+      # to touch docker: it SIGKILLs a node, inspects its data directory while it
+      # is dead, and restarts it. pytest.ini deselects the `requires_docker`
+      # marker by default so the step above stays docker-free and portable, so
+      # it has to be selected explicitly here. It runs last because it disturbs
+      # the cluster.
+      #
+      # `-rs` prints skip reasons: the test skips rather than fails when it
+      # cannot do its job (no docker, no compose project, non-local nodes), and
+      # a skip that nobody can see would be a silently unverified requirement.
+      - name: Run crash-recovery test
+        run: pytest tests/e2e -m requires_docker -v -rs
+
+      - name: Dump cluster logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps
+
+      - name: Tear down cluster
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------------------
+  # bench/ is a SEPARATE Go module, so the `go` job above — which is scoped to
+  # go-sidecar — never compiles it. Without this job kvbench rots silently and is
+  # discovered broken the next time someone tries to reproduce a benchmark, which
+  # is the worst possible moment.
+  #
+  # No test step: it has none. It is a measurement tool whose output is checked by
+  # reading it, and a fake test asserting that a throughput number is positive
+  # would be worse than nothing.
+  # ---------------------------------------------------------------------------
+  bench-build:
+    name: Benchmark client builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: bench
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: bench/go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reported files needing formatting:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+  # ---------------------------------------------------------------------------
+  # Phase 6: the same cluster, brought up with TLS everywhere.
+  #
+  # A separate job rather than another step in `e2e`, because the two profiles
+  # cannot coexist: the secure profile stops publishing the plaintext client
+  # ports, which is precisely what one of its tests asserts. Reusing one cluster
+  # would mean testing neither profile honestly.
+  #
+  # This job is what keeps the security work from rotting. Without it, R6.3 and
+  # R6.4 are verified once by hand and never again — and the specific bug this
+  # phase found (a certificate valid for a hostname, a peer dialled by container
+  # IP) forms a perfectly healthy cluster and only breaks after a leader
+  # election, so nothing short of running the profile catches it.
+  # ---------------------------------------------------------------------------
+  e2e-secure:
+    name: End-to-end cluster (TLS profile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Build image
+        run: docker build -t raftkv:latest .
+
+      - name: Generate cluster certificates
+        run: ./scripts/gen-certs.sh
+
+      # A generated token, not the compose fallback. The fallback exists so the
+      # zero-config demo runs; a security job that used it would be asserting
+      # that a publicly known credential works.
+      - name: Start secure cluster
+        run: |
+          # Generated ONCE. The first version of this step called `openssl rand`
+          # twice — writing one token to GITHUB_ENV for later steps and starting
+          # the cluster with a different one, so every later step would have held
+          # a credential the cluster had never seen.
+          token=""
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "RAFTKV_MGMT_TOKEN=$token" >> "$GITHUB_ENV"
+          export RAFTKV_MGMT_TOKEN="$token"
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
+
+      # Readiness is polled over HTTPS with --cacert, not -k. `curl -k` would
+      # report a node healthy while it served a certificate from the wrong CA,
+      # which is the misconfiguration this whole job exists to catch.
+      - name: Wait for secure cluster readiness
+        run: |
+          deadline=$(( $(date +%s) + 150 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+            for port in 6000 6001 6002; do
+              curl -sf --max-time 2 --cacert certs/ca.pem \
+                "https://localhost:${port}/ready" >/dev/null || ready=0
+            done
+
+            if [ "$ready" -eq 1 ]; then
+              for port in 6000 6001 6002; do
+                status="$(curl -sf --max-time 2 --cacert certs/ca.pem \
+                  "https://localhost:${port}/status" || true)"
+                printf '%s' "$status" \
+                  | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+              done
+            fi
+
+            if [ "$ready" -eq 1 ]; then
+              echo "Secure cluster is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "::error::Secure cluster did not become ready within 150s"
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml ps
+          exit 1
+
+      # -rs so a skip is visible. Every test in this module skips rather than
+      # fails when the profile is not up, which is right for a laptop and wrong
+      # for CI: here a skip means the requirement went unverified while the job
+      # went green.
+      - name: Run TLS profile tests
+        run: pytest tests/e2e -m requires_secure -v -rs
+
+      # The bug this phase found only appears AFTER a leader election: the
+      # bootstrap node advertised its resolved container IP, and a certificate
+      # issued for "node1" does not cover 172.18.0.2, so the next leader could
+      # never reach it again. A cluster that is merely up proves nothing about
+      # it, so the job forces the election.
+      - name: Survive a leader failover
+        run: |
+          set -e
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.secure.yml"
+          $COMPOSE stop node1
+
+          echo "Waiting for a new leader..."
+          deadline=$(( $(date +%s) + 90 ))
+          elected=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            for port in 6001 6002; do
+              if curl -sf --max-time 2 --cacert certs/ca.pem \
+                "https://localhost:${port}/status" 2>/dev/null \
+                | grep -q '"is_leader":true'; then
+                elected=1
+                break 2
+              fi
+            done
+            sleep 2
+          done
+          [ "$elected" -eq 1 ] || { echo "::error::no new leader was elected"; exit 1; }
+
+          $COMPOSE start node1
+
+          echo "Waiting for node1 to be replicated to again..."
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            applied="$(curl -sf --max-time 2 --cacert certs/ca.pem \
+              https://localhost:6000/status 2>/dev/null \
+              | sed -n 's/.*"applied_index":\([0-9]*\).*/\1/p')"
+            if [ -n "$applied" ] && [ "$applied" -gt 0 ]; then
+              echo "node1 rejoined and applied up to index $applied"
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "::error::node1 never caught up after the failover."
+          echo "Look for: x509: certificate is valid for ..., not <container IP>"
+          $COMPOSE logs --no-color --tail 100
+          exit 1
+
+      - name: Dump cluster logs
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml \
+            logs --no-color --timestamps
+
+      - name: Tear down secure cluster
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.secure.yml down -v

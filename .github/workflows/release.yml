@@ -1,0 +1,301 @@
+# Release on a v* tag (R7.9).
+#
+# Order matters: the full CI suite runs FIRST and everything else depends on it.
+# Publishing an image and then discovering the tests fail leaves a broken artifact
+# in a registry where someone can pull it, and deleting a published tag is not the
+# same as it never having existed.
+#
+# The e2e job here runs against the image built from the tagged tree, not against
+# the published one — that would be circular. A post-publish smoke test pulls what
+# was actually pushed.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (must already exist)'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  # ghcr.io requires a lowercase path. github.repository is already lowercase for
+  # this repo, but hard-coding the lowercased form avoids a class of failure that
+  # only appears for owners with capitals in their name.
+  IMAGE: ghcr.io/burhankapadia18/raftkv
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate. Nothing is published unless this passes.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Full test suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-sidecar/go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Go — format, vet, race tests
+        working-directory: go-sidecar
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reported files needing formatting: $unformatted"
+            exit 1
+          fi
+          go vet ./...
+          go test -race ./...
+
+      - name: Benchmark client builds
+        working-directory: bench
+        run: go vet ./... && go build ./...
+
+      - name: C++ — build and test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ pkg-config protobuf-compiler protobuf-compiler-grpc \
+            libprotobuf-dev libgrpc++-dev libmsgpack-dev libgtest-dev
+          cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON
+          cmake --build cpp-app/build -j"$(nproc)"
+          ctest --test-dir cpp-app/build --output-on-failure
+
+      - name: Chaos harness unit tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+          pytest tests/chaos/test_journal.py -v
+
+      - name: End-to-end
+        run: |
+          docker build -t raftkv:latest .
+          # EXPORT as well as writing to GITHUB_ENV: GITHUB_ENV only affects LATER
+          # steps, so a token written here and used by a `docker compose up` in the
+          # same step would never reach it — compose would silently fall back to the
+          # publicly known dev token from docker-compose.yml. Same trap that bit the
+          # Phase 6 secure-cluster step.
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "RAFTKV_MGMT_TOKEN=$token" >> "$GITHUB_ENV"
+          export RAFTKV_MGMT_TOKEN="$token"
+          docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+            for port in 6000 6001 6002; do
+              curl -sf --max-time 2 "http://localhost:${port}/status" 2>/dev/null \
+                | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+            done
+            [ "$ready" -eq 1 ] && break
+            sleep 2
+          done
+          [ "$ready" -eq 1 ] || { echo "::error::cluster not ready"; docker compose ps; exit 1; }
+          pytest tests/e2e -v
+          pytest tests/e2e -m requires_docker -v -rs
+          docker compose down -v
+
+  # ---------------------------------------------------------------------------
+  # Publish multi-arch images.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Build and push images
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        # arm64 is emulated on an amd64 runner. It is slow — a full C++ build under
+        # QEMU takes tens of minutes — which is why this job's timeout is generous.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          {
+            echo "version=$version"
+            echo "tags=${IMAGE}:${version},${IMAGE}:latest"
+          } >> "$GITHUB_OUTPUT"
+          # `latest` moves only for a final release. A prerelease tag (v1.0.0-rc1)
+          # that overwrote `latest` would hand a release candidate to everyone who
+          # pulls without a tag.
+          case "$version" in
+            *-*) echo "tags=${IMAGE}:${version}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  # ---------------------------------------------------------------------------
+  # Pull what was actually published and run the suite against it. Without this,
+  # "the release is green" means the tree passed, not that the artifact works.
+  # ---------------------------------------------------------------------------
+  smoke:
+    name: Smoke-test the published image
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the published image
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "RAFTKV_IMAGE=${IMAGE}:${ref#v}" >> "$GITHUB_ENV"
+
+      - name: Start cluster and run e2e
+        run: |
+          # EXPORT as well as writing to GITHUB_ENV: GITHUB_ENV only affects LATER
+          # steps, so a token written here and used by a `docker compose up` in the
+          # same step would never reach it — compose would silently fall back to the
+          # publicly known dev token from docker-compose.yml. Same trap that bit the
+          # Phase 6 secure-cluster step.
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "RAFTKV_MGMT_TOKEN=$token" >> "$GITHUB_ENV"
+          export RAFTKV_MGMT_TOKEN="$token"
+          # RAFTKV_IMAGE points compose at what was just PUSHED, so nothing here is
+          # built locally. That is the whole point of this job: the tree passing is
+          # not evidence that the artifact works.
+          docker compose pull
+          docker compose up -d
+          deadline=$(( $(date +%s) + 120 ))
+          ready=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+            for port in 6000 6001 6002; do
+              curl -sf --max-time 2 "http://localhost:${port}/status" 2>/dev/null \
+                | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+            done
+            [ "$ready" -eq 1 ] && break
+            sleep 2
+          done
+          [ "$ready" -eq 1 ] || { echo "::error::published image did not form a cluster"; docker compose logs; exit 1; }
+          pytest tests/e2e -v
+          docker compose down -v
+
+  # ---------------------------------------------------------------------------
+  # The GitHub release, last: it is the announcement, and announcing something
+  # that has not been smoke-tested is how a broken release gets adopted.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub release
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          # The section for this version, up to the next `## [`. Falls back to a
+          # pointer rather than an empty body: a release with no notes is worse
+          # than one that says where to look.
+          if awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md && [ -s notes.md ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "See CHANGELOG.md for changes in $ref." > notes.md
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+          # shellcheck disable=SC2016
+          # The single-quoted strings below are literal markdown — fenced code
+          # blocks and `code spans`. Nothing in them is meant to expand.
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo '## Images'
+            echo ''
+            echo '```bash'
+            echo "docker pull ${IMAGE}:${version}"
+            echo '```'
+            echo ''
+            echo 'Multi-arch: `linux/amd64`, `linux/arm64`.'
+          } >> notes.md
+          cat notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          prerelease=""
+          case "${ref#v}" in
+            *-*) prerelease="--prerelease" ;;
+          esac
+          gh release create "$ref" \
+            --title "$ref" \
+            --notes-file notes.md \
+            $prerelease \
+            --verify-tag

@@ -1,35 +1,112 @@
-version: '3.8'
-
+# The `version:` key is obsolete on modern compose and is deliberately omitted;
+# it only produced a deprecation warning on every command.
+#
+# RAFTKV_MGMT_TOKEN guards /join and /remove (R6.1). It is interpolated from the
+# environment with a dev-only fallback so `docker compose up` still works out of
+# the box — but the fallback is a KNOWN constant and must not be used anywhere
+# real. Set it for anything beyond a laptop:
+#
+#     export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
+#
+# The endpoints are closed, not open, when it is unset — so a cluster that forgets
+# this cannot grow rather than being silently world-writable.
+# Which image (R7.9)
+# ------------------
+# RAFTKV_IMAGE defaults to the LOCALLY BUILT `raftkv:latest`, so `docker build -t
+# raftkv:latest . && docker compose up -d` works from a clean checkout with no
+# registry access — which is what CI, the e2e suite, the chaos harness and every
+# command in the README already assume.
+#
+# To run a published release instead, with no build at all:
+#
+#     RAFTKV_IMAGE=ghcr.io/burhankapadia18/raftkv:1.0.0 docker compose up -d
+#
+# The phase spec asked for the reverse — the published image by default with a
+# local-build override. That ordering cannot be introduced before the first image
+# is published: `docker compose up -d` would try to pull a tag that does not exist
+# yet, and every workflow that builds `raftkv:latest` and then brings the cluster
+# up would silently run something else. One variable gets the same result in both
+# directions without a window where the repo is broken.
 services:
   node1:
-    image: raftkv:latest
+    image: ${RAFTKV_IMAGE:-raftkv:latest}
     hostname: node1
     environment:
       - NODE_ID=node1
       - BOOTSTRAP=true
+      - RAFTKV_MGMT_TOKEN=${RAFTKV_MGMT_TOKEN:-dev-only-insecure-token}
     ports:
+      # 8080 is the client HTTP API. 6000 is the management API (/status,
+      # /join, /remove), published from Phase 4 on because a client can no
+      # longer tell the leader from a follower by writing to it — forwarding
+      # means every node accepts a write. /status is now the only honest way to
+      # ask who leads, and tests/e2e needs that to verify forwarding at all.
       - "8080:8080"
+      - "6000:6000"
+    restart: unless-stopped
+    healthcheck:
+      # /ready, not /health: this gates depends_on, and what a dependent node
+      # needs to know is whether node1 can actually serve a join — which is
+      # readiness, not merely "the process started".
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
     volumes:
       - ./vol-node1:/app/data
 
   node2:
-    image: raftkv:latest
+    image: ${RAFTKV_IMAGE:-raftkv:latest}
     hostname: node2
     environment:
       - NODE_ID=node2
       - JOIN_ADDR=node1:6000
+      - RAFTKV_MGMT_TOKEN=${RAFTKV_MGMT_TOKEN:-dev-only-insecure-token}
+    depends_on:
+      node1:
+        # Without this, node2 starts its join retry loop against a node1 that is
+        # not up yet. cluster.Joiner retries 20 times so it recovered anyway, but
+        # the first several attempts were guaranteed to fail and the logs said so.
+        condition: service_healthy
     ports:
       - "8081:8080"
+      - "6001:6000"
+    restart: unless-stopped
+    healthcheck:
+      # /ready, not /health: this gates depends_on, and what a dependent node
+      # needs to know is whether node1 can actually serve a join — which is
+      # readiness, not merely "the process started".
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
     volumes:
       - ./vol-node2:/app/data
 
   node3:
-    image: raftkv:latest
+    image: ${RAFTKV_IMAGE:-raftkv:latest}
     hostname: node3
     environment:
       - NODE_ID=node3
       - JOIN_ADDR=node1:6000
+      - RAFTKV_MGMT_TOKEN=${RAFTKV_MGMT_TOKEN:-dev-only-insecure-token}
+    depends_on:
+      node1:
+        condition: service_healthy
     ports:
       - "8082:8080"
+      - "6002:6000"
+    restart: unless-stopped
+    healthcheck:
+      # /ready, not /health: this gates depends_on, and what a dependent node
+      # needs to know is whether node1 can actually serve a join — which is
+      # readiness, not merely "the process started".
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
     volumes:
       - ./vol-node3:/app/data

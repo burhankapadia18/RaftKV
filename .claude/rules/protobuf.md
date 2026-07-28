@@ -4,6 +4,16 @@
 
 - `RaftNode.Propose(Command) → ProposeResponse` — C++ → Go (port 50052)
 - `StateMachine.Apply(Command) → ApplyResponse` — Go → C++ (port 50051)
+- `StateMachine.GetSnapshot(SnapshotRequest) → stream SnapshotChunk` — Go → C++ (Phase 3)
+- `StateMachine.RestoreSnapshot(stream SnapshotChunk) → RestoreResponse` — Go → C++ (Phase 3)
+
+The two snapshot RPCs are **streaming**, so they need care the unary ones do not:
+a server-streaming response has no message left to carry an error field, which is
+why `GetSnapshot` reports failure as a non-OK gRPC status while `RestoreSnapshot`
+(client-streaming, with a real response message) follows the Phase 1 convention of
+`success=false` + a reason and `Status::OK`. Chunk payloads are the Phase 2
+base-file encoding at 64 KiB per chunk — the same bytes `kv.db` holds, so the
+snapshot format and the on-disk format can never drift apart.
 
 ## The `Command.data` convention
 
@@ -22,7 +32,9 @@ The KV payload travels as **opaque MsgPack bytes in `Command.data`**, end to end
    ```
 
    The `option go_package = "./pb";` in the proto places output in `go-sidecar/pb/`.
-4. Rebuild both sides and run the cluster smoke test (`docker build`, `docker-compose up -d`, `python test_client.py`).
+4. Rebuild both sides and run the unit tests (`cd go-sidecar && go test -race ./...`;
+   `cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON && cmake --build cpp-app/build && ctest --test-dir cpp-app/build --output-on-failure`),
+   then the cluster smoke test (`docker build`, `docker compose up -d`, `pytest tests/e2e -v`).
 
 ## Compatibility rules
 

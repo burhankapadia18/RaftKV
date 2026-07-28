@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	RaftNode_Propose_FullMethodName = "/consensus.RaftNode/Propose"
+	RaftNode_Read_FullMethodName    = "/consensus.RaftNode/Read"
 )
 
 // RaftNodeClient is the client API for RaftNode service.
@@ -27,6 +28,11 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type RaftNodeClient interface {
 	Propose(ctx context.Context, in *Command, opts ...grpc.CallOption) (*ProposeResponse, error)
+	// Phase 4 — a linearizable read. Served by the LEADER: it runs Barrier() +
+	// VerifyLeader() and only then reads its own local state machine, which is
+	// what makes the answer linearizable rather than merely recent. A follower
+	// forwards exactly once (see ReadRequest.forwarded).
+	Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error)
 }
 
 type raftNodeClient struct {
@@ -47,11 +53,26 @@ func (c *raftNodeClient) Propose(ctx context.Context, in *Command, opts ...grpc.
 	return out, nil
 }
 
+func (c *raftNodeClient) Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReadResponse)
+	err := c.cc.Invoke(ctx, RaftNode_Read_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftNodeServer is the server API for RaftNode service.
 // All implementations must embed UnimplementedRaftNodeServer
 // for forward compatibility.
 type RaftNodeServer interface {
 	Propose(context.Context, *Command) (*ProposeResponse, error)
+	// Phase 4 — a linearizable read. Served by the LEADER: it runs Barrier() +
+	// VerifyLeader() and only then reads its own local state machine, which is
+	// what makes the answer linearizable rather than merely recent. A follower
+	// forwards exactly once (see ReadRequest.forwarded).
+	Read(context.Context, *ReadRequest) (*ReadResponse, error)
 	mustEmbedUnimplementedRaftNodeServer()
 }
 
@@ -64,6 +85,9 @@ type UnimplementedRaftNodeServer struct{}
 
 func (UnimplementedRaftNodeServer) Propose(context.Context, *Command) (*ProposeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Propose not implemented")
+}
+func (UnimplementedRaftNodeServer) Read(context.Context, *ReadRequest) (*ReadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Read not implemented")
 }
 func (UnimplementedRaftNodeServer) mustEmbedUnimplementedRaftNodeServer() {}
 func (UnimplementedRaftNodeServer) testEmbeddedByValue()                  {}
@@ -104,6 +128,24 @@ func _RaftNode_Propose_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftNode_Read_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftNodeServer).Read(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftNode_Read_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftNodeServer).Read(ctx, req.(*ReadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftNode_ServiceDesc is the grpc.ServiceDesc for RaftNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -115,13 +157,20 @@ var RaftNode_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Propose",
 			Handler:    _RaftNode_Propose_Handler,
 		},
+		{
+			MethodName: "Read",
+			Handler:    _RaftNode_Read_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "consensus.proto",
 }
 
 const (
-	StateMachine_Apply_FullMethodName = "/consensus.StateMachine/Apply"
+	StateMachine_Apply_FullMethodName           = "/consensus.StateMachine/Apply"
+	StateMachine_Get_FullMethodName             = "/consensus.StateMachine/Get"
+	StateMachine_GetSnapshot_FullMethodName     = "/consensus.StateMachine/GetSnapshot"
+	StateMachine_RestoreSnapshot_FullMethodName = "/consensus.StateMachine/RestoreSnapshot"
 )
 
 // StateMachineClient is the client API for StateMachine service.
@@ -129,6 +178,21 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type StateMachineClient interface {
 	Apply(ctx context.Context, in *Command, opts ...grpc.CallOption) (*ApplyResponse, error)
+	// Phase 4 — a plain local read of the C++ store, with no consensus involved.
+	// This is deliberately NOT a linearizable read on its own: it is the second
+	// half of one, called by the sidecar only after that sidecar has verified it
+	// is still the leader. Calling it directly gives you exactly what
+	// GET ?consistency=local gives you.
+	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
+	// Phase 3 — raft snapshot lifecycle. The C++ engine owns the state, so it
+	// serves both directions: Go asks for a snapshot to hand to raft, and hands
+	// a snapshot back when raft restores one.
+	//
+	// Chunk payloads are the Phase 2 base-file encoding ("KVB1" + length-prefixed
+	// records) — one format for disk and wire, so a snapshot is byte-identical to
+	// what kv.db would contain.
+	GetSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error)
+	RestoreSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SnapshotChunk, RestoreResponse], error)
 }
 
 type stateMachineClient struct {
@@ -149,11 +213,68 @@ func (c *stateMachineClient) Apply(ctx context.Context, in *Command, opts ...grp
 	return out, nil
 }
 
+func (c *stateMachineClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetResponse)
+	err := c.cc.Invoke(ctx, StateMachine_Get_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *stateMachineClient) GetSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StateMachine_ServiceDesc.Streams[0], StateMachine_GetSnapshot_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SnapshotRequest, SnapshotChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_GetSnapshotClient = grpc.ServerStreamingClient[SnapshotChunk]
+
+func (c *stateMachineClient) RestoreSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SnapshotChunk, RestoreResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StateMachine_ServiceDesc.Streams[1], StateMachine_RestoreSnapshot_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SnapshotChunk, RestoreResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_RestoreSnapshotClient = grpc.ClientStreamingClient[SnapshotChunk, RestoreResponse]
+
 // StateMachineServer is the server API for StateMachine service.
 // All implementations must embed UnimplementedStateMachineServer
 // for forward compatibility.
 type StateMachineServer interface {
 	Apply(context.Context, *Command) (*ApplyResponse, error)
+	// Phase 4 — a plain local read of the C++ store, with no consensus involved.
+	// This is deliberately NOT a linearizable read on its own: it is the second
+	// half of one, called by the sidecar only after that sidecar has verified it
+	// is still the leader. Calling it directly gives you exactly what
+	// GET ?consistency=local gives you.
+	Get(context.Context, *GetRequest) (*GetResponse, error)
+	// Phase 3 — raft snapshot lifecycle. The C++ engine owns the state, so it
+	// serves both directions: Go asks for a snapshot to hand to raft, and hands
+	// a snapshot back when raft restores one.
+	//
+	// Chunk payloads are the Phase 2 base-file encoding ("KVB1" + length-prefixed
+	// records) — one format for disk and wire, so a snapshot is byte-identical to
+	// what kv.db would contain.
+	GetSnapshot(*SnapshotRequest, grpc.ServerStreamingServer[SnapshotChunk]) error
+	RestoreSnapshot(grpc.ClientStreamingServer[SnapshotChunk, RestoreResponse]) error
 	mustEmbedUnimplementedStateMachineServer()
 }
 
@@ -166,6 +287,15 @@ type UnimplementedStateMachineServer struct{}
 
 func (UnimplementedStateMachineServer) Apply(context.Context, *Command) (*ApplyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Apply not implemented")
+}
+func (UnimplementedStateMachineServer) Get(context.Context, *GetRequest) (*GetResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
+}
+func (UnimplementedStateMachineServer) GetSnapshot(*SnapshotRequest, grpc.ServerStreamingServer[SnapshotChunk]) error {
+	return status.Error(codes.Unimplemented, "method GetSnapshot not implemented")
+}
+func (UnimplementedStateMachineServer) RestoreSnapshot(grpc.ClientStreamingServer[SnapshotChunk, RestoreResponse]) error {
+	return status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
 }
 func (UnimplementedStateMachineServer) mustEmbedUnimplementedStateMachineServer() {}
 func (UnimplementedStateMachineServer) testEmbeddedByValue()                      {}
@@ -206,6 +336,42 @@ func _StateMachine_Apply_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StateMachine_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(StateMachineServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: StateMachine_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(StateMachineServer).Get(ctx, req.(*GetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _StateMachine_GetSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SnapshotRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(StateMachineServer).GetSnapshot(m, &grpc.GenericServerStream[SnapshotRequest, SnapshotChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_GetSnapshotServer = grpc.ServerStreamingServer[SnapshotChunk]
+
+func _StateMachine_RestoreSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(StateMachineServer).RestoreSnapshot(&grpc.GenericServerStream[SnapshotChunk, RestoreResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_RestoreSnapshotServer = grpc.ClientStreamingServer[SnapshotChunk, RestoreResponse]
+
 // StateMachine_ServiceDesc is the grpc.ServiceDesc for StateMachine service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -217,7 +383,22 @@ var StateMachine_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Apply",
 			Handler:    _StateMachine_Apply_Handler,
 		},
+		{
+			MethodName: "Get",
+			Handler:    _StateMachine_Get_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "GetSnapshot",
+			Handler:       _StateMachine_GetSnapshot_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "RestoreSnapshot",
+			Handler:       _StateMachine_RestoreSnapshot_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "consensus.proto",
 }

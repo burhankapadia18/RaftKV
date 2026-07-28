@@ -1,0 +1,138 @@
+# Nightly chaos run (R7.4).
+#
+# Not per-PR, deliberately. Ten minutes of fault injection is too slow for a pull
+# request, and its value is in REPETITION: a race that shows up one night in five
+# is exactly the kind this harness exists to find, and a single run per PR would
+# neither catch it nor be trusted when it did.
+#
+# The fast e2e suite stays on every PR and remains the gate. This is the one that
+# runs while nobody is watching, which is why it uploads everything needed to
+# reconstruct a failure after the fact.
+name: Chaos
+
+on:
+  schedule:
+    # 03:17 UTC. An odd minute on purpose: GitHub's scheduler queues everything
+    # submitted on the hour, and a job that starts 40 minutes late every night is
+    # a job whose logs never line up with anything.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Seconds of chaos'
+        required: false
+        default: '600'
+      seed:
+        description: 'RNG seed (same seed replays the same fault sequence)'
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  chaos:
+    name: Fault injection under load
+    runs-on: ubuntu-latest
+    # Duration is 10 minutes; the rest is build, readiness, the final invariant
+    # check, and enough headroom that a slow runner is not reported as a failure.
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      # The harness's own logic, before spending 10 minutes trusting it.
+      - name: Unit-test the journal fold
+        run: pytest tests/chaos/test_journal.py -v
+
+      - name: Build image
+        run: docker build -t raftkv:latest .
+
+      - name: Start cluster
+        run: |
+          # EXPORT as well as writing to GITHUB_ENV: GITHUB_ENV only affects LATER
+          # steps, so a token written here and used by a `docker compose up` in the
+          # same step would never reach it — compose would silently fall back to the
+          # publicly known dev token from docker-compose.yml. Same trap that bit the
+          # Phase 6 secure-cluster step.
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "RAFTKV_MGMT_TOKEN=$token" >> "$GITHUB_ENV"
+          export RAFTKV_MGMT_TOKEN="$token"
+          docker compose up -d
+
+      - name: Wait for cluster readiness
+        run: |
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+            for port in 8080 8081 8082; do
+              curl -sf --max-time 2 \
+                "http://localhost:${port}/get-val?key=__chaos_readiness__" \
+                >/dev/null 2>&1 || true
+              curl -sf --max-time 2 -o /dev/null \
+                "http://localhost:${port}/metrics" || ready=0
+            done
+            if [ "$ready" -eq 1 ]; then
+              for port in 6000 6001 6002; do
+                curl -sf --max-time 2 "http://localhost:${port}/status" 2>/dev/null \
+                  | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+              done
+            fi
+            if [ "$ready" -eq 1 ]; then
+              echo "Cluster is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Cluster did not become ready within 120s"
+          docker compose ps
+          exit 1
+
+      # The seed is the run number on a schedule, so consecutive nights explore
+      # different fault sequences rather than repeating one. A fixed seed would
+      # make three green nights much weaker evidence than they look.
+      - name: Run chaos
+        run: |
+          python tests/chaos/chaos.py \
+            --duration "${{ github.event.inputs.duration || '600' }}" \
+            --seed "${{ github.event.inputs.seed || github.run_number }}" \
+            --journal chaos-journal.jsonl
+
+      # always(), not failure(): a passing run's journal is what makes the next
+      # failure diagnosable, because it shows what normal looks like.
+      - name: Upload journal
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-journal
+          path: chaos-journal.jsonl
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload cluster logs
+        if: always()
+        run: docker compose logs --no-color --timestamps > chaos-cluster.log || true
+
+      - name: Attach cluster logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-cluster-logs
+          path: chaos-cluster.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

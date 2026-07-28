@@ -1,11 +1,72 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <map>
+#include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 namespace kvdb {
+
+/**
+ * @brief Percent-decode a URL component (R4.6).
+ *
+ * Returns nullopt on a malformed escape rather than guessing: "%zz" and a
+ * trailing "%4" are not "probably fine", they mean the client and this server
+ * disagree about the bytes being named, and silently keeping the literal text
+ * would let two different requests address the same key.
+ *
+ * @param in           The raw component.
+ * @param decode_plus  Treat '+' as a space. True for query strings (where
+ *                     application/x-www-form-urlencoded says so), false for
+ *                     path segments (where '+' is a literal plus). Getting this
+ *                     backwards silently corrupts any key containing a '+'.
+ * @return The decoded bytes, or nullopt if @p in contains a malformed escape.
+ */
+[[nodiscard]] inline std::optional<std::string>
+url_decode(const std::string &in, bool decode_plus = false) {
+  static constexpr auto hex_value = [](char c) -> int {
+    if (c >= '0' && c <= '9')
+      return c - '0';
+    if (c >= 'a' && c <= 'f')
+      return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+      return c - 'A' + 10;
+    return -1;
+  };
+
+  std::string out;
+  out.reserve(in.size());
+
+  for (size_t i = 0; i < in.size(); ++i) {
+    const char c = in[i];
+    if (c == '+' && decode_plus) {
+      out += ' ';
+      continue;
+    }
+    if (c != '%') {
+      out += c;
+      continue;
+    }
+
+    // Needs exactly two more characters, both hex. Checking the length first is
+    // what keeps this from reading past the end on a trailing "%".
+    if (i + 2 >= in.size()) {
+      return std::nullopt;
+    }
+    const int hi = hex_value(in[i + 1]);
+    const int lo = hex_value(in[i + 2]);
+    if (hi < 0 || lo < 0) {
+      return std::nullopt;
+    }
+    out += static_cast<char>((hi << 4) | lo);
+    i += 2;
+  }
+
+  return out;
+}
 
 /**
  * @brief Parsed HTTP request structure.
@@ -20,6 +81,14 @@ struct HttpRequest {
   std::string body;
   bool is_msgpack = false;
   int content_length = 0;
+
+  /**
+   * @brief Set when a Content-Length header was present but unparseable.
+   *
+   * @c content_length stays 0 in that case. The handler answers 400 rather
+   * than guessing at a body length.
+   */
+  bool bad_content_length = false;
 
   /**
    * @brief Parse query parameters from the query string.
@@ -102,7 +171,31 @@ public:
 
       if (lower_line.find("content-length:") != std::string::npos) {
         size_t colon = line.find(':');
-        request.content_length = std::stoi(line.substr(colon + 1));
+        // std::stoi throws on garbage ("abc"), on an empty value and on
+        // anything wider than an int. parse() must stay total: an exception
+        // here would unwind out of the accept loop and take the process down,
+        // which makes a single unauthenticated header a remote kill switch.
+        try {
+          request.content_length = std::stoi(line.substr(colon + 1));
+        } catch (const std::invalid_argument &) {
+          request.bad_content_length = true;
+          request.content_length = 0;
+        } catch (const std::out_of_range &) {
+          request.bad_content_length = true;
+          request.content_length = 0;
+        }
+        // A NEGATIVE length parses fine — std::stoi("-1") just returns -1 — so
+        // catching exceptions alone is not enough. HttpServer compares
+        // body.size() against static_cast<size_t>(content_length), and
+        // (size_t)-1 is 18446744073709551615: the body top-up loop would never
+        // be satisfied and would block in recv() forever. Because the accept
+        // loop is single-threaded, one client holding that socket open wedges
+        // the node's entire HTTP surface while the container still reports
+        // healthy. Verified against a live cluster before this guard existed.
+        if (request.content_length < 0) {
+          request.bad_content_length = true;
+          request.content_length = 0;
+        }
       }
 
       if (lower_line.find("content-type:") != std::string::npos &&

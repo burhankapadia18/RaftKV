@@ -102,11 +102,17 @@ set(KVDB_SOURCES
 )
 
 set(KVDB_HEADERS
+    src/common/log.hpp
+    src/common/metrics.hpp
     src/config/config.hpp
     src/commands/kv_command.hpp
+    src/storage/format.hpp
+    src/storage/atomic_file.hpp
+    src/storage/wal.hpp
     src/storage/kv_store.hpp
     src/raft/raft_client.hpp
     src/raft/state_machine.hpp
+    src/network/thread_pool.hpp
     src/network/http_request.hpp
     src/network/http_server.hpp
 )
@@ -140,3 +146,127 @@ endif()
 # --- 8. Installation (Optional) ---
 
 install(TARGETS kvdb_node DESTINATION bin)
+
+# --- 9. Unit Tests (opt-in) ---
+#
+# Everything below is guarded by KVDB_BUILD_TESTS so that the default
+# configuration (and therefore the Docker build) is completely unaffected.
+#   cmake -DKVDB_BUILD_TESTS=ON .. && make -j4 && ctest --output-on-failure
+
+option(KVDB_BUILD_TESTS "Build unit tests" OFF)
+
+if(KVDB_BUILD_TESTS)
+    # Prefer an already-installed GoogleTest (Debian: libgtest-dev) so CI can run
+    # offline; only fall back to fetching the sources when nothing is installed.
+    find_package(GTest QUIET)
+
+    if(TARGET GTest::gtest_main)
+        message(STATUS "Tests: using system GoogleTest")
+    else()
+        message(STATUS "Tests: GoogleTest not found, fetching 1.15.2")
+        include(FetchContent)
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            # The 1.15.2 release is tagged "v1.15.2" (the "release-" prefix was
+            # dropped after 1.12.1).
+            GIT_TAG v1.15.2
+            # A tag is a mutable ref, so without GIT_SHALLOW every build adds a
+            # full-history clone plus an update fetch. This branch is what the
+            # cpp-sanitizers CI job takes (it omits libgtest-dev on purpose), so
+            # keep it cheap.
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(googletest)
+    endif()
+
+    enable_testing()
+    include(GoogleTest)
+
+    # Listed explicitly on purpose - no globbing, so adding a file is a visible
+    # change to this list.
+    add_executable(kvdb_tests
+        tests/kv_command_test.cpp
+        tests/kv_store_test.cpp
+        tests/http_request_test.cpp
+        tests/state_machine_test.cpp
+        tests/http_handler_test.cpp
+        tests/format_test.cpp
+        tests/atomic_file_test.cpp
+        tests/wal_test.cpp
+        tests/thread_pool_test.cpp
+        tests/metrics_test.cpp
+    )
+
+    target_include_directories(kvdb_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${PROTO_BINARY_DIR}
+    )
+
+    # Phase 1 links consensus_proto: StateMachineService::Apply and
+    # KVHttpHandler are now under test, and both sit on the generated
+    # consensus.pb.h / grpc.pb.h types. The pure units (KVCommand,
+    # PersistentKVStore, HttpRequestParser) still need nothing but msgpack.
+    target_link_libraries(kvdb_tests PRIVATE
+        GTest::gtest_main
+        consensus_proto
+        msgpackc
+    )
+
+    # <filesystem> (used by the store tests for temp files) needs an explicit
+    # library only on GCC older than 9.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
+        target_link_libraries(kvdb_tests PRIVATE stdc++fs)
+    endif()
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kvdb_tests PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Wno-unused-parameter
+        )
+    endif()
+
+    # DISCOVERY_TIMEOUT defaults to 5s and discovery runs the freshly built
+    # binary at build time. Under ASan+UBSan on a loaded CI runner that can
+    # overrun, and the failure surfaces as a *build* error rather than a test
+    # failure, which is badly misleading. 120s costs nothing when it passes.
+    gtest_discover_tests(kvdb_tests DISCOVERY_TIMEOUT 120)
+endif()
+
+# --- 10. Fuzzers (opt-in, clang only) ------------------------------------
+#
+# Guarded exactly like KVDB_BUILD_TESTS so the default build and the Docker image
+# are untouched. libFuzzer is a clang feature; GCC has no equivalent, so this
+# refuses loudly rather than producing a target that silently does nothing.
+#
+#   cmake -S cpp-app -B build-fuzz -DKVDB_BUILD_FUZZERS=ON \
+#         -DCMAKE_CXX_COMPILER=clang++
+#   ./build-fuzz/fuzz_kv_command cpp-app/fuzz/corpus/kv_command -max_total_time=60
+
+option(KVDB_BUILD_FUZZERS "Build libFuzzer targets (clang only)" OFF)
+
+if(KVDB_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "KVDB_BUILD_FUZZERS requires clang (libFuzzer is a clang feature); "
+            "got ${CMAKE_CXX_COMPILER_ID}. Re-run with -DCMAKE_CXX_COMPILER=clang++")
+    endif()
+
+    # The sanitizers are not optional here. A fuzzer without ASan finds only hard
+    # crashes; the out-of-bounds reads these parsers could produce are exactly
+    # what ASan turns into a finding.
+    set(KVDB_FUZZ_FLAGS -fsanitize=fuzzer,address,undefined
+                        -fno-omit-frame-pointer -g)
+
+    foreach(target fuzz_kv_command fuzz_http_parser)
+        add_executable(${target} fuzz/${target}.cpp)
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_options(${target} PRIVATE ${KVDB_FUZZ_FLAGS})
+        target_link_options(${target} PRIVATE ${KVDB_FUZZ_FLAGS})
+        target_link_libraries(${target} PRIVATE msgpackc)
+    endforeach()
+endif()

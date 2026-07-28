@@ -1,0 +1,3 @@
+GET /kv/hello%20world?consistency=linearizable HTTP/1.1
+Host: x
+

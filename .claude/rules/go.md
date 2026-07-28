@@ -25,9 +25,26 @@ Project-specific rules for `go-sidecar/`. These extend the general Go guidance w
 
 ## Raft specifics
 
-- `raftnode.New` uses the same BoltDB store for log and stable store, and `NewDiscardSnapshotStore()` — snapshots are intentionally not implemented (`DummySnapshot`). Don't add snapshot logic as a drive-by; it requires a C++-side state export and is its own project.
+- `raftnode.New` uses the same BoltDB store for log and stable store, and a real `raft.NewFileSnapshotStore` (Phase 3). Snapshot tunables live in `internal/config` — `SnapshotInterval`, `SnapshotThreshold`, `TrailingLogs`.
+- **`TrailingLogs` is what actually bounds the log.** Raft truncates to `snapshot_index - TrailingLogs`, so leaving the default (10240) means the log never shrinks no matter how often the node snapshots. A test that only lowers the threshold will snapshot and still observe an un-truncated log.
+- **`CppFSM.Snapshot()` captures the state eagerly, and that is load-bearing.** Raft calls `Snapshot()` on the FSM goroutine with no `Apply` in flight, then may call `Persist()` *later, concurrently with subsequent Applies*. Streaming from the live C++ store inside `Persist()` would produce a snapshot labelled index N whose contents are the state at some later index N+k. This store is idempotent, so the cluster would re-converge on replay and the bug would pass every test while being wrong in general — do not "optimize" the buffering away without replacing it with a real point-in-time read. The cost is the whole store in memory during a snapshot; that is a known scaling limit, not an oversight.
+- `Persist()` must `sink.Cancel()` on any error, never `sink.Close()`. A half-written snapshot that was closed is a corrupt snapshot raft will happily try to restore later.
+- `CppFSM.Restore()` must return an error when the C++ side reports failure. A node that cannot restore must not serve: returning nil would leave it claiming state it does not have.
+- **Use `raft-boltdb/v2` (bbolt), not v1.** The v1 module pulls `github.com/boltdb/bolt`, which is unmaintained and trips Go's `checkptr` instrumentation — and `checkptr` is enabled by `-race`, which CI runs. Any test that successfully opens a v1 BoltDB store dies with "converted pointer straddles multiple allocations". bbolt shares the on-disk format, so this is a drop-in.
 - `FSM.Apply` runs on every node for every committed entry and must stay deterministic and side-effect-free apart from the C++ call.
 - Only the leader can `Apply`; `rpc.Server.Propose` surfaces `ErrNotLeader` as a failed `ProposeResponse` rather than a gRPC error — keep that contract, the C++ client checks `reply.success()`.
+
+## TLS and auth (Phase 6 — do not regress this)
+
+- **Build every `*tls.Config` through `internal/tlsconfig`.** A listener with a cert and key but no `ClientCAs` handshakes with anyone; it looks like mutual TLS and authenticates nobody. One place, under test, is the only defence against that.
+- `ServerConfig(m, requireClientCert)` — the boolean is deliberate. The raft transport passes `true`; the management listener passes `false`, because probes and Prometheus hold no certificate and are authenticated by the bearer token instead. Never infer it from whether a CA was supplied.
+- `ClientConfig` sets `RootCAs` (replacing the system pool, on purpose — a peer signed by a public CA is not a cluster peer) and never `InsecureSkipVerify`. Per-destination verification comes from `WithServerName`, which **clones**: raft dials peers concurrently, and mutating a shared config is a data race.
+- **Never fall back to plaintext on a TLS error.** `Config.Validate()` is called by `main` before anything binds; `NewJoiner` and `HTTPForwarder.WithTLS` return errors. A join or relay that degraded to HTTP would put the cluster-admin token on the wire in clear.
+- **`hostPortAddr` in `raftnode` is load-bearing.** The TLS transport advertises the configured *name*; the plaintext one advertises a resolved IP because `raft.NewTCPTransport` demands a `*net.TCPAddr`. Collapsing the two reintroduces a bug that forms a healthy cluster and breaks permanently after the first election (`x509: certificate is valid for ..., not <container IP>`). The comment on the type is the full account.
+- The bearer token comes from `RAFTKV_MGMT_TOKEN`, never a flag value in argv — `ps` is readable by any local user. An empty token **disables** `/join` and `/remove` (403); it must never mean "open".
+- `internal/testcerts` is a non-test package imported only from `_test.go` files, because Go cannot share a test helper across packages otherwise. It must not import `internal/tlsconfig` — that would make `tlsconfig`'s in-package tests an import cycle.
+
+Verification for anything here: `go test -race ./internal/tlsconfig/ ./internal/raftnode/ ./internal/management/ ./internal/cluster/`, then the real deployment — `pytest tests/e2e -m requires_secure`. A unit test cannot prove that a compose file publishes the ports it claims.
 
 ## Checks
 
