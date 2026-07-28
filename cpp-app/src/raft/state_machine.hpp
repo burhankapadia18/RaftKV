@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <iostream>
 #include <memory>
@@ -14,6 +15,8 @@
 #include <grpcpp/grpcpp.h>
 
 #include "../commands/kv_command.hpp"
+#include "../common/log.hpp"
+#include "../common/metrics.hpp"
 #include "../storage/kv_store.hpp"
 
 namespace kvdb {
@@ -103,8 +106,9 @@ restore_from_payload(IKVStore &store, const std::string &payload) {
     state = deserialize_state(payload);
   } catch (const std::exception &e) {
     const std::string reason = std::string("invalid snapshot: ") + e.what();
-    std::cerr << "[StateMachine] Refused snapshot of " << payload.size()
-              << " bytes: " << reason << std::endl;
+    log::warn(
+        log::kComponentStateMachine, "refused snapshot",
+        {log::field("bytes", payload.size()), log::field("reason", reason)});
     return reason;
   }
 
@@ -119,12 +123,13 @@ restore_from_payload(IKVStore &store, const std::string &payload) {
   } catch (const std::exception &e) {
     const std::string reason =
         std::string("could not install snapshot: ") + e.what();
-    std::cerr << "[StateMachine] " << reason << std::endl;
+    log::error(log::kComponentStateMachine, reason);
     return reason;
   }
 
-  std::cout << "[StateMachine] Restored snapshot: " << entries << " entries ("
-            << payload.size() << " bytes)" << std::endl;
+  log::info(
+      log::kComponentStateMachine, "restored snapshot",
+      {log::field("entries", entries), log::field("bytes", payload.size())});
   return std::nullopt;
 }
 
@@ -173,6 +178,25 @@ public:
   grpc::Status Apply(grpc::ServerContext *context,
                      const consensus::Command *request,
                      consensus::ApplyResponse *reply) override {
+    // R5.4: applies are timed here, on the C++ side of the boundary. The Go
+    // side times the same call from outside; the difference between the two is
+    // the gRPC round trip, which is worth being able to see separately.
+    const auto started = std::chrono::steady_clock::now();
+    struct ApplyTimer {
+      std::chrono::steady_clock::time_point started;
+      ~ApplyTimer() {
+        metrics::Registry::global()
+            .histogram("raftkv_apply_duration_seconds",
+                       "Time to apply one committed entry to the local store.")
+            .observe(std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - started)
+                         .count());
+        metrics::Registry::global()
+            .counter("raftkv_apply_total", "Committed entries applied locally.")
+            .inc();
+      }
+    } timer{started};
+
     try {
       // Deserialize the command from MsgPack
       KVCommand cmd = KVCommand::from_msgpack(request->data().data(),
@@ -184,14 +208,15 @@ public:
       // reason attached.
       const std::optional<std::string> reason = cmd.validation_error();
       if (reason.has_value()) {
-        std::cerr << "[StateMachine] Rejected: " << *reason << std::endl;
+        log::warn(log::kComponentStateMachine, "rejected command",
+                  {log::field("reason", *reason)});
         reply->set_success(false);
         reply->set_error(*reason);
         return grpc::Status::OK;
       }
 
-      std::cout << "[StateMachine] Applied: " << cmd.op << " " << cmd.key
-                << std::endl;
+      log::debug(log::kComponentStateMachine, "applied",
+                 {log::field("op", cmd.op), log::field("key", cmd.key)});
 
       // Apply the operation to the store
       switch (cmd.operation_type()) {
@@ -226,8 +251,8 @@ public:
       // FSM routes transport errors down its "THIS REPLICA MAY NOW BE
       // DIVERGED" branch, so every bad-msgpack write any client sent raised a
       // false divergence alarm on all three nodes. Nothing was diverged.
-      std::cerr << "[StateMachine] Rejected: malformed payload: " << e.what()
-                << std::endl;
+      log::warn(log::kComponentStateMachine, "rejected malformed payload",
+                {log::field("error", e.what())});
       reply->set_success(false);
       reply->set_error(std::string("malformed payload: ") + e.what());
       return grpc::Status::OK;
@@ -299,7 +324,8 @@ public:
     try {
       payload = serialize_state(store_.snapshot_state());
     } catch (const std::exception &e) {
-      std::cerr << "[StateMachine] Snapshot failed: " << e.what() << std::endl;
+      log::error(log::kComponentStateMachine, "snapshot failed",
+                 {log::field("error", e.what())});
       return grpc::Status(grpc::StatusCode::INTERNAL,
                           std::string("snapshot serialization failed: ") +
                               e.what());
@@ -321,14 +347,15 @@ public:
         });
 
     if (!complete) {
-      std::cerr << "[StateMachine] Snapshot stream aborted after " << sent
-                << " of " << payload.size() << " bytes" << std::endl;
+      log::warn(log::kComponentStateMachine, "snapshot stream aborted",
+                {log::field("sent_bytes", sent),
+                 log::field("total_bytes", payload.size())});
       return grpc::Status(grpc::StatusCode::CANCELLED,
                           "snapshot stream aborted before completion");
     }
 
-    std::cout << "[StateMachine] Snapshot sent: " << payload.size() << " bytes"
-              << std::endl;
+    log::info(log::kComponentStateMachine, "snapshot sent",
+              {log::field("bytes", payload.size())});
     return grpc::Status::OK;
   }
 
@@ -413,7 +440,8 @@ public:
     builder.RegisterService(&service_);
 
     server_ = builder.BuildAndStart();
-    std::cout << "[gRPC] StateMachine listening on " << address_ << std::endl;
+    log::info(log::kComponentStateMachine, "gRPC listening",
+              {log::field("address", address_)});
   }
 
   /**

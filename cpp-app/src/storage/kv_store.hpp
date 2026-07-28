@@ -17,6 +17,7 @@
 #include <msgpack.hpp>
 
 #include "../commands/kv_command.hpp"
+#include "../common/log.hpp"
 #include "../config/config.hpp"
 #include "atomic_file.hpp"
 #include "format.hpp"
@@ -309,6 +310,25 @@ public:
   }
 
   /**
+   * @brief Number of keys currently held (R5.4 gauge).
+   *
+   * Deliberately NOT on IKVStore: it exists for observability, and widening the
+   * storage interface for it would force every test fake to implement it too.
+   * main.cpp holds the concrete type, which is all the metrics registration
+   * needs.
+   */
+  [[nodiscard]] size_t key_count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return store_.size();
+  }
+
+  /** @brief Current WAL size in bytes (R5.4 gauge). */
+  [[nodiscard]] size_t wal_size_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return wal_.size_bytes();
+  }
+
+  /**
    * @brief Check if a key exists in the store.
    */
   [[nodiscard]] bool contains(const std::string &key) const override {
@@ -502,11 +522,11 @@ private:
       }
       if (!apply_payload_unlocked(payload)) {
         stopped = true;
-        std::cerr << "[Store] WAL record " << index << " in "
-                  << wal_path_for(db_path_)
-                  << " is not a valid command; stopping replay there and "
-                     "dropping the rest"
-                  << std::endl;
+        log::warn(log::kComponentStore,
+                  "WAL record is not a valid command; stopping replay there "
+                  "and dropping the rest",
+                  {log::field("record_index", index),
+                   log::field("wal_path", wal_path_for(db_path_))});
         return;
       }
       ++index;

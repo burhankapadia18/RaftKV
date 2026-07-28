@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -13,6 +14,8 @@
 #include <unistd.h>
 
 #include "../commands/kv_command.hpp"
+#include "../common/log.hpp"
+#include "../common/metrics.hpp"
 #include "../config/config.hpp"
 #include "../raft/raft_client.hpp"
 #include "../storage/kv_store.hpp"
@@ -222,6 +225,67 @@ public:
    * gets 415 instead of silently becoming "no such route".
    */
   [[nodiscard]] HttpResponse handle(const HttpRequest &request) const {
+    // R5.4: every request is counted and timed, by ROUTE and status class.
+    // Route rather than raw path: /kv/{key} would otherwise create one series
+    // per key, which is the classic way to blow up a Prometheus instance.
+    const auto started = std::chrono::steady_clock::now();
+    const std::string route = route_label(request);
+    const HttpResponse response = route_request(request);
+
+    const double elapsed = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - started)
+                               .count();
+    metrics::Registry::global()
+        .histogram("raftkv_http_request_duration_seconds",
+                   "Time to serve one HTTP request.", {{"route", route}})
+        .observe(elapsed);
+    metrics::Registry::global()
+        .counter(
+            "raftkv_http_requests_total",
+            "HTTP requests served, by route and status class.",
+            {{"route", route}, {"status", status_class(response.status_code)}})
+        .inc();
+    return response;
+  }
+
+private:
+  /**
+   * @brief The route this request matched, for use as a metric label.
+   *
+   * Deliberately NOT the path: /kv/{key} carries the key, and labelling by it
+   * would create an unbounded number of time series — one per key ever written.
+   * Unrecognized paths collapse to "other" for the same reason.
+   */
+  [[nodiscard]] static std::string route_label(const HttpRequest &request) {
+    if (request.path.rfind(kKvPathPrefix, 0) == 0) {
+      return request.method + " /kv/{key}";
+    }
+    if (request.path == "/insert-val" || request.path == "/get-val" ||
+        request.path == "/metrics") {
+      return request.method + " " + request.path;
+    }
+    return "other";
+  }
+
+  /** @brief 2xx/4xx/5xx, which is the granularity worth alerting on. */
+  [[nodiscard]] static std::string status_class(int status_code) {
+    return std::to_string(status_code / 100) + "xx";
+  }
+
+public:
+  /** @brief Routing, separated from the instrumentation wrapper above. */
+  [[nodiscard]] HttpResponse route_request(const HttpRequest &request) const {
+    // R5.4: the scrape endpoint. Before the others because it must work even
+    // when the store or the sidecar does not.
+    if (request.method == "GET" && request.path == "/metrics") {
+      HttpResponse response =
+          HttpResponse::ok(metrics::Registry::global().render());
+      // Prometheus' own content type; text/plain would also be accepted but
+      // being explicit is what makes promtool happy.
+      response.content_type = "text/plain; version=0.0.4; charset=utf-8";
+      return response;
+    }
+
     // R4.6: the REST surface. Checked before the legacy routes because it is
     // the one clients should be using.
     if (request.path.rfind(kKvPathPrefix, 0) == 0) {
@@ -525,8 +589,9 @@ public:
    * This method blocks indefinitely, accepting and handling connections.
    */
   void run() {
-    std::cout << "[HTTP] Server listening on port " << port_ << " with "
-              << pool_.size() << " worker threads" << std::endl;
+    log::info(log::kComponentHttp, "listening",
+              {log::field("port", static_cast<long long>(port_)),
+               log::field("workers", pool_.size())});
 
     while (!stopping_.load(std::memory_order_relaxed)) {
       const int client_socket = accept(server_fd_, nullptr, nullptr);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 
 // WalSyncMode is defined by the component it configures (storage/wal.hpp) so
@@ -65,6 +66,20 @@ struct DurabilityOptions {
  * reference.
  */
 struct Config {
+  /** @brief NODE_ID from the environment, or "unknown". */
+  [[nodiscard]] static std::string default_node_id() {
+    const char *value = std::getenv("NODE_ID");
+    return (value != nullptr && *value != '\0') ? std::string(value)
+                                                : std::string("unknown");
+  }
+
+  /** @brief LOG_LEVEL from the environment, or "info". */
+  [[nodiscard]] static std::string default_log_level() {
+    const char *value = std::getenv("LOG_LEVEL");
+    return (value != nullptr && *value != '\0') ? std::string(value)
+                                                : std::string("info");
+  }
+
   std::string db_file = "kv.db";
   std::string grpc_port = "50051";
   std::string sidecar_port = "50052";
@@ -72,6 +87,18 @@ struct Config {
 
   /** @brief Durability policy handed to the store (spec R2.8). */
   DurabilityOptions durability{};
+
+  /**
+   * @brief Node identity, stamped on every log line (R5.2).
+   *
+   * Defaults to the NODE_ID environment variable so entrypoint.sh does not need
+   * another positional argument; the compose file already sets it for the
+   * sidecar.
+   */
+  std::string node_id = default_node_id();
+
+  /** @brief Log threshold: debug|info|warn|error. */
+  std::string log_level = default_log_level();
 
   /** @brief Inbound HTTP request bounds (R4.9). */
   RequestLimits limits{};

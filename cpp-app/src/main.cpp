@@ -21,6 +21,8 @@
 #include <thread>
 #include <unistd.h>
 
+#include "common/log.hpp"
+#include "common/metrics.hpp"
 #include "config/config.hpp"
 #include "network/http_server.hpp"
 #include "raft/raft_client.hpp"
@@ -93,15 +95,29 @@ int main(int argc, char *argv[]) {
     // 1. Parse configuration
     Config config = Config::from_args(argc, argv);
 
-    std::cout << "=== KVDB Raft Node ===" << std::endl;
-    std::cout << "HTTP Port:    " << config.http_port << std::endl;
-    std::cout << "gRPC Port:    " << config.grpc_port << std::endl;
-    std::cout << "Sidecar Port: " << config.sidecar_port << std::endl;
-    std::cout << "DB File:      " << config.db_file << std::endl;
-    std::cout << "======================" << std::endl;
-
     // 2. Initialize the persistent key-value store
     PersistentKVStore store(config.db_file, config.durability);
+
+    // R5.2: configure the JSON logger before anything logs through it.
+    log::Logger::configure(config.node_id, log::parse_level(config.log_level));
+    log::info(
+        log::kComponentMain, "starting",
+        {log::field("http_port", static_cast<long long>(config.http_port)),
+         log::field("grpc_port", config.grpc_port),
+         log::field("sidecar_port", config.sidecar_port),
+         log::field("db_file", config.db_file)});
+
+    // R5.4: store gauges, read at SCRAPE time rather than snapshotted, so a
+    // dashboard cannot show a stale key count. Registered here because main
+    // holds the concrete PersistentKVStore — nothing was added to IKVStore for
+    // this.
+    metrics::Registry::global().gauge_fn(
+        "raftkv_store_keys", "Keys currently held in the local store.",
+        [&store]() { return static_cast<double>(store.key_count()); });
+    metrics::Registry::global().gauge_fn(
+        "raftkv_wal_size_bytes",
+        "Current size of the write-ahead log in bytes.",
+        [&store]() { return static_cast<double>(store.wal_size_bytes()); });
 
     // 3. Start the gRPC StateMachine server in a background thread
     StateMachineServer grpc_server(config.grpc_address(), store);
@@ -122,8 +138,8 @@ int main(int argc, char *argv[]) {
     // the worker pool join, gRPC's Shutdown() — is unsafe in a signal handler
     // and perfectly fine here.
     spawn_signal_waiter(shutdown_mask, [&](int signal_number) {
-      std::cout << "[main] received signal " << signal_number
-                << ", shutting down gracefully" << std::endl;
+      log::info(log::kComponentMain, "shutdown signal received",
+                {log::field("signal", static_cast<long long>(signal_number))});
       // Unblocks the accept loop so run() returns and main unwinds.
       http_server.request_stop();
       grpc_server.shutdown();
@@ -131,16 +147,17 @@ int main(int argc, char *argv[]) {
 
     http_server.run();
 
-    std::cout << "[main] HTTP server stopped; draining workers" << std::endl;
+    log::info(log::kComponentMain, "http stopped, draining workers");
     // The joining half. request_stop() only unblocked accept(); this is what
     // waits for in-flight connections to be answered.
     http_server.stop();
-    std::cout << "[main] Shutdown complete" << std::endl;
+    log::info(log::kComponentMain, "shutdown complete");
 
     return 0;
 
   } catch (const std::exception &e) {
-    std::cerr << "Fatal error: " << e.what() << std::endl;
+    log::error(log::kComponentMain, "fatal error",
+               {log::field("error", e.what())});
     return 1;
   }
 }

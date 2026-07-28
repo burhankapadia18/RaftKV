@@ -102,6 +102,8 @@ set(KVDB_SOURCES
 )
 
 set(KVDB_HEADERS
+    src/common/log.hpp
+    src/common/metrics.hpp
     src/config/config.hpp
     src/commands/kv_command.hpp
     src/storage/format.hpp
@@ -194,6 +196,7 @@ if(KVDB_BUILD_TESTS)
         tests/atomic_file_test.cpp
         tests/wal_test.cpp
         tests/thread_pool_test.cpp
+        tests/metrics_test.cpp
     )
 
     target_include_directories(kvdb_tests PRIVATE
