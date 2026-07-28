@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"my-raft-sidecar/internal/backend"
 	"my-raft-sidecar/internal/cluster"
@@ -16,6 +17,11 @@ import (
 	"my-raft-sidecar/internal/raftnode"
 	"my-raft-sidecar/internal/rpc"
 )
+
+// mgmtForwardTimeout bounds a relayed /join or /remove. The original caller is
+// blocked while we wait, so an unbounded relay would turn one slow peer into a
+// stalled request on whichever node received it.
+const mgmtForwardTimeout = 10 * time.Second
 
 func main() {
 	// Parse configuration
@@ -46,8 +52,17 @@ func main() {
 		}
 	}
 
-	// Start management server
-	mgmtServer := management.NewServer(node, cfg.MgmtPort)
+	// peers.Resolver is the single place that knows a peer's RaftNode gRPC and
+	// management API sit on the same host as its Raft transport, at different
+	// ports. Both the write-forwarding path (R4.1) and the join/remove
+	// forwarding path (R4.12) resolve through it.
+	resolver := peers.New(cfg.PeerRPCPort, cfg.MgmtPort)
+
+	// Start management server. The forwarder lets /join and /remove be sent to
+	// any node: a follower relays them to the leader rather than failing the
+	// leader-only Raft call where it landed.
+	mgmtServer := management.NewServer(node, cfg.MgmtPort, resolver,
+		management.NewHTTPForwarder(mgmtForwardTimeout))
 	mgmtServer.Start()
 
 	// Join cluster if requested
@@ -61,10 +76,7 @@ func main() {
 	}
 
 	// Start gRPC server. The forwarder is what lets a write land on any node
-	// (R4.1): a follower relays the proposal to the leader instead of refusing
-	// it. peers.Resolver holds the one place that knows a peer's RaftNode gRPC
-	// sits on the same host as its Raft transport, at a different port.
-	resolver := peers.New(cfg.PeerRPCPort, cfg.MgmtPort)
+	// (R4.1): a follower relays the proposal to the leader instead of refusing it.
 	forwarder := rpc.NewForwarder(resolver)
 	defer forwarder.Close()
 

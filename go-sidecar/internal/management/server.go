@@ -25,6 +25,10 @@ type RaftControl interface {
 	LeaderAddr() string
 	AddVoter(id, address string) error
 
+	// RemoveServer drops a peer from the cluster configuration. Like AddVoter
+	// it is leader-only, which is what makes the forwarding below necessary.
+	RemoveServer(id string) error
+
 	// Stats returns Raft's own runtime counters as decimal strings (the shape
 	// of raft.Raft.Stats()). Keeping the library's map shape here, instead of a
 	// struct, is what avoids a shared type that raftnode would have to import
@@ -42,13 +46,24 @@ type Server struct {
 	node       RaftControl
 	httpServer *http.Server
 	port       string
+
+	// resolver and forwarder are what let /join and /remove work on any node
+	// (R4.12). Both may be nil, which disables forwarding and restores the
+	// older behavior of failing the leader-only call where it landed — that
+	// keeps a half-configured server explicit rather than silently degraded.
+	resolver  PeerResolver
+	forwarder Forwarder
 }
 
 // NewServer creates a new management server.
-func NewServer(node RaftControl, port string) *Server {
+//
+// resolver and forwarder are optional; pass nil for both to disable relaying.
+func NewServer(node RaftControl, port string, resolver PeerResolver, forwarder Forwarder) *Server {
 	return &Server{
-		node: node,
-		port: port,
+		node:      node,
+		port:      port,
+		resolver:  resolver,
+		forwarder: forwarder,
 	}
 }
 
@@ -56,6 +71,7 @@ func NewServer(node RaftControl, port string) *Server {
 func (s *Server) Start() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/join", s.handleJoin)
+	mux.HandleFunc("/remove", s.handleRemove)
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/health", s.handleHealth)
 
@@ -100,6 +116,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Received join request for %s at %s", peerID, peerAddress)
 
+	if s.relayToLeader(w, r, "/join") {
+		return
+	}
+
 	if err := s.node.AddVoter(peerID, peerAddress); err != nil {
 		log.Printf("Failed to add voter: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -108,6 +128,89 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Joined successfully"))
+}
+
+// handleRemove drops a peer from the cluster configuration (R4.12).
+func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	peerID := r.URL.Query().Get("peerID")
+	if peerID == "" {
+		http.Error(w, "Missing peerID", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Received remove request for %s", peerID)
+
+	if s.relayToLeader(w, r, "/remove") {
+		return
+	}
+
+	if err := s.node.RemoveServer(peerID); err != nil {
+		log.Printf("Failed to remove server: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Removed successfully"))
+}
+
+// relayToLeader forwards a leader-only request and reports whether it answered.
+//
+// Returns true when it has fully handled the response — either by relaying the
+// leader's answer or by refusing — so the caller must return immediately.
+// Returns false when this node is the leader and should do the work itself.
+//
+// Every refusal path answers 503 rather than 500: none of them mean the request
+// was wrong, they mean "not here, not now", which is the same thing the write
+// path tells a client when it cannot find a leader.
+func (s *Server) relayToLeader(w http.ResponseWriter, r *http.Request, path string) bool {
+	if s.node.IsLeader() {
+		return false
+	}
+
+	// Already relayed once: answer truthfully instead of bouncing it onward.
+	// Leadership moved between the first hop and this one.
+	if r.Header.Get(ForwardedHeader) != "" {
+		log.Printf("Refusing already-forwarded %s: this node is not the leader", path)
+		http.Error(w,
+			"not the leader, and this request was already forwarded once",
+			http.StatusServiceUnavailable)
+		return true
+	}
+
+	if s.resolver == nil || s.forwarder == nil {
+		http.Error(w, "not the leader and forwarding is not configured",
+			http.StatusServiceUnavailable)
+		return true
+	}
+
+	mgmtAddr, err := s.resolver.MgmtAddr(s.node.LeaderAddr())
+	if err != nil {
+		log.Printf("Cannot forward %s: %v", path, err)
+		http.Error(w, "not the leader: "+err.Error(),
+			http.StatusServiceUnavailable)
+		return true
+	}
+
+	log.Printf("Forwarding %s to the leader at %s", path, mgmtAddr)
+	result, err := s.forwarder.Forward(r.Context(), mgmtAddr, path, r.URL.RawQuery)
+	if err != nil {
+		log.Printf("Forwarding %s to %s failed: %v", path, mgmtAddr, err)
+		http.Error(w, "forwarding to the leader failed: "+err.Error(),
+			http.StatusServiceUnavailable)
+		return true
+	}
+
+	// Relay the leader's answer verbatim: the caller asked for a cluster
+	// change, and what the leader said about it is the real answer.
+	w.WriteHeader(result.Status)
+	w.Write(result.Body)
+	return true
 }
 
 // statusResponse is the /status payload.

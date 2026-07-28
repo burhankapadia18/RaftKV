@@ -198,6 +198,16 @@ func (n *Node) AddVoter(id, address string) error {
 	return future.Error()
 }
 
+// RemoveServer drops a peer from the cluster configuration.
+//
+// Leader-only, like AddVoter: on a follower the future fails with
+// raft.ErrNotLeader, which is why management forwards the request rather than
+// calling this on whichever node happened to receive it.
+func (n *Node) RemoveServer(id string) error {
+	future := n.Raft.RemoveServer(raft.ServerID(id), 0, 0)
+	return future.Error()
+}
+
 // Apply proposes a command to the Raft cluster and waits for it to be applied
 // locally.
 //

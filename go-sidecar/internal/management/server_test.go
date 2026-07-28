@@ -69,8 +69,11 @@ type fakeRaftControl struct {
 	firstLogIndex uint64
 	firstLogErr   error
 
-	mu            sync.Mutex
-	addVoterCalls []addVoterCall
+	removeServerErr error
+
+	mu              sync.Mutex
+	addVoterCalls   []addVoterCall
+	removeServerIDs []string
 }
 
 var _ RaftControl = (*fakeRaftControl)(nil)
@@ -101,6 +104,20 @@ func raftStats(lastLog, applied, commit, lastSnapshot uint64) map[string]string 
 		// the map.
 		"state": "Leader",
 	}
+}
+
+func (f *fakeRaftControl) RemoveServer(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeServerIDs = append(f.removeServerIDs, id)
+	return f.removeServerErr
+}
+
+// removeServerIDsSnapshot returns a copy, safe to read from any goroutine.
+func (f *fakeRaftControl) removeServerIDsSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.removeServerIDs...)
 }
 
 func (f *fakeRaftControl) AddVoter(id, address string) error {
@@ -223,8 +240,10 @@ func TestHandleJoin(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			node := &fakeRaftControl{addVoterErr: tc.addVoterErr}
-			server := NewServer(node, "6000")
+			// isLeader: only the leader does the work itself. Since R4.12 a
+			// follower forwards instead, which TestJoinForwarding covers.
+			node := &fakeRaftControl{isLeader: true, addVoterErr: tc.addVoterErr}
+			server := NewServer(node, "6000", nil, nil)
 
 			rec := httptest.NewRecorder()
 			server.handleJoin(rec, httptest.NewRequest(tc.method, tc.target, nil))
@@ -365,7 +384,7 @@ func TestHandleStatus(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(tc.node, "6000")
+			server := NewServer(tc.node, "6000", nil, nil)
 
 			rec := httptest.NewRecorder()
 			server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -390,7 +409,7 @@ func TestHandleStatus(t *testing.T) {
 			stats:         raftStats(5, 5, 5, 0),
 			firstLogIndex: 1,
 		}
-		server := NewServer(node, "6000")
+		server := NewServer(node, "6000", nil, nil)
 
 		rec := httptest.NewRecorder()
 		server.handleStatus(rec, httptest.NewRequest(http.MethodDelete, "/status", nil))
@@ -409,7 +428,7 @@ func TestHandleStatus(t *testing.T) {
 	// PIN: the log_store_error field is absent, not empty, on the happy path.
 	t.Run("log_store_error is omitted when the read succeeds", func(t *testing.T) {
 		node := &fakeRaftControl{stats: raftStats(1, 1, 1, 0), firstLogIndex: 1}
-		server := NewServer(node, "6000")
+		server := NewServer(node, "6000", nil, nil)
 
 		rec := httptest.NewRecorder()
 		server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -448,7 +467,7 @@ func TestStatusBodyMatchesCIReadinessProbe(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			node := &fakeRaftControl{leaderAddr: tc.leaderAddr, stats: raftStats(3, 3, 3, 0)}
-			server := NewServer(node, "6000")
+			server := NewServer(node, "6000", nil, nil)
 
 			rec := httptest.NewRecorder()
 			server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -471,7 +490,7 @@ func TestStatusIsValidJSON(t *testing.T) {
 		stats:         raftStats(9000, 8999, 9000, 8500),
 		firstLogIndex: 8001,
 	}
-	server := NewServer(node, "6000")
+	server := NewServer(node, "6000", nil, nil)
 
 	rec := httptest.NewRecorder()
 	server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -543,7 +562,7 @@ func TestHandleHealth(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			server := NewServer(tc.node, "6000")
+			server := NewServer(tc.node, "6000", nil, nil)
 
 			rec := httptest.NewRecorder()
 			server.handleHealth(rec, httptest.NewRequest(tc.method, "/health", nil))
@@ -561,7 +580,7 @@ func TestHandleHealth(t *testing.T) {
 // TestStopWithoutStart covers the nil-httpServer branch: Stop must be safe on a
 // server that was never started (the shutdown path runs even if Start failed).
 func TestStopWithoutStart(t *testing.T) {
-	server := NewServer(&fakeRaftControl{}, "6000")
+	server := NewServer(&fakeRaftControl{}, "6000", nil, nil)
 
 	if err := server.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop() on a never-started server: %v", err)
@@ -611,7 +630,7 @@ func TestStartServesAndStops(t *testing.T) {
 		firstLogIndex: 8001,
 	}
 	port := freePort(t)
-	server := NewServer(node, port)
+	server := NewServer(node, port, nil, nil)
 
 	server.Start()
 	t.Cleanup(func() {
@@ -693,4 +712,261 @@ func TestStartServesAndStops(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Errorf("management server still answering on %s after Stop()", baseURL)
+}
+
+// --- R4.12: join/remove forwarding ----------------------------------------
+
+// fakeResolver maps a raft address to a management address, or refuses.
+type fakeResolver struct {
+	addr string
+	err  error
+}
+
+func (f *fakeResolver) MgmtAddr(raftAddr string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.addr, nil
+}
+
+// recordingForwarder captures the relay so a test can assert what was sent, and
+// returns a canned answer.
+type recordingForwarder struct {
+	result *ForwardResult
+	err    error
+
+	mu       sync.Mutex
+	gotAddr  string
+	gotPath  string
+	gotQuery string
+	calls    int
+}
+
+func (f *recordingForwarder) Forward(ctx context.Context, mgmtAddr, path, rawQuery string) (*ForwardResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.gotAddr, f.gotPath, f.gotQuery = mgmtAddr, path, rawQuery
+	return f.result, f.err
+}
+
+func (f *recordingForwarder) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// TestJoinForwarding is the R4.12 contract: a leader-only cluster change sent to
+// a follower is relayed rather than failed where it landed.
+func TestJoinForwarding(t *testing.T) {
+	t.Run("a follower relays to the leader and returns its answer verbatim", func(t *testing.T) {
+		node := &fakeRaftControl{isLeader: false, leaderAddr: "node1:8088"}
+		resolver := &fakeResolver{addr: "node1:6000"}
+		fwd := &recordingForwarder{
+			result: &ForwardResult{Status: http.StatusOK, Body: []byte("Joined successfully")},
+		}
+		server := NewServer(node, "6000", resolver, fwd)
+
+		rec := httptest.NewRecorder()
+		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Body.String(); got != "Joined successfully" {
+			t.Errorf("body = %q, want the leader's answer relayed verbatim", got)
+		}
+		if fwd.gotAddr != "node1:6000" {
+			t.Errorf("forwarded to %q, want the resolved management address", fwd.gotAddr)
+		}
+		if fwd.gotPath != "/join" {
+			t.Errorf("forwarded path = %q, want /join", fwd.gotPath)
+		}
+		// The query must survive the relay: it carries the whole request.
+		if !strings.Contains(fwd.gotQuery, "peerID=node2") ||
+			!strings.Contains(fwd.gotQuery, "peerAddress=10.0.0.2") {
+			t.Errorf("forwarded query = %q, want it to carry peerID and peerAddress",
+				fwd.gotQuery)
+		}
+		// The follower must not have tried the leader-only call itself.
+		if calls := node.addVoterCallsSnapshot(); len(calls) != 0 {
+			t.Errorf("follower called AddVoter itself: %+v", calls)
+		}
+	})
+
+	t.Run("the leader does the work and does not forward", func(t *testing.T) {
+		node := &fakeRaftControl{isLeader: true}
+		fwd := &recordingForwarder{}
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+
+		rec := httptest.NewRecorder()
+		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if fwd.callCount() != 0 {
+			t.Errorf("the leader forwarded %d times, want 0", fwd.callCount())
+		}
+		want := []addVoterCall{{id: "node2", address: "10.0.0.2:8088"}}
+		if got := node.addVoterCallsSnapshot(); !reflect.DeepEqual(got, want) {
+			t.Errorf("AddVoter calls = %+v, want %+v", got, want)
+		}
+	})
+
+	// THE LOOP GUARD. Without it, two nodes that each believe the other leads
+	// relay the same join back and forth until something times out.
+	t.Run("an already-forwarded request is refused, never relayed twice", func(t *testing.T) {
+		node := &fakeRaftControl{isLeader: false, leaderAddr: "node1:8088"}
+		fwd := &recordingForwarder{
+			result: &ForwardResult{Status: http.StatusOK, Body: []byte("should never be used")},
+		}
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+
+		req := httptest.NewRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil)
+		req.Header.Set(ForwardedHeader, "1")
+
+		rec := httptest.NewRecorder()
+		server.handleJoin(rec, req)
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+		if fwd.callCount() != 0 {
+			t.Errorf("relayed an already-forwarded request %d times, want 0 — "+
+				"this is the forwarding loop the header exists to prevent",
+				fwd.callCount())
+		}
+		if calls := node.addVoterCallsSnapshot(); len(calls) != 0 {
+			t.Errorf("non-leader called AddVoter anyway: %+v", calls)
+		}
+	})
+
+	t.Run("no known leader is 503, not a relay to nowhere", func(t *testing.T) {
+		node := &fakeRaftControl{isLeader: false, leaderAddr: ""}
+		fwd := &recordingForwarder{}
+		server := NewServer(node, "6000",
+			&fakeResolver{err: errors.New("peers: no leader address known")}, fwd)
+
+		rec := httptest.NewRecorder()
+		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+		if fwd.callCount() != 0 {
+			t.Errorf("forwarded despite an unresolvable leader (%d calls)", fwd.callCount())
+		}
+	})
+
+	t.Run("a failed relay is 503, not a masked success", func(t *testing.T) {
+		node := &fakeRaftControl{isLeader: false, leaderAddr: "node1:8088"}
+		fwd := &recordingForwarder{err: errors.New("connection refused")}
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+
+		rec := httptest.NewRecorder()
+		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+		}
+		if !strings.Contains(rec.Body.String(), "connection refused") {
+			t.Errorf("body = %q, want it to name the underlying failure", rec.Body.String())
+		}
+	})
+}
+
+// TestHandleRemove covers the new /remove endpoint (R4.12).
+func TestHandleRemove(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		target     string
+		isLeader   bool
+		removeErr  error
+		wantStatus int
+		wantIDs    []string
+	}{
+		{
+			name:       "leader removes the peer",
+			method:     http.MethodPost,
+			target:     "/remove?peerID=node3",
+			isLeader:   true,
+			wantStatus: http.StatusOK,
+			wantIDs:    []string{"node3"},
+		},
+		{
+			name:       "missing peerID is rejected",
+			method:     http.MethodPost,
+			target:     "/remove",
+			isLeader:   true,
+			wantStatus: http.StatusBadRequest,
+			wantIDs:    nil,
+		},
+		{
+			name:       "PUT is rejected",
+			method:     http.MethodPut,
+			target:     "/remove?peerID=node3",
+			isLeader:   true,
+			wantStatus: http.StatusMethodNotAllowed,
+			wantIDs:    nil,
+		},
+		{
+			name:       "RemoveServer failure is reported as 500",
+			method:     http.MethodPost,
+			target:     "/remove?peerID=node3",
+			isLeader:   true,
+			removeErr:  errors.New("not enough voters"),
+			wantStatus: http.StatusInternalServerError,
+			wantIDs:    []string{"node3"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &fakeRaftControl{isLeader: tc.isLeader, removeServerErr: tc.removeErr}
+			server := NewServer(node, "6000", nil, nil)
+
+			rec := httptest.NewRecorder()
+			server.handleRemove(rec, httptest.NewRequest(tc.method, tc.target, nil))
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.wantStatus,
+					rec.Body.String())
+			}
+			got := node.removeServerIDsSnapshot()
+			if len(got) == 0 && len(tc.wantIDs) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, tc.wantIDs) {
+				t.Errorf("RemoveServer ids = %v, want %v", got, tc.wantIDs)
+			}
+		})
+	}
+
+	t.Run("a follower relays /remove to the leader", func(t *testing.T) {
+		node := &fakeRaftControl{isLeader: false, leaderAddr: "node1:8088"}
+		fwd := &recordingForwarder{
+			result: &ForwardResult{Status: http.StatusOK, Body: []byte("Removed successfully")},
+		}
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+
+		rec := httptest.NewRecorder()
+		server.handleRemove(rec, httptest.NewRequest(http.MethodPost, "/remove?peerID=node3", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if fwd.gotPath != "/remove" {
+			t.Errorf("forwarded path = %q, want /remove", fwd.gotPath)
+		}
+		if ids := node.removeServerIDsSnapshot(); len(ids) != 0 {
+			t.Errorf("follower called RemoveServer itself: %v", ids)
+		}
+	})
 }
