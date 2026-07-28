@@ -111,9 +111,46 @@ struct KVCommand {
     return cmd.to_msgpack();
   }
 
+  /**
+   * @brief Structural limits applied while decoding (R6.7).
+   *
+   * WITHOUT THESE, A 17-BYTE REQUEST BODY IS A CLUSTER-WIDE DENIAL OF SERVICE.
+   * Found by the libFuzzer target in cpp-app/fuzz: msgpack's map32 marker
+   * (0xdf) declares an entry count in its next four bytes, so a short chain of
+   * them declares billions of entries and msgpack-c allocates for them before
+   * discovering the bytes are not there. Reproduced outside the fuzzer — 17
+   * bytes asking for more than 512 MiB.
+   *
+   * It is worse than a single-node crash. This decode happens at APPLY time, on
+   * every replica, on an entry that Raft has ALREADY COMMITTED — and committed
+   * entries replay on restart. So one such write takes down all three nodes and
+   * keeps taking them down every time they come back up.
+   *
+   * The limits are the actual shape of the payload, not a guess: the wire
+   * format is a flat map of exactly three string fields (MSGPACK_DEFINE_MAP
+   * below), so anything nested, longer, or wider is not a command this store
+   * has ever produced. Depth 4 leaves headroom over the flat map's depth of 1
+   * without permitting a recursion bomb.
+   */
+  static constexpr size_t kMaxMapEntries = 64;
+  static constexpr size_t kMaxArrayEntries = 64;
+  static constexpr size_t kMaxStringBytes = 8u * 1024 * 1024;
+  static constexpr size_t kMaxDepth = 4;
+
   static KVCommand from_msgpack(const char *data, size_t size) {
     KVCommand cmd;
-    msgpack::object_handle oh = msgpack::unpack(data, size);
+
+    // The limit is checked as the parser walks the input, so an over-large
+    // declared length is refused BEFORE anything is allocated for it. That
+    // ordering is the whole fix; validating after the allocation would be too
+    // late by definition.
+    const msgpack::unpack_limit limit(kMaxArrayEntries, kMaxMapEntries,
+                                      kMaxStringBytes, kMaxStringBytes,
+                                      kMaxStringBytes, kMaxDepth);
+
+    size_t offset = 0;
+    msgpack::object_handle oh = msgpack::unpack(
+        data, size, offset, MSGPACK_NULLPTR, MSGPACK_NULLPTR, limit);
     msgpack::object obj = oh.get();
     obj.convert(cmd);
     return cmd;

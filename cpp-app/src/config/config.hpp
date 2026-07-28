@@ -139,10 +139,20 @@ struct Config {
   }
 
   /**
-   * @brief Get the full gRPC server address.
+   * @brief Address the StateMachine gRPC server binds (R6.6).
+   *
+   * 127.0.0.1, not 0.0.0.0. The ONLY caller is this node's own sidecar over
+   * loopback — Apply, Get and the snapshot streams are all local — so binding
+   * the wildcard address exposed an unauthenticated interface that can read and
+   * overwrite the entire store to anything that could reach the container.
+   *
+   * NOTE the asymmetry with the sidecar's own RaftNode port (50052), which must
+   * stay reachable from peers: Phase 4 made it the target of write and read
+   * forwarding, so it is deliberately NOT localhost-only. R6.6 predates that
+   * and describes both ports as intra-node; only this one still is.
    */
   [[nodiscard]] std::string grpc_address() const {
-    return "0.0.0.0:" + grpc_port;
+    return "127.0.0.1:" + grpc_port;
   }
 
   /**

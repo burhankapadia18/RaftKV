@@ -182,6 +182,9 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+	// #nosec G104 -- a failed response write means the client hung up. The
+	// status is already committed and there is no second channel to report on,
+	// so there is nothing to do with the error but drop it.
 	w.Write([]byte("Joined successfully"))
 }
 
@@ -215,6 +218,9 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+	// #nosec G104 -- a failed response write means the client hung up. The
+	// status is already committed and there is no second channel to report on,
+	// so there is nothing to do with the error but drop it.
 	w.Write([]byte("Removed successfully"))
 }
 
@@ -268,6 +274,9 @@ func (s *Server) relayToLeader(w http.ResponseWriter, r *http.Request, path stri
 	// Relay the leader's answer verbatim: the caller asked for a cluster
 	// change, and what the leader said about it is the real answer.
 	w.WriteHeader(result.Status)
+	// #nosec G104 -- a failed response write means the client hung up. The
+	// status is already committed and there is no second channel to report on,
+	// so there is nothing to do with the error but drop it.
 	w.Write(result.Body)
 	return true
 }
@@ -326,6 +335,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	// #nosec G104 -- a failed response write means the client hung up. The
+	// status is already committed and there is no second channel to report on,
+	// so there is nothing to do with the error but drop it.
 	w.Write(payload)
 }
 
@@ -353,6 +365,9 @@ func statIndex(stats map[string]string, key string) uint64 {
 // that answers "should traffic go here", and that is /ready.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
+	// #nosec G104 -- a failed response write means the client hung up. The
+	// status is already committed and there is no second channel to report on,
+	// so there is nothing to do with the error but drop it.
 	w.Write([]byte("OK"))
 }
 
@@ -457,5 +472,8 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if !ready {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
+	// #nosec G104 -- a failed response write means the client hung up. The
+	// status is already committed and there is no second channel to report on,
+	// so there is nothing to do with the error but drop it.
 	w.Write(payload)
 }

@@ -56,6 +56,18 @@ jobs:
       - name: go test -race
         run: go test -race -coverprofile=coverage.out ./...
 
+      # R6.8. Pinned rather than @latest: a static analyser that changes its rule
+      # set on its own schedule turns an unrelated PR red for reasons its author
+      # cannot act on.
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.21.4
+          # -exclude-dir=pb: the only G103 (unsafe) findings are in
+          # protoc-generated code. An annotation there would be erased the next
+          # time the stubs are regenerated, so excluding the directory is the
+          # honest suppression rather than a comment that cannot survive.
+          "$(go env GOPATH)/bin/gosec" -exclude-dir=pb -fmt=text ./...
+
       - name: Coverage summary
         run: |
           go tool cover -func=coverage.out | tee coverage.txt
@@ -232,6 +244,55 @@ jobs:
 
       - name: Run tests
         run: ctest --test-dir cpp-app/build-tsan --output-on-failure
+
+  # --- R6.7: libFuzzer over the two trust boundaries ----------------------
+  fuzz:
+    name: Fuzz (libFuzzer, 60s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: debian:bookworm-slim
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake clang libmsgpack-dev git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # clang, not gcc: libFuzzer is a clang feature and CMakeLists refuses
+      # loudly rather than building a target that silently fuzzes nothing.
+      - name: Configure
+        run: |
+          cmake -S cpp-app -B cpp-app/build-fuzz \
+            -DKVDB_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build cpp-app/build-fuzz -j "$(nproc)"
+
+      # Bounded so this stays a PR gate rather than a fuzzing campaign. Any crash,
+      # OOM or sanitizer report fails the job and the input becomes a checked-in
+      # regression test — that is how the map-header amplification DoS in
+      # KVCommand was found and fixed.
+      - name: Fuzz KVCommand::from_msgpack
+        run: |
+          ./cpp-app/build-fuzz/fuzz_kv_command cpp-app/fuzz/corpus/kv_command \
+            -max_total_time=60 -artifact_prefix=/tmp/fuzz-kv-
+
+      - name: Fuzz HttpRequestParser::parse
+        run: |
+          ./cpp-app/build-fuzz/fuzz_http_parser cpp-app/fuzz/corpus/http_parser \
+            -max_total_time=60 -artifact_prefix=/tmp/fuzz-http-
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: /tmp/fuzz-*
+          if-no-files-found: ignore
 
   # --- R0.15: full cluster end-to-end ------------------------------------
   e2e:

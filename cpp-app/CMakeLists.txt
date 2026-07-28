@@ -235,3 +235,38 @@ if(KVDB_BUILD_TESTS)
     # failure, which is badly misleading. 120s costs nothing when it passes.
     gtest_discover_tests(kvdb_tests DISCOVERY_TIMEOUT 120)
 endif()
+
+# --- 10. Fuzzers (opt-in, clang only) ------------------------------------
+#
+# Guarded exactly like KVDB_BUILD_TESTS so the default build and the Docker image
+# are untouched. libFuzzer is a clang feature; GCC has no equivalent, so this
+# refuses loudly rather than producing a target that silently does nothing.
+#
+#   cmake -S cpp-app -B build-fuzz -DKVDB_BUILD_FUZZERS=ON \
+#         -DCMAKE_CXX_COMPILER=clang++
+#   ./build-fuzz/fuzz_kv_command cpp-app/fuzz/corpus/kv_command -max_total_time=60
+
+option(KVDB_BUILD_FUZZERS "Build libFuzzer targets (clang only)" OFF)
+
+if(KVDB_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "KVDB_BUILD_FUZZERS requires clang (libFuzzer is a clang feature); "
+            "got ${CMAKE_CXX_COMPILER_ID}. Re-run with -DCMAKE_CXX_COMPILER=clang++")
+    endif()
+
+    # The sanitizers are not optional here. A fuzzer without ASan finds only hard
+    # crashes; the out-of-bounds reads these parsers could produce are exactly
+    # what ASan turns into a finding.
+    set(KVDB_FUZZ_FLAGS -fsanitize=fuzzer,address,undefined
+                        -fno-omit-frame-pointer -g)
+
+    foreach(target fuzz_kv_command fuzz_http_parser)
+        add_executable(${target} fuzz/${target}.cpp)
+        target_include_directories(${target} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_options(${target} PRIVATE ${KVDB_FUZZ_FLAGS})
+        target_link_options(${target} PRIVATE ${KVDB_FUZZ_FLAGS})
+        target_link_libraries(${target} PRIVATE msgpackc)
+    endforeach()
+endif()

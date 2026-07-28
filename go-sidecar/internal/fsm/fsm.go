@@ -414,6 +414,9 @@ func (s *cppSnapshot) Persist(sink raft.SnapshotSink) error {
 	// contract ("Write must return a non-nil error if it returns n < len(p)"),
 	// so checking err covers the partial-write case too.
 	if _, err := sink.Write(s.state); err != nil {
+		// #nosec G104 -- Cancel's own error is deliberately discarded: we are
+		// already returning the failure that mattered, and reporting a
+		// cleanup error instead of the cause would lose the diagnosis.
 		sink.Cancel()
 		return fmt.Errorf("fsm: writing %d byte(s) to snapshot %s: %w", len(s.state), sink.ID(), err)
 	}
@@ -423,6 +426,9 @@ func (s *cppSnapshot) Persist(sink raft.SnapshotSink) error {
 		// on raft's own FileSnapshotSink — it has already marked itself closed
 		// and removed its temp directory — but it costs nothing and tells any
 		// other sink implementation to discard the partial write.
+		// #nosec G104 -- Cancel's own error is deliberately discarded: we are
+		// already returning the failure that mattered, and reporting a
+		// cleanup error instead of the cause would lose the diagnosis.
 		sink.Cancel()
 		return fmt.Errorf("fsm: closing snapshot %s: %w", sink.ID(), err)
 	}

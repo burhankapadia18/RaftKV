@@ -332,5 +332,61 @@ TEST(KVCommandTest, ValidationErrorNamesTheOffendingField) {
   }
 }
 
+// --- R6.7: the amplification DoS the fuzzer found -------------------------
+
+TEST(KVCommandTest, RejectsAMapHeaderBombWithoutAllocatingForIt) {
+  // FOUND BY FUZZING (cpp-app/fuzz/fuzz_kv_command.cpp), then reproduced
+  // standalone: these 17 bytes made msgpack-c attempt to allocate more than
+  // 512 MiB. 0xdf is the map32 marker, whose next four bytes are an entry
+  // count, so a short chain of them declares billions of entries and the
+  // library allocates for them before noticing the bytes are absent.
+  //
+  // The severity is not "one request is slow". This decode runs at APPLY time
+  // on every replica, against an entry Raft has already COMMITTED, and
+  // committed entries replay on restart — so a single 17-byte write took down
+  // all three nodes and kept doing it every time they came back.
+  //
+  // KVCommand::kMax* limits are what make this a rejection instead of an
+  // allocation. If this test ever fails, that DoS is back.
+  const unsigned char bomb[] = {0xdf, 0xdf, 0xdf, 0xdf, 0xdf, 0xdf,
+                                0xdf, 0xdf, 0xdf, 0xdf, 0xdf, 0xdf,
+                                0xdf, 0xdf, 0xdf, 0x83, 0x83};
+  EXPECT_THROW(KVCommand::from_msgpack(reinterpret_cast<const char *>(bomb),
+                                       sizeof(bomb)),
+               std::exception);
+}
+
+TEST(KVCommandTest, RejectsADeeplyNestedPayload) {
+  // The depth limit, exercised directly: a chain of fixmap headers. The real
+  // format is a flat map, so anything nested past a handful of levels is not a
+  // command this store ever produced.
+  std::string nested;
+  for (int i = 0; i < 64; ++i) {
+    nested += static_cast<char>(0x81); // fixmap with 1 entry
+    nested += static_cast<char>(0xa1); // fixstr length 1
+    nested += 'k';
+  }
+  nested += static_cast<char>(0xc0); // nil, to terminate the innermost value
+  EXPECT_THROW(KVCommand::from_msgpack(nested.data(), nested.size()),
+               std::exception);
+}
+
+TEST(KVCommandTest, TheLimitsDoNotRejectRealCommands) {
+  // The fix must not have narrowed the accepted format. A normal command, and a
+  // value far larger than any test above, both still decode — otherwise the DoS
+  // fix would itself be an availability bug.
+  const std::string ordinary =
+      pack_string_map({{"op", "SET"}, {"key", "k"}, {"value", "v"}});
+  const KVCommand decoded = decode(ordinary);
+  EXPECT_EQ(decoded.op, "SET");
+  EXPECT_TRUE(decoded.is_valid());
+
+  const std::string big_value(1024 * 1024, 'x'); // 1 MiB, the R4.9 body cap
+  const std::string big =
+      pack_string_map({{"op", "SET"}, {"key", "k"}, {"value", big_value}});
+  const KVCommand big_decoded = decode(big);
+  EXPECT_EQ(big_decoded.value.size(), big_value.size());
+}
+
 } // namespace
 } // namespace kvdb
