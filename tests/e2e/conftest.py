@@ -77,6 +77,44 @@ def node_urls() -> list[str]:
     return [url.strip().rstrip("/") for url in raw.split(",") if url.strip()]
 
 
+def mgmt_urls_for(nodes: list[str]) -> list[str]:
+    """Management API base URLs, one per entry in ``nodes``.
+
+    ``RAFTKV_MGMT`` overrides them wholesale (same order as ``RAFTKV_NODES``).
+    Otherwise they are derived from the client URLs by mapping the published
+    client port onto the published management port, which docker-compose.yml
+    lays out positionally:
+
+        8080 -> 6000     8081 -> 6001     8082 -> 6002
+
+    Deriving rather than hardcoding keeps a custom ``RAFTKV_NODES`` working for
+    the common case, and the explicit override covers everything else.
+    """
+    raw = os.environ.get("RAFTKV_MGMT", "").strip()
+    if raw:
+        urls = [u.strip().rstrip("/") for u in raw.split(",") if u.strip()]
+        if len(urls) != len(nodes):
+            raise ValueError(
+                f"RAFTKV_MGMT has {len(urls)} entries but there are "
+                f"{len(nodes)} nodes; they must correspond one to one"
+            )
+        return urls
+
+    derived = []
+    for url in nodes:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+        if port is None or not (8080 <= port <= 8089):
+            raise ValueError(
+                f"cannot derive a management URL for {url!r}: expected a "
+                "published client port in 8080-8089 (docker-compose.yml maps "
+                "8080/8081/8082 to 6000/6001/6002). Set RAFTKV_MGMT explicitly."
+            )
+        host = parsed.hostname or "localhost"
+        derived.append(f"{parsed.scheme}://{host}:{6000 + (port - 8080)}")
+    return derived
+
+
 # --------------------------------------------------------------------------
 # Polling
 # --------------------------------------------------------------------------
@@ -473,55 +511,54 @@ def unique_value() -> str:
 
 
 @pytest.fixture(scope="session")
-def leader(nodes: list[str], run_id: str) -> str:
-    """Base URL of the current Raft leader, discovered by probing.
+def leader(nodes: list[str]) -> str:
+    """Base URL of the current Raft leader, from each node's management API.
 
-    The management API (:6000 ``/status``) is **not** published to the host by
-    docker-compose.yml, so we cannot ask the cluster who leads. Instead we
-    exploit the current no-forwarding contract: a write only succeeds on the
-    leader. Since Phase 1 that is unambiguous on the wire -- the leader answers
-    ``200 {"ok":true}`` and a follower answers ``503`` with
-    ``{"error":"not leader","leader":"<raft address>"}``, because
-    ``raft.Apply`` returns ``ErrNotLeader``, the sidecar tags it
-    ``not_leader:<addr>`` (go-sidecar/internal/rpc/server.go) and the C++
-    handler maps that prefix to 503.
+    Until Phase 4 this was discovered by probing: a write only succeeded on the
+    leader, so whichever node answered ``200 {"ok":true}`` was it. **Forwarding
+    killed that technique.** Every node now accepts every write — a follower
+    relays it to the leader and returns the leader's answer — so "who accepts a
+    write" identifies nothing, and a probe would silently return whichever node
+    happened to be first in the list.
 
-    The probe deliberately keys off the success shape rather than "not a 503",
-    so a node answering 502 (sidecar unreachable) is never mistaken for a
-    leader. It is retried until ``RAFTKV_LEADER_TIMEOUT`` so a cluster still
-    holding an election is tolerated.
+    So we ask instead. ``/status`` reports ``is_leader``, and docker-compose.yml
+    publishes the management port for exactly this reason (6000/6001/6002,
+    positionally matching the 8080/8081/8082 client ports).
+
+    Set ``RAFTKV_MGMT`` to override the management URLs; it defaults to deriving
+    them from the client ports, so the common case needs no configuration.
     """
+    mgmt_urls = mgmt_urls_for(nodes)
+
     last_round: list[str] = []
 
     def probe():
         last_round.clear()
-        for url in nodes:
-            probe_key = f"e2e-leader-probe-{run_id}-{uuid.uuid4().hex[:8]}"
+        for base_url, mgmt_url in zip(nodes, mgmt_urls):
             try:
-                response = post_command(url, "SET", probe_key, "1")
-            except requests.RequestException as exc:
-                last_round.append(f"{url} -> unreachable ({type(exc).__name__}: {exc})")
+                response = requests.get(f"{mgmt_url}/status", timeout=HTTP_TIMEOUT)
+                status = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                last_round.append(
+                    f"{mgmt_url} -> unreachable ({type(exc).__name__}: {exc})"
+                )
                 continue
-            body = decode_body(response)
-            last_round.append(f"{url} -> HTTP {response.status_code} body={body!r}")
-            if response.status_code == HTTP_OK and try_json(body) == WRITE_OK_BODY:
-                return url
+            last_round.append(f"{mgmt_url} -> is_leader={status.get('is_leader')!r}")
+            if status.get("is_leader") is True:
+                return base_url
         return None
 
     found = wait_until(probe, timeout=LEADER_TIMEOUT, interval=POLL_INTERVAL)
     if not found:
         detail = "\n  ".join(last_round) or "  (no nodes probed)"
         pytest.fail(
-            "No node accepted a write within "
+            "No node reported itself leader within "
             f"{LEADER_TIMEOUT:g}s -- the RaftKV cluster does not look ready.\n"
-            f"Expected exactly one node to answer HTTP 200 {WRITE_OK_BODY!r}; "
-            "a follower answers 503 {'error': 'not leader', ...} and a node "
-            "whose sidecar is down answers 502.\n"
-            f"Probed nodes: {', '.join(nodes)}\n"
+            f"Management URLs probed: {', '.join(mgmt_urls)}\n"
             f"Last probe round:\n  {detail}\n"
             "These tests do not manage docker. Start the cluster first:\n"
             "  docker build -t raftkv:latest . && docker compose up -d\n"
-            "or point the suite elsewhere with RAFTKV_NODES=<comma-separated URLs>.",
+            "Point the suite elsewhere with RAFTKV_NODES / RAFTKV_MGMT.",
             pytrace=False,
         )
     return found

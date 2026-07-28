@@ -248,9 +248,25 @@ type fakeGRPCStateMachineClient struct {
 	gotSnapshotReq *pb.SnapshotRequest
 	snapshotStream pb.StateMachine_GetSnapshotClient
 	restoreStream  pb.StateMachine_RestoreSnapshotClient
+
+	gotGetReq *pb.GetRequest
+	getResp   *pb.GetResponse
 }
 
 var _ pb.StateMachineClient = (*fakeGRPCStateMachineClient)(nil)
+
+// Get satisfies pb.StateMachineClient. Phase 4 added it for linearizable
+// reads; the FSM does not use it (reads never go through raft.FSM), so this
+// exists to keep the fake implementing the full generated interface.
+func (f *fakeGRPCStateMachineClient) Get(ctx context.Context, in *pb.GetRequest, opts ...grpc.CallOption) (*pb.GetResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gotGetReq = in
+	if f.getResp != nil {
+		return f.getResp, nil
+	}
+	return &pb.GetResponse{}, nil
+}
 
 func (f *fakeGRPCStateMachineClient) Apply(ctx context.Context, in *pb.Command, opts ...grpc.CallOption) (*pb.ApplyResponse, error) {
 	f.mu.Lock()

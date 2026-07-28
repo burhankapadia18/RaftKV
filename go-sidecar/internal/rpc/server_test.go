@@ -202,7 +202,7 @@ func TestPropose(t *testing.T) {
 				err:        tc.err,
 				leaderAddr: tc.leaderAddr,
 			}
-			server := NewServer(node)
+			server := NewServer(node, nil)
 
 			payload := []byte{0x83, 0xa2, 'o', 'p'}
 			resp, err := server.Propose(context.Background(), &pb.Command{Data: payload})
@@ -257,7 +257,7 @@ func TestProposeForwardsPayloadOpaquely(t *testing.T) {
 	}
 
 	node := &fakeProposer{}
-	server := NewServer(node)
+	server := NewServer(node, nil)
 
 	resp, err := server.Propose(context.Background(), &pb.Command{
 		Data: payload,
@@ -285,7 +285,7 @@ func TestProposeForwardsPayloadOpaquely(t *testing.T) {
 // used rather than cmd.Data so a nil message cannot panic the sidecar.
 func TestProposeWithNilCommand(t *testing.T) {
 	node := &fakeProposer{}
-	server := NewServer(node)
+	server := NewServer(node, nil)
 
 	resp, err := server.Propose(context.Background(), nil)
 	if err != nil {
@@ -311,13 +311,13 @@ func TestProposeWithNilCommand(t *testing.T) {
 // TestStopWithoutStart covers the shutdown path on a server that never served:
 // main.go's signal handler can fire before Start binds the port.
 func TestStopWithoutStart(t *testing.T) {
-	NewServer(&fakeProposer{}).Stop()
+	NewServer(&fakeProposer{}, nil).Stop()
 }
 
 // TestStartRejectsBadPort proves Start surfaces a bind failure as a wrapped
 // error instead of returning nil or panicking.
 func TestStartRejectsBadPort(t *testing.T) {
-	err := NewServer(&fakeProposer{}).Start("not-a-port")
+	err := NewServer(&fakeProposer{}, nil).Start("not-a-port")
 	if err == nil {
 		t.Fatal("Start() with a non-numeric port returned nil, want an error")
 	}
@@ -360,7 +360,7 @@ func freePort(t *testing.T) string {
 // C++ GrpcRaftClient depends on.
 func TestStartServesProposeAndStops(t *testing.T) {
 	node := &fakeProposer{err: raft.ErrNotLeader, leaderAddr: "node1:8088"}
-	server := NewServer(node)
+	server := NewServer(node, nil)
 	port := freePort(t)
 
 	serveErr := make(chan error, 1)

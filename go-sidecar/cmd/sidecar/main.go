@@ -12,6 +12,7 @@ import (
 	"my-raft-sidecar/internal/config"
 	"my-raft-sidecar/internal/fsm"
 	"my-raft-sidecar/internal/management"
+	"my-raft-sidecar/internal/peers"
 	"my-raft-sidecar/internal/raftnode"
 	"my-raft-sidecar/internal/rpc"
 )
@@ -59,8 +60,15 @@ func main() {
 		joiner.JoinAsync()
 	}
 
-	// Start gRPC server
-	grpcServer := rpc.NewServer(node)
+	// Start gRPC server. The forwarder is what lets a write land on any node
+	// (R4.1): a follower relays the proposal to the leader instead of refusing
+	// it. peers.Resolver holds the one place that knows a peer's RaftNode gRPC
+	// sits on the same host as its Raft transport, at a different port.
+	resolver := peers.New(cfg.PeerRPCPort, cfg.MgmtPort)
+	forwarder := rpc.NewForwarder(resolver)
+	defer forwarder.Close()
+
+	grpcServer := rpc.NewServer(node, forwarder)
 
 	// Setup graceful shutdown
 	go func() {

@@ -64,18 +64,32 @@ type RaftProposer interface {
 	LeaderAddr() string
 }
 
+// ProposeForwarder relays a proposal to the leader on a follower's behalf.
+// *Forwarder satisfies it; kept as an interface so the handler can be tested
+// without a real peer.
+type ProposeForwarder interface {
+	ForwardPropose(ctx context.Context, raftAddr string, cmd *pb.Command) (*pb.ProposeResponse, error)
+}
+
 // Server represents the gRPC server for Raft operations.
 type Server struct {
 	pb.UnimplementedRaftNodeServer
 	node       RaftProposer
+	forwarder  ProposeForwarder
 	grpcServer *grpc.Server
 	listener   net.Listener
 }
 
 // NewServer creates a new gRPC server for the Raft node.
-func NewServer(node RaftProposer) *Server {
+//
+// forwarder may be nil, which disables forwarding and restores the Phase 1
+// behavior of refusing a write on a follower. That is what the older tests
+// expect, and it keeps the failure mode explicit rather than depending on a
+// half-configured forwarder.
+func NewServer(node RaftProposer, forwarder ProposeForwarder) *Server {
 	return &Server{
 		node:       node,
+		forwarder:  forwarder,
 		grpcServer: grpc.NewServer(),
 	}
 }
@@ -98,7 +112,35 @@ func (s *Server) Propose(ctx context.Context, cmd *pb.Command) (*pb.ProposeRespo
 	if err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
 			leader := s.node.LeaderAddr()
-			log.Printf("Propose rejected: not the leader (leader=%q)", leader)
+
+			// R4.1: forward once, then stop. `cmd.GetForwarded()` means a peer
+			// already sent this here believing we lead — if we do not, our own
+			// leader hint is no better than theirs, and forwarding again is how
+			// two nodes with stale hints ping-pong a request between them. Refuse
+			// instead, and let the original client see the truth.
+			if s.forwarder != nil && !cmd.GetForwarded() && leader != "" {
+				log.Printf("Propose: not the leader, forwarding to %s", leader)
+				forwarded, ferr := s.forwarder.ForwardPropose(ctx, leader, cmd)
+				if ferr != nil {
+					// Forwarding failed as a transport matter. Report it as
+					// itself, NOT as not_leader: the client should not be told
+					// "retry at the leader" when the problem is that we could
+					// not reach the leader.
+					log.Printf("ERROR: forwarding to leader %s failed: %v", leader, ferr)
+					return &pb.ProposeResponse{
+						Success: false,
+						Error:   fmt.Sprintf("could not reach leader %s: %v", leader, ferr),
+					}, nil
+				}
+				return forwarded, nil
+			}
+
+			if cmd.GetForwarded() {
+				log.Printf("Propose rejected: arrived forwarded but this node is "+
+					"not the leader (leader=%q) — refusing to forward again", leader)
+			} else {
+				log.Printf("Propose rejected: not the leader (leader=%q)", leader)
+			}
 			return &pb.ProposeResponse{
 				Success: false,
 				Error:   NotLeaderPrefix + leader,

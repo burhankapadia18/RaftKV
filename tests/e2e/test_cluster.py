@@ -10,9 +10,11 @@ Two families of test live here:
   opposite (HTTP 200 for everything, ``"error"`` / ``"Key Not Found"`` in the
   body); those pins were flipped here when Phase 1 landed.
 
-What is *still* deliberately pinned is called out in each docstring: a write to
-a follower is rejected rather than forwarded, and reads are served from the
-local store and may be stale. Both change in Phase 4.
+Phase 4 flipped the follower-write pin: a write to a follower is now forwarded
+to the leader and succeeds, so `test_r4_1_...` asserts the inverse of what
+`test_r0_4_...` used to. What is *still* pinned is called out in each docstring:
+reads are served from the local store and may be stale unless
+`consistency=linearizable` is asked for.
 
 R0.5 (non-zero exit on failure) needs no code: it is pytest's default. Nothing
 in this file catches an assertion or a transport error to soften a result.
@@ -200,80 +202,59 @@ def test_r0_3_get_missing_key_returns_404_not_found(cluster, unique_key):
 # --------------------------------------------------------------------------
 
 
-def test_r0_4_set_on_follower_returns_503_naming_the_leader(
+def test_r4_1_set_on_a_follower_is_forwarded_and_succeeds(
     cluster, unique_key, unique_value
 ):
-    """SET sent to a follower: HTTP 503 with the leader's Raft address.
+    """SET sent to a follower now SUCCEEDS, transparently (R4.1).
 
-    GUARANTEED SINCE PHASE 1 (R1.5 + R1.8): ``raft.Apply`` returns
-    ``ErrNotLeader``, ``rpc.Server.Propose`` tags it ``not_leader:<addr>`` with
-    the address from ``LeaderWithID``, and the C++ handler turns that prefix
-    into a 503 carrying the address. Phase 0 pinned this as HTTP 200 with the
-    body ``error``, indistinguishable from "the sidecar is down" (which is now
-    a 502).
+    THIS ASSERTION IS THE INVERSE OF WHAT IT WAS. Phase 0 pinned a follower
+    write as HTTP 200 with the body ``error``; Phase 1 made that an honest 503
+    naming the leader's Raft address. Both were the same underlying behaviour:
+    the write was refused and the client had to do something about it — and the
+    address it was handed was a Raft transport address it could not even dial.
 
-    STILL PINNED (Phase 4): the rejection itself. There is no leader
-    forwarding, so a client has to retry against the address in the ``leader``
-    field. That address is the peer's **Raft** address (``node1:8088`` under
-    docker-compose.yml, where entrypoint.sh advertises the container hostname),
-    not an HTTP endpoint a client can dial -- which is why this asserts a shape
-    rather than a usable URL.
+    Phase 4 removes the problem instead of describing it. ``rpc.Server.Propose``
+    on a non-leader relays the proposal to the leader's RaftNode gRPC and
+    returns the leader's answer, so every node is a usable entry point and a
+    client needs no redirect logic at all.
+
+    The one-hop guard is what keeps this safe: the forwarded command carries
+    ``Command.forwarded``, and a node that receives an already-forwarded
+    proposal while not being the leader refuses it rather than forwarding
+    again. Two nodes with stale leader hints therefore cannot bounce a request
+    between themselves. That guard is unit-tested in
+    go-sidecar/internal/rpc/forwarding_handler_test.go; here we prove the
+    user-visible half.
     """
     if not cluster.followers:
         pytest.skip(
             "single-node cluster (leader is the only node in "
-            f"{list(cluster.nodes)}) -- no follower to reject a write"
+            f"{list(cluster.nodes)}) -- no follower to forward from"
         )
 
     for base_url in cluster.followers:
         response = cluster.set(base_url, unique_key, unique_value)
 
-        assert response.status_code == HTTP_SERVICE_UNAVAILABLE, (
+        assert response.status_code == HTTP_OK, (
             f"follower {base_url} answered HTTP {response.status_code} "
             f"({response.reason!r}) body={cluster.body(response)!r}; expected "
-            f"{HTTP_SERVICE_UNAVAILABLE} for a write it cannot commit. If this "
-            f"says {HTTP_OK}, leadership moved off {cluster.leader} mid-run"
+            f"{HTTP_OK}. A {HTTP_SERVICE_UNAVAILABLE} here means forwarding did "
+            "not happen -- either the forwarder is not wired up in "
+            "cmd/sidecar/main.go, or -peer-rpc-port does not match the port the "
+            "leader's RaftNode gRPC actually listens on (R4.2)"
         )
-        assert response.reason == REASON_PHRASES[HTTP_SERVICE_UNAVAILABLE], (
-            f"follower {base_url} answered with the reason phrase "
-            f"{response.reason!r} (R1.7)"
-        )
-        assert response.headers.get("Content-Type") == JSON_CONTENT_TYPE, (
-            f"follower {base_url} answered Content-Type="
-            f"{response.headers.get('Content-Type')!r}"
+        assert cluster.json(response) == WRITE_OK_BODY, (
+            f"follower {base_url} answered {cluster.body(response)!r}, want "
+            f"{WRITE_OK_BODY!r} relayed from the leader"
         )
 
-        payload = cluster.json(response)
-        assert payload.get("error") == ERROR_NOT_LEADER, (
-            f"follower {base_url} answered {cluster.body(response)!r}; expected "
-            "the not-leader envelope. A different message here means a propose "
-            "that failed for some other reason was mis-mapped onto 503 instead "
-            "of 502"
+        # Forwarded or not, the write must be real: committed through raft and
+        # visible on every node, not just acknowledged by the follower.
+        mismatches = cluster.wait_for_value_on_all(unique_key, unique_value)
+        assert not mismatches, (
+            f"a write forwarded via follower {base_url} was acknowledged but did "
+            f"not replicate. Last body per failing node: {mismatches!r}"
         )
-
-        leader_addr = payload.get("leader", "")
-        assert leader_addr, (
-            f"follower {base_url} returned a 503 with an empty 'leader' field. "
-            "The sidecar emits a bare 'not_leader:' only while no leader is "
-            "known -- but this run already discovered a leader at "
-            f"{cluster.leader}, so an election in flight is the only benign "
-            "explanation. If it reproduces, LeaderWithID is not reaching the "
-            "response (go-sidecar/internal/rpc/server.go)"
-        )
-        assert RAFT_ADDRESS_RE.match(leader_addr), (
-            f"follower {base_url} named the leader as {leader_addr!r}, which is "
-            "not a host:port Raft address. It comes from raft's LeaderWithID "
-            "and under docker-compose.yml should look like 'node1:8088'"
-        )
-
-    # The rejected write must not have reached any node's store, including the
-    # follower that refused it. One probe each, no polling: there is nothing to
-    # wait for, and waiting would only hide a slow leak of the entry.
-    leaked = cluster.wait_for_missing_on_all(unique_key, timeout=0)
-    assert not leaked, (
-        f"the only write for {unique_key!r} was rejected by a follower, yet "
-        f"some node has state for it: {leaked!r}"
-    )
 
 
 # --------------------------------------------------------------------------

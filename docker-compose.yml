@@ -1,5 +1,5 @@
-version: '3.8'
-
+# The `version:` key is obsolete on modern compose and is deliberately omitted;
+# it only produced a deprecation warning on every command.
 services:
   node1:
     image: raftkv:latest
@@ -8,7 +8,13 @@ services:
       - NODE_ID=node1
       - BOOTSTRAP=true
     ports:
+      # 8080 is the client HTTP API. 6000 is the management API (/status,
+      # /join, /remove), published from Phase 4 on because a client can no
+      # longer tell the leader from a follower by writing to it — forwarding
+      # means every node accepts a write. /status is now the only honest way to
+      # ask who leads, and tests/e2e needs that to verify forwarding at all.
       - "8080:8080"
+      - "6000:6000"
     volumes:
       - ./vol-node1:/app/data
 
@@ -20,6 +26,7 @@ services:
       - JOIN_ADDR=node1:6000
     ports:
       - "8081:8080"
+      - "6001:6000"
     volumes:
       - ./vol-node2:/app/data
 
@@ -31,5 +38,6 @@ services:
       - JOIN_ADDR=node1:6000
     ports:
       - "8082:8080"
+      - "6002:6000"
     volumes:
       - ./vol-node3:/app/data

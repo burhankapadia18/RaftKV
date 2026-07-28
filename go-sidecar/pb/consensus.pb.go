@@ -156,11 +156,20 @@ func (x *RestoreResponse) GetError() string {
 }
 
 type Command struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Op            string                 `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"` // "SET", "DELETE"
-	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
-	Value         string                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
-	Data          []byte                 `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"` // Serialization wrapper
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Op    string                 `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"` // "SET", "DELETE"
+	Key   string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`
+	Value string                 `protobuf:"bytes,3,opt,name=value,proto3" json:"value,omitempty"`
+	Data  []byte                 `protobuf:"bytes,4,opt,name=data,proto3" json:"data,omitempty"` // Serialization wrapper
+	// Phase 4 loop guard. Set by a follower when it forwards a proposal to the
+	// leader. A request that arrives already-forwarded and still lands on a
+	// non-leader is refused with the Phase 1 `not_leader:` error rather than
+	// forwarded again, so a stale leader hint cannot produce a forwarding cycle
+	// between two nodes that each believe the other leads.
+	//
+	// New tag. Old binaries never set it, and it is absent from every raft log
+	// entry ever written; the apply path ignores it entirely.
+	Forwarded     bool `protobuf:"varint,5,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -223,6 +232,228 @@ func (x *Command) GetData() []byte {
 	return nil
 }
 
+func (x *Command) GetForwarded() bool {
+	if x != nil {
+		return x.Forwarded
+	}
+	return false
+}
+
+// Phase 4 linearizable read, sidecar-to-sidecar and C++-to-sidecar.
+type ReadRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Key   string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	// Same one-hop guard as Command.forwarded.
+	Forwarded     bool `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReadRequest) Reset() {
+	*x = ReadRequest{}
+	mi := &file_consensus_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReadRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReadRequest) ProtoMessage() {}
+
+func (x *ReadRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReadRequest.ProtoReflect.Descriptor instead.
+func (*ReadRequest) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *ReadRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *ReadRequest) GetForwarded() bool {
+	if x != nil {
+		return x.Forwarded
+	}
+	return false
+}
+
+type ReadResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Found bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	// Values are arbitrary bytes (NULs and newlines round-trip since Phase 2),
+	// so this is `bytes`, not `string`.
+	Value []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	// Empty on success. Carries the `not_leader:<addr>` prefix when the read
+	// could not be served here, exactly like ProposeResponse.error.
+	Error         string `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReadResponse) Reset() {
+	*x = ReadResponse{}
+	mi := &file_consensus_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReadResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReadResponse) ProtoMessage() {}
+
+func (x *ReadResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReadResponse.ProtoReflect.Descriptor instead.
+func (*ReadResponse) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ReadResponse) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+func (x *ReadResponse) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+func (x *ReadResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+// Phase 4 local store lookup, Go -> C++.
+type GetRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           string                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRequest) Reset() {
+	*x = GetRequest{}
+	mi := &file_consensus_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRequest) ProtoMessage() {}
+
+func (x *GetRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRequest.ProtoReflect.Descriptor instead.
+func (*GetRequest) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *GetRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+type GetResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Found         bool                   `protobuf:"varint,1,opt,name=found,proto3" json:"found,omitempty"`
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetResponse) Reset() {
+	*x = GetResponse{}
+	mi := &file_consensus_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetResponse) ProtoMessage() {}
+
+func (x *GetResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetResponse.ProtoReflect.Descriptor instead.
+func (*GetResponse) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GetResponse) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+func (x *GetResponse) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
 type ProposeResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
@@ -233,7 +464,7 @@ type ProposeResponse struct {
 
 func (x *ProposeResponse) Reset() {
 	*x = ProposeResponse{}
-	mi := &file_consensus_proto_msgTypes[4]
+	mi := &file_consensus_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -245,7 +476,7 @@ func (x *ProposeResponse) String() string {
 func (*ProposeResponse) ProtoMessage() {}
 
 func (x *ProposeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_consensus_proto_msgTypes[4]
+	mi := &file_consensus_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -258,7 +489,7 @@ func (x *ProposeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProposeResponse.ProtoReflect.Descriptor instead.
 func (*ProposeResponse) Descriptor() ([]byte, []int) {
-	return file_consensus_proto_rawDescGZIP(), []int{4}
+	return file_consensus_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ProposeResponse) GetSuccess() bool {
@@ -290,7 +521,7 @@ type ApplyResponse struct {
 
 func (x *ApplyResponse) Reset() {
 	*x = ApplyResponse{}
-	mi := &file_consensus_proto_msgTypes[5]
+	mi := &file_consensus_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -302,7 +533,7 @@ func (x *ApplyResponse) String() string {
 func (*ApplyResponse) ProtoMessage() {}
 
 func (x *ApplyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_consensus_proto_msgTypes[5]
+	mi := &file_consensus_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -315,7 +546,7 @@ func (x *ApplyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyResponse.ProtoReflect.Descriptor instead.
 func (*ApplyResponse) Descriptor() ([]byte, []int) {
-	return file_consensus_proto_rawDescGZIP(), []int{5}
+	return file_consensus_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ApplyResponse) GetSuccess() bool {
@@ -342,22 +573,38 @@ const file_consensus_proto_rawDesc = "" +
 	"\x04data\x18\x01 \x01(\fR\x04data\"A\n" +
 	"\x0fRestoreResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"U\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"s\n" +
 	"\aCommand\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\tR\x05value\x12\x12\n" +
-	"\x04data\x18\x04 \x01(\fR\x04data\"A\n" +
+	"\x04data\x18\x04 \x01(\fR\x04data\x12\x1c\n" +
+	"\tforwarded\x18\x05 \x01(\bR\tforwarded\"=\n" +
+	"\vReadRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x1c\n" +
+	"\tforwarded\x18\x02 \x01(\bR\tforwarded\"P\n" +
+	"\fReadResponse\x12\x14\n" +
+	"\x05found\x18\x01 \x01(\bR\x05found\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"\x1e\n" +
+	"\n" +
+	"GetRequest\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\"9\n" +
+	"\vGetResponse\x12\x14\n" +
+	"\x05found\x18\x01 \x01(\bR\x05found\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"A\n" +
 	"\x0fProposeResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"?\n" +
 	"\rApplyResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error2E\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error2~\n" +
 	"\bRaftNode\x129\n" +
-	"\aPropose\x12\x12.consensus.Command\x1a\x1a.consensus.ProposeResponse2\xd7\x01\n" +
+	"\aPropose\x12\x12.consensus.Command\x1a\x1a.consensus.ProposeResponse\x127\n" +
+	"\x04Read\x12\x16.consensus.ReadRequest\x1a\x17.consensus.ReadResponse2\x8d\x02\n" +
 	"\fStateMachine\x125\n" +
-	"\x05Apply\x12\x12.consensus.Command\x1a\x18.consensus.ApplyResponse\x12E\n" +
+	"\x05Apply\x12\x12.consensus.Command\x1a\x18.consensus.ApplyResponse\x124\n" +
+	"\x03Get\x12\x15.consensus.GetRequest\x1a\x16.consensus.GetResponse\x12E\n" +
 	"\vGetSnapshot\x12\x1a.consensus.SnapshotRequest\x1a\x18.consensus.SnapshotChunk0\x01\x12I\n" +
 	"\x0fRestoreSnapshot\x12\x18.consensus.SnapshotChunk\x1a\x1a.consensus.RestoreResponse(\x01B\x06Z\x04./pbb\x06proto3"
 
@@ -373,26 +620,34 @@ func file_consensus_proto_rawDescGZIP() []byte {
 	return file_consensus_proto_rawDescData
 }
 
-var file_consensus_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
+var file_consensus_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_consensus_proto_goTypes = []any{
 	(*SnapshotRequest)(nil), // 0: consensus.SnapshotRequest
 	(*SnapshotChunk)(nil),   // 1: consensus.SnapshotChunk
 	(*RestoreResponse)(nil), // 2: consensus.RestoreResponse
 	(*Command)(nil),         // 3: consensus.Command
-	(*ProposeResponse)(nil), // 4: consensus.ProposeResponse
-	(*ApplyResponse)(nil),   // 5: consensus.ApplyResponse
+	(*ReadRequest)(nil),     // 4: consensus.ReadRequest
+	(*ReadResponse)(nil),    // 5: consensus.ReadResponse
+	(*GetRequest)(nil),      // 6: consensus.GetRequest
+	(*GetResponse)(nil),     // 7: consensus.GetResponse
+	(*ProposeResponse)(nil), // 8: consensus.ProposeResponse
+	(*ApplyResponse)(nil),   // 9: consensus.ApplyResponse
 }
 var file_consensus_proto_depIdxs = []int32{
 	3, // 0: consensus.RaftNode.Propose:input_type -> consensus.Command
-	3, // 1: consensus.StateMachine.Apply:input_type -> consensus.Command
-	0, // 2: consensus.StateMachine.GetSnapshot:input_type -> consensus.SnapshotRequest
-	1, // 3: consensus.StateMachine.RestoreSnapshot:input_type -> consensus.SnapshotChunk
-	4, // 4: consensus.RaftNode.Propose:output_type -> consensus.ProposeResponse
-	5, // 5: consensus.StateMachine.Apply:output_type -> consensus.ApplyResponse
-	1, // 6: consensus.StateMachine.GetSnapshot:output_type -> consensus.SnapshotChunk
-	2, // 7: consensus.StateMachine.RestoreSnapshot:output_type -> consensus.RestoreResponse
-	4, // [4:8] is the sub-list for method output_type
-	0, // [0:4] is the sub-list for method input_type
+	4, // 1: consensus.RaftNode.Read:input_type -> consensus.ReadRequest
+	3, // 2: consensus.StateMachine.Apply:input_type -> consensus.Command
+	6, // 3: consensus.StateMachine.Get:input_type -> consensus.GetRequest
+	0, // 4: consensus.StateMachine.GetSnapshot:input_type -> consensus.SnapshotRequest
+	1, // 5: consensus.StateMachine.RestoreSnapshot:input_type -> consensus.SnapshotChunk
+	8, // 6: consensus.RaftNode.Propose:output_type -> consensus.ProposeResponse
+	5, // 7: consensus.RaftNode.Read:output_type -> consensus.ReadResponse
+	9, // 8: consensus.StateMachine.Apply:output_type -> consensus.ApplyResponse
+	7, // 9: consensus.StateMachine.Get:output_type -> consensus.GetResponse
+	1, // 10: consensus.StateMachine.GetSnapshot:output_type -> consensus.SnapshotChunk
+	2, // 11: consensus.StateMachine.RestoreSnapshot:output_type -> consensus.RestoreResponse
+	6, // [6:12] is the sub-list for method output_type
+	0, // [0:6] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -409,7 +664,7 @@ func file_consensus_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_consensus_proto_rawDesc), len(file_consensus_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   6,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

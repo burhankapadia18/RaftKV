@@ -35,6 +35,8 @@ var expectedFlags = []struct {
 	{name: "id", defValue: "node1", usage: "Unique Node ID"},
 	{name: "raft", defValue: "8088", usage: "Raft TCP Port"},
 	{name: "srv", defValue: "50052", usage: "Sidecar gRPC Port"},
+	{name: "peer-rpc-port", defValue: "50052",
+		usage: "Port a PEER's RaftNode gRPC listens on, for forwarding to the leader"},
 	{name: "app", defValue: "localhost:50051", usage: "Address of C++ App gRPC"},
 	{name: "mgmt", defValue: "6000", usage: "Management HTTP Port"},
 	{name: "bootstrap", defValue: "false", usage: "Bootstrap the cluster (Leader only)"},
@@ -242,6 +244,7 @@ func TestConfigString(t *testing.T) {
 		NodeID:            "node1",
 		RaftPort:          "8088",
 		SidecarPort:       "50052",
+		PeerRPCPort:       "50052",
 		AppAddr:           "localhost:50051",
 		MgmtPort:          "6000",
 		Bootstrap:         true,
@@ -254,6 +257,7 @@ func TestConfigString(t *testing.T) {
 	}
 
 	want := "Config{NodeID: node1, RaftPort: 8088, SidecarPort: 50052, " +
+		"PeerRPCPort: 50052, " +
 		"AppAddr: localhost:50051, MgmtPort: 6000, Bootstrap: true, DataDir: /data, " +
 		"SnapshotInterval: 5s, SnapshotThreshold: 64, TrailingLogs: 32}"
 
@@ -290,7 +294,7 @@ func TestConfigStringOmitsJoinAndAdvertise(t *testing.T) {
 func TestConfigStringZeroValue(t *testing.T) {
 	var cfg Config
 
-	want := "Config{NodeID: , RaftPort: , SidecarPort: , AppAddr: , MgmtPort: , Bootstrap: false, DataDir: , " +
+	want := "Config{NodeID: , RaftPort: , SidecarPort: , PeerRPCPort: , AppAddr: , MgmtPort: , Bootstrap: false, DataDir: , " +
 		"SnapshotInterval: 0s, SnapshotThreshold: 0, TrailingLogs: 0}"
 
 	if got := cfg.String(); got != want {

@@ -51,3 +51,6 @@ __pycache__/
 .pytest_cache/
 
 .DS_Store
+
+# scratch note left in the working tree; not part of the project
+f.txt
