@@ -31,6 +31,18 @@
 - **HTTP API** — Simple REST-like interface for client applications
 - **Secure by configuration** — mutual TLS between Raft peers, HTTPS + bearer-token auth on the management API, and TLS termination for clients ([Security](#security))
 
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | The design: data paths, consistency, snapshots, security, and what it is bad at |
+| [docs/benchmarks.md](docs/benchmarks.md) | Throughput and latency, with methodology and run-to-run variance stated |
+| [tests/chaos/README.md](tests/chaos/README.md) | The chaos harness: what it injects, what it proves, and what it does not |
+| [tests/e2e/README.md](tests/e2e/README.md) | The end-to-end suite and its opt-in markers |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, and the bugs that were fixed getting here |
+| [docs/phases/](docs/phases/) | The specs each phase of work was built against |
+| [ROADMAP.md](ROADMAP.md) | How this got from a demo to 1.0 |
+
 ## Architecture
 
 ```
@@ -206,19 +218,109 @@ push to `main` and every pull request, with independent jobs:
 
 ## API Reference
 
-Every failure carries a real status code, the matching reason phrase on the
-status line, and a JSON body naming what went wrong. Error bodies are always
-`Content-Type: application/json`; a successful read is the one response that is
-not JSON.
+Every response carries a real status code, the matching reason phrase on the
+status line, and — with one exception — a JSON body. The exception is a successful
+read, which returns the stored value verbatim as `text/plain`.
 
-### Insert / delete a key
+Two surfaces exist. **`/kv/{key}` is the one to use.** The older
+`/insert-val` + `/get-val` pair is kept for compatibility and differs in one
+visible way (see [Percent-decoding](#percent-decoding)).
+
+Every row below was verified against a running 3-node cluster; the same
+expectations are mirrored as constants in
+[`tests/e2e/contracts.py`](tests/e2e/contracts.py), so the handler, this table and
+the tests change together.
+
+### Write a key
+
+```http
+PUT /kv/{key}
+```
+
+The body is the value, as raw bytes — no `Content-Type` required and no encoding
+imposed. **Any node accepts a write**: a follower forwards the proposal to the
+leader rather than refusing it.
+
+| Outcome | Status | Body |
+|---|---|---|
+| Committed and applied | `200 OK` | `{"ok":true}` |
+| No leader available (election in progress, or quorum lost) | `503 Service Unavailable` | `{"error":"not leader","leader":"node1:8088"}` |
+| Any other failure (sidecar unreachable, deadline exceeded, the state machine rejected the command) | `502 Bad Gateway` | `{"error":"<reason>"}` |
+| Body over 1 MiB | `413 Content Too Large` | `{"error":"request body too large"}` |
+| Headers over 32 KiB | `431 Request Header Fields Too Large` | `{"error":"request headers too large"}` |
+| Empty key (`/kv/`) | `400 Bad Request` | `{"error":"key must not be empty"}` |
+| Method other than PUT/GET/DELETE | `405 Method Not Allowed` | `{"error":"method not allowed on /kv/{key}: use PUT, GET or DELETE"}` |
+
+**The 502/503 distinction is the retry contract.** 503 means try again — the
+cluster is between leaders and nothing was lost. 502 means a real failure; retrying
+the identical request will usually fail identically. Clients should back off and
+retry on 503, and surface a 502.
+
+### Read a key
+
+```http
+GET /kv/{key}
+GET /kv/{key}?consistency=linearizable
+```
+
+| Outcome | Status | Content-Type | Body |
+|---|---|---|---|
+| Key present | `200 OK` | `text/plain; charset=utf-8` | the stored value, verbatim |
+| Key absent (never written, or deleted) | `404 Not Found` | `application/json` | `{"error":"key not found"}` |
+| `consistency` is not `local` or `linearizable` | `400 Bad Request` | `application/json` | `{"error":"consistency must be \"local\" or \"linearizable\""}` |
+
+**The default read can be stale, and visibly so.** Writing to a follower and
+reading it back immediately returns 404, because the write was forwarded to the
+leader and this node has not applied it yet:
+
+```
+PUT /kv/k                              -> 200 {"ok":true}
+GET /kv/k                              -> 404 {"error":"key not found"}
+GET /kv/k?consistency=linearizable     -> 200 "value"
+GET /kv/k            (1s later)        -> 200 "value"
+```
+
+That is not a bug; it is what "no consensus on the read path" means. Ask for
+`consistency=linearizable` when a read must reflect every acknowledged write. It
+costs roughly 7× a local read ([benchmarks](docs/benchmarks.md)) because it
+forwards to the leader, waits for a `Barrier`, and confirms leadership with a
+quorum.
+
+### Delete a key
+
+```http
+DELETE /kv/{key}
+```
+
+Same status codes as a write. **Deleting a key that does not exist returns
+`200`** — the operation is idempotent and the response describes the resulting
+state, not whether anything changed.
+
+### Percent-decoding
+
+`/kv/{key}` percent-decodes its path. `/get-val?key=` and `/insert-val` do not.
+The same logical key is therefore addressed differently through the two surfaces:
+
+```
+POST /insert-val {"key": "pc%20t"}   ->  stores the literal key  pc%20t
+GET  /get-val?key=pc%20t             ->  200 "literal-percent"
+GET  /kv/pc%20t                      ->  404   (decodes to "pc t", a different key)
+
+PUT  /kv/a%2Fb                       ->  stores the key  a/b
+GET  /kv/a/b                         ->  200   (same key, both spellings work)
+```
+
+This is deliberate: decoding the legacy routes would silently change which key an
+existing client reaches. They are scheduled for removal a release after 1.0.
+
+### Legacy routes
 
 ```http
 POST /insert-val
 Content-Type: application/msgpack
 ```
 
-**Request body** (MsgPack **map**, all three fields present):
+Body is a MsgPack **map** with all three fields present:
 
 ```json
 { "op": "SET", "key": "your_key", "value": "your_value" }
@@ -226,53 +328,47 @@ Content-Type: application/msgpack
 
 `op` is `SET` or `DELETE`; a `DELETE` ignores `value` but must still supply it.
 
-**Responses**
-
-| Outcome | Status | Body |
-|---|---|---|
-| Committed and applied on this node | `200 OK` | `{"ok":true}` |
-| This node is not the leader | `503 Service Unavailable` | `{"error":"not leader","leader":"node1:8088"}` |
-| Propose failed for any other reason (sidecar unreachable, deadline exceeded, the state machine rejected the command) | `502 Bad Gateway` | `{"error":"<reason>"}` |
-| `Content-Type` is not `application/msgpack` | `415 Unsupported Media Type` | `{"error":"unsupported media type","expected":"application/msgpack"}` |
-| Empty body | `400 Bad Request` | `{"error":"empty request body"}` |
-| `Content-Length` is not a number | `400 Bad Request` | `{"error":"malformed Content-Length"}` |
-
-Two things worth knowing about the failure paths:
-
-- **`leader` is a Raft address, not a URL.** It comes from HashiCorp Raft's
-  `LeaderWithID`, so under `docker-compose.yml` it is `<node-id>:8088` — the
-  peer's raft port, not its HTTP port. It is empty (`"leader":""`) while an
-  election is in progress. There is no leader forwarding yet: a client has to
-  retry against the leader itself. Forwarding lands in Phase 4, and the
-  sidecar's machine-readable `not_leader:` prefix exists so it can.
-- **A command the state machine rejects is a `502`, and it was still
-  replicated.** Validation happens at apply time, after the entry is committed,
-  so an unknown `op` or an empty `key` costs a raft log entry and comes back as
-  `502 {"error":"fsm: failed to apply raft log entry index=… term=…: empty key
-  for operation \"SET\""}`. Rejecting these before proposing is future work.
-
-### Get value by key
-
 ```http
 GET /get-val?key=<key>
 ```
 
-Served from the local in-memory store without consensus, so a follower may
-answer with a stale value.
+| Outcome | Status | Body |
+|---|---|---|
+| Committed / key present | `200 OK` | `{"ok":true}` / the value as `text/plain` |
+| `Content-Type` is not `application/msgpack` | `415 Unsupported Media Type` | `{"error":"unsupported media type","expected":"application/msgpack"}` |
+| Empty body | `400 Bad Request` | `{"error":"empty request body"}` |
+| `Content-Length` missing, negative or not a number | `400 Bad Request` | `{"error":"malformed Content-Length"}` |
+| No `key` query parameter | `400 Bad Request` | `{"error":"missing required query parameter: key"}` |
 
-| Outcome | Status | Content-Type | Body |
-|---|---|---|---|
-| Key present | `200 OK` | `text/plain; charset=utf-8` | the stored value, verbatim |
-| Key absent (never written, or deleted) | `404 Not Found` | `application/json` | `{"error":"key not found"}` |
-| No `key` query parameter | `400 Bad Request` | `application/json` | `{"error":"missing required query parameter: key"}` |
+**Validation happens after commit.** An unknown `op` or an empty `key` is
+replicated first and rejected at apply time, so it costs a raft log entry and
+comes back as a 502:
 
-Keys must be URL-safe: the query parser does no percent-decoding.
+```
+POST /insert-val {"op":"FROB","key":"k","value":"v"}
+-> 502 {"error":"fsm: failed to apply raft log entry index=14 term=2: unknown operation: \"FROB\""}
+```
+
+The entry stays in the log as a permanent no-op. Rejecting these before proposing
+would mean the HTTP layer parsing the MsgPack it currently forwards blind — an
+architectural change, not a tweak.
+
+### Observability
+
+```http
+GET /metrics
+```
+
+Prometheus text format from the storage engine (`raftkv_apply_total`,
+`raftkv_http_requests_total`, `raftkv_store_keys`, `raftkv_wal_size_bytes`, apply
+and request duration histograms). The sidecar exposes its own on `:6000/metrics`,
+including raft gauges.
 
 ### Anything else
 
 | Outcome | Status | Body |
 |---|---|---|
-| Any other method or path | `404 Not Found` | `{"error":"not found"}` |
+| Any other path | `404 Not Found` | `{"error":"not found"}` |
 
 ### Cluster Management (Sidecar)
 
@@ -610,24 +706,15 @@ go build -o sidecar ./cmd/sidecar
 
 ## How It Works
 
-### Raft Consensus
+The design — both data paths, the consistency modes and what they cost, the
+snapshot lifecycle, the security model, and a candid section on what this
+architecture is bad at — is in **[docs/architecture.md](docs/architecture.md)**.
 
-RaftKV uses the Raft algorithm to maintain consistency across nodes:
-
-1. **Leader Election** — One node is elected leader; it handles all write requests
-2. **Log Replication** — The leader appends entries to its log and replicates to followers
-3. **Commit** — Once a majority acknowledge, the entry is committed
-4. **Apply** — Committed entries are applied to each node's state machine
-
-### Sidecar Pattern
-
-The sidecar architecture decouples the storage logic from consensus:
-
-- **C++** handles performance-critical storage operations
-- **Go** leverages the mature HashiCorp Raft implementation
-- **gRPC** provides efficient communication between them
-
-This design allows each component to be optimized independently while maintaining clear interfaces.
+The short version: each node runs two processes. A C++ storage engine owns the
+data and the durability guarantee; a Go sidecar wraps `hashicorp/raft` and owns
+consensus. They talk over localhost gRPC in both directions, and the sidecar never
+sees a key or a value — it moves opaque bytes and calls `Apply`. Writes go through
+raft; reads are served locally unless a client asks for a linearizable one.
 
 ## Contributing
 

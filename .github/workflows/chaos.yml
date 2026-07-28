@@ -60,7 +60,15 @@ jobs:
 
       - name: Start cluster
         run: |
-          echo "RAFTKV_MGMT_TOKEN=$(openssl rand -hex 32)" >> "$GITHUB_ENV"
+          # EXPORT as well as writing to GITHUB_ENV: GITHUB_ENV only affects LATER
+          # steps, so a token written here and used by a `docker compose up` in the
+          # same step would never reach it — compose would silently fall back to the
+          # publicly known dev token from docker-compose.yml. Same trap that bit the
+          # Phase 6 secure-cluster step.
+          token="$(openssl rand -hex 32)"
+          echo "::add-mask::$token"
+          echo "RAFTKV_MGMT_TOKEN=$token" >> "$GITHUB_ENV"
+          export RAFTKV_MGMT_TOKEN="$token"
           docker compose up -d
 
       - name: Wait for cluster readiness

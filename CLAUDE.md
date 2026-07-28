@@ -16,6 +16,9 @@ RaftKV is a distributed key-value store using a **sidecar pattern**: each node r
 # Full cluster (the primary way to run and verify anything)
 docker build -t raftkv:latest .
 docker compose up -d                  # 3 nodes: HTTP on host ports 8080/8081/8082
+# `image:` is ${RAFTKV_IMAGE:-raftkv:latest}, so the default is the LOCAL build and
+# a published release needs no compose edit:
+#   RAFTKV_IMAGE=ghcr.io/burhankapadia18/raftkv:1.0.0 docker compose up -d
 docker compose logs -f
 docker compose down                   # add -v and rm -rf vol-node* for a clean slate
 
@@ -49,6 +52,12 @@ docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
 curl --cacert certs/ca.pem https://localhost:6000/status
 curl --cacert certs/ca.pem -X PUT --data-binary v https://localhost:8443/kv/k
 
+# Chaos harness — needs a cluster up; drives docker itself (Phase 7)
+python tests/chaos/chaos.py --duration 600
+
+# Benchmarks — separate Go module, no third-party deps
+cd bench && go run ./cmd/kvbench -workload all -clients 32 -duration 20s
+
 # Fuzzers (clang only; not built by default)
 cmake -S cpp-app -B cpp-app/fuzz-build -DKVDB_BUILD_FUZZERS=ON \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
@@ -69,7 +78,12 @@ There are three test layers, all of which must stay green:
 
 `test_client.py` is retained only as a manual one-shot demo — it asserts nothing and checks a single node. Use `pytest tests/e2e` for verification. If you add tests, follow [.claude/rules/testing.md](.claude/rules/testing.md).
 
-**CI**: `.github/workflows/ci.yml` runs on every push to `main` and every PR, with independent jobs: `go` (blocking `gofmt -l`, `go vet`, `go test -race` + coverage summary, `gosec` pinned to v2.21.4 with `-exclude-dir=pb`), `cpp` (blocking `clang-format` check against `.clang-format`, cmake build with the project warning flags, `ctest`), `cpp-sanitizers` (ASan+UBSan), `cpp-tsan` (ThreadSanitizer — needs `--security-opt seccomp=unconfined`, or the build dies in `gtest_discover_tests` on a blocked `personality()` call), `fuzz` (both libFuzzer targets, 60s each, crash inputs uploaded), `e2e` (docker build, `docker compose -f docker-compose.yml -f docker-compose.test.yml up -d`, bounded readiness poll, `pytest tests/e2e`, then `-m requires_docker`), and `e2e-secure` (the same cluster under `docker-compose.secure.yml`, `-m requires_secure`, **plus a forced leader failover** — see below).
+**Chaos and benchmarks** (Phase 7, both outside the three layers above):
+
+- `tests/chaos/` — fault injection under load with an invariant checker (acknowledged writes survive; replicas converge). Drives docker directly, which is the deliberate opposite of the e2e rule. Runs nightly, not per-PR. Its checker proves it can fail before every run, because a broken checker and a healthy cluster produce identical output. `pytest tests/chaos/test_journal.py` covers the journal fold with no cluster. See [tests/chaos/README.md](tests/chaos/README.md).
+- `bench/` — a **separate Go module** (`raftkv-bench`) with no third-party dependencies. Gated by its own `bench-build` CI job, because the `go` job is scoped to `go-sidecar` and would never compile it. Results in [docs/benchmarks.md](docs/benchmarks.md), labelled as laptop measurements with their ±25% run-to-run variance stated.
+
+**CI**: `.github/workflows/ci.yml` runs on every push to `main` and every PR, with independent jobs: `go` (blocking `gofmt -l`, `go vet`, `go test -race` + coverage summary, `gosec` pinned to v2.21.4 with `-exclude-dir=pb`), `cpp` (blocking `clang-format` check against `.clang-format`, cmake build with the project warning flags, `ctest`), `cpp-sanitizers` (ASan+UBSan), `cpp-tsan` (ThreadSanitizer — needs `--security-opt seccomp=unconfined`, or the build dies in `gtest_discover_tests` on a blocked `personality()` call), `fuzz` (both libFuzzer targets, 60s each, crash inputs uploaded), `e2e` (docker build, `docker compose -f docker-compose.yml -f docker-compose.test.yml up -d`, bounded readiness poll, `pytest tests/e2e`, then `-m requires_docker`), `e2e-secure` (the same cluster under `docker-compose.secure.yml`, `-m requires_secure`, **plus a forced leader failover** — see below), and `bench-build`. Two more workflows exist: `chaos.yml` (nightly, not per-PR) and `release.yml` (on a `v*` tag: full suite → multi-arch buildx push to GHCR → smoke-test the *published* image → GitHub release, in that order, because publishing before verifying leaves a broken artifact people can pull).
 
 The failover step in `e2e-secure` is not padding. Phase 6 found a bug where the bootstrap node advertised its *resolved container IP*, so a peer dialling it verified the certificate against `172.18.0.2` while the certificate was issued for `node1`. The cluster forms, replicates and passes every smoke test; it breaks only after the first election, permanently, because the address is in the committed raft configuration. Only an election catches it.
 
@@ -159,3 +173,8 @@ Phase 0 removed none of these — it **pinned** them with tests that assert the 
 - **No client authentication or authorization**: anyone who can reach the client HTTP API can read and write every key, in both compose profiles. The Phase 6 bearer token guards cluster *membership* (`/join`, `/remove`), not data. No per-key ACLs, no roles. Phase 6 scoped this out for 1.0 deliberately — the README's Security section says so plainly rather than implying the secure profile is fully locked down.
 - **The intra-node gRPC pair is plaintext**: 50051 binds `127.0.0.1` and never leaves the container, so that one is fine. **50052 is not** — Phase 4 made it peer-reachable for write and read forwarding, so a peer that can reach it can propose writes with no credential. It sits inside the same trust boundary as the Raft port but, unlike the Raft port, is unauthenticated. A real gap, knowingly left.
 - **Certificates do not rotate**: TLS material is read once at startup. Changing a certificate means restarting the node.
+- **One raft group, and this is the ceiling**: every write goes through one leader and one log. There is no sharding, so adding nodes makes write throughput *worse* (more followers to wait for), not better. Measured at ~1.9k writes/s on a laptop, saturating at 32 concurrent writers — see [docs/benchmarks.md](docs/benchmarks.md). Anything that needs more than one group's worth of writes needs a different design, not tuning.
+- **The whole dataset lives in memory**, and a snapshot holds a second copy while it is being written (see the `CppFSM.Snapshot()` note in [.claude/rules/go.md](.claude/rules/go.md) for why the buffering is load-bearing). Dataset size is bounded by RAM.
+- **No client SDK**: clients speak HTTP and MsgPack directly and must implement their own retry policy around the 502/503 distinction. The distinction is documented and stable; the retrying is not done for them.
+- **No bounded-staleness read**: the only choices are a local read (unbounded staleness) and a full barrier + quorum check. There is nothing in between, such as "no older than 100ms".
+- **Client TLS is proxy-terminated**, so the proxy-to-node hop is plaintext and the proxy belongs on the same host as the node. Native TLS in the C++ server was considered and rejected for 1.0; see [docs/architecture.md](docs/architecture.md#security-model).

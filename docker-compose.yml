@@ -10,9 +10,26 @@
 #
 # The endpoints are closed, not open, when it is unset — so a cluster that forgets
 # this cannot grow rather than being silently world-writable.
+# Which image (R7.9)
+# ------------------
+# RAFTKV_IMAGE defaults to the LOCALLY BUILT `raftkv:latest`, so `docker build -t
+# raftkv:latest . && docker compose up -d` works from a clean checkout with no
+# registry access — which is what CI, the e2e suite, the chaos harness and every
+# command in the README already assume.
+#
+# To run a published release instead, with no build at all:
+#
+#     RAFTKV_IMAGE=ghcr.io/burhankapadia18/raftkv:1.0.0 docker compose up -d
+#
+# The phase spec asked for the reverse — the published image by default with a
+# local-build override. That ordering cannot be introduced before the first image
+# is published: `docker compose up -d` would try to pull a tag that does not exist
+# yet, and every workflow that builds `raftkv:latest` and then brings the cluster
+# up would silently run something else. One variable gets the same result in both
+# directions without a window where the repo is broken.
 services:
   node1:
-    image: raftkv:latest
+    image: ${RAFTKV_IMAGE:-raftkv:latest}
     hostname: node1
     environment:
       - NODE_ID=node1
@@ -40,7 +57,7 @@ services:
       - ./vol-node1:/app/data
 
   node2:
-    image: raftkv:latest
+    image: ${RAFTKV_IMAGE:-raftkv:latest}
     hostname: node2
     environment:
       - NODE_ID=node2
@@ -69,7 +86,7 @@ services:
       - ./vol-node2:/app/data
 
   node3:
-    image: raftkv:latest
+    image: ${RAFTKV_IMAGE:-raftkv:latest}
     hostname: node3
     environment:
       - NODE_ID=node3

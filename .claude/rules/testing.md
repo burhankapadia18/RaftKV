@@ -67,6 +67,35 @@ cluster is running, instead of printing a confusing transport error.
 `test_client.py` survives only as a manual one-shot demo. It asserts nothing and
 touches a single node; never treat a clean run of it as verification.
 
+## Chaos and benchmarks (Phase 7)
+
+Two things live outside the three layers above, and both have a rule attached.
+
+**`tests/chaos/`** drives docker directly — the deliberate opposite of the e2e
+rule, because injecting a fault means killing a real container. It runs nightly,
+not per-PR.
+
+- **A check that cannot fail is worse than no check.** The harness proves its own
+  checker can fail before every run: it asserts a value that was never written, a
+  value that differs from what the cluster holds, a value that matches, and a
+  deletion that did not happen — and requires three objections and one silence. Do
+  not remove that, and do not add an invariant without a negative control for it.
+  Two assertions in this repository were vacuous for two phases while CI stayed
+  green; that is the precedent, not a hypothetical.
+- **Only acknowledged operations may be asserted.** A write that timed out or
+  returned 502 may have committed anyway. Those keys are poisoned, reclaimed only
+  after every retry the write path can perform has provably elapsed, and never
+  claimed in between. Relaxing that produces false violations on correct behavior.
+- Mid-run checks **park the load first**. Replaying a live journal against a live
+  cluster reports lost writes that never happened.
+
+**`bench/`** is a separate Go module and is *not* covered by the `go` CI job; it
+has its own `bench-build` job. It has no tests and should not grow fake ones — a
+test asserting that a throughput number is positive is worse than nothing. Its
+output is checked by reading it, and [docs/benchmarks.md](../../docs/benchmarks.md)
+states the run-to-run variance so a single number is not mistaken for a
+measurement.
+
 ## When adding tests
 
 The seams the code was structured around are now actually in use — copy the
