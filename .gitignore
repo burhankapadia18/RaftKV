@@ -59,3 +59,15 @@ f.txt
 # private keys, not even throwaway ones — a committed key is a key that gets
 # copied into something real.
 certs/
+
+# A compiled kvbench got committed once: `go build ./...` with the source
+# bind-mounted writes the binary into the module root, and `git add -A` took it.
+# 7.9 MiB of build output, and the reason a push failed with HTTP 400.
+bench/kvbench
+cpp-app/fuzz-build/
+cpp-app/build-fuzz/
+
+# libFuzzer writes newly interesting inputs into its FIRST corpus argument. The
+# documented commands now point that at /tmp, but ignore the conventional local
+# name too so an ad-hoc run cannot re-add hundreds of hash-named files.
+cpp-app/fuzz/corpus-generated/

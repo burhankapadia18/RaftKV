@@ -203,7 +203,12 @@ pytest tests/e2e -m requires_secure -v -rs
 cmake -S cpp-app -B cpp-app/fuzz-build -DKVDB_BUILD_FUZZERS=ON \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build cpp-app/fuzz-build -j4
-./cpp-app/fuzz-build/fuzz_kv_command cpp-app/fuzz/corpus/kv_command -max_total_time=60
+# Two corpus dirs: libFuzzer WRITES to the first and reads the rest as
+# seeds. Passing the checked-in seed dir first would fill it with
+# generated inputs.
+mkdir -p /tmp/corpus-kv
+./cpp-app/fuzz-build/fuzz_kv_command /tmp/corpus-kv \
+  cpp-app/fuzz/corpus/kv_command -max_total_time=60
 ```
 
 **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on every

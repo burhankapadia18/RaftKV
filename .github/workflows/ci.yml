@@ -276,14 +276,22 @@ jobs:
       # OOM or sanitizer report fails the job and the input becomes a checked-in
       # regression test — that is how the map-header amplification DoS in
       # KVCommand was found and fixed.
+      # TWO corpus directories, and the order matters. libFuzzer writes newly
+      # interesting inputs to the FIRST directory only and treats the rest as
+      # read-only seeds. Passing the checked-in seed corpus first — which the
+      # original version of this step did — makes a 60s run deposit hundreds of
+      # hash-named files into the repository. That is how 1671 generated inputs got
+      # committed alongside 7 authored seeds.
       - name: Fuzz KVCommand::from_msgpack
         run: |
-          ./cpp-app/build-fuzz/fuzz_kv_command cpp-app/fuzz/corpus/kv_command \
+          mkdir -p /tmp/corpus-kv
+          ./cpp-app/build-fuzz/fuzz_kv_command /tmp/corpus-kv cpp-app/fuzz/corpus/kv_command \
             -max_total_time=60 -artifact_prefix=/tmp/fuzz-kv-
 
       - name: Fuzz HttpRequestParser::parse
         run: |
-          ./cpp-app/build-fuzz/fuzz_http_parser cpp-app/fuzz/corpus/http_parser \
+          mkdir -p /tmp/corpus-http
+          ./cpp-app/build-fuzz/fuzz_http_parser /tmp/corpus-http cpp-app/fuzz/corpus/http_parser \
             -max_total_time=60 -artifact_prefix=/tmp/fuzz-http-
 
       - name: Upload crash artifacts
