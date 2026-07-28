@@ -50,6 +50,17 @@ type Forwarder interface {
 // HTTPForwarder relays over plain HTTP to a peer's management port.
 type HTTPForwarder struct {
 	client *http.Client
+
+	// token is presented to the leader on a relayed request (R6.2). A follower
+	// relaying a join must authenticate as itself: the leader authorizes the
+	// REQUEST it receives, and it cannot see the original caller's credential.
+	token string
+}
+
+// WithAuthToken sets the token presented on relayed requests.
+func (f *HTTPForwarder) WithAuthToken(token string) *HTTPForwarder {
+	f.token = token
+	return f
 }
 
 // NewHTTPForwarder returns a Forwarder with a bounded per-request timeout.
@@ -77,6 +88,9 @@ func (f *HTTPForwarder) Forward(ctx context.Context, mgmtAddr, path, rawQuery st
 		return nil, fmt.Errorf("building forwarded request to %s: %w", mgmtAddr, err)
 	}
 	req.Header.Set(ForwardedHeader, "1")
+	if f.token != "" {
+		req.Header.Set(AuthHeader, bearerPrefix+f.token)
+	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {

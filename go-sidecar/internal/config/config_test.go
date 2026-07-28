@@ -53,7 +53,16 @@ var expectedFlags = []struct {
 	// R5.1: the slog threshold. Part of the same contract — an operator turns
 	// debug on through this flag or the LOG_LEVEL env var entrypoint.sh forwards.
 	{name: "log-level", defValue: "info", usage: "Log threshold: debug|info|warn|error"},
+	// R6.1: the cluster-admin token. Its DEFAULT is deliberately not pinned here
+	// — it comes from RAFTKV_MGMT_TOKEN, so a fixed expectation would fail on any
+	// machine that happens to have the variable set, including a real deployment.
+	// The name and usage are the contract; the value is environment.
+	{name: "mgmt-token", defValue: anyValue, usage: "Cluster-admin bearer token for /join and /remove (prefer RAFTKV_MGMT_TOKEN)"},
 }
+
+// anyValue marks a flag whose default is environment-derived and therefore not
+// pinnable. The table check skips comparing defValue when it sees this.
+const anyValue = "\x00any"
 
 // TestSnapshotFlagDefaultsMatchConstants ties the flag defaults to the exported
 // Default* constants. Without this the two can drift: raftnode and any future
@@ -120,7 +129,9 @@ func TestRegisteredFlags(t *testing.T) {
 			if f == nil {
 				t.Fatalf("flag -%s is not registered on flag.CommandLine", tt.name)
 			}
-			if f.DefValue != tt.defValue {
+			// anyValue: the default is environment-derived, so pinning it would
+			// fail wherever the variable happens to be set — including production.
+			if tt.defValue != anyValue && f.DefValue != tt.defValue {
 				t.Errorf("flag -%s default = %q, want %q", tt.name, f.DefValue, tt.defValue)
 			}
 			if f.Usage != tt.usage {

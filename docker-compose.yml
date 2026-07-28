@@ -1,5 +1,15 @@
 # The `version:` key is obsolete on modern compose and is deliberately omitted;
 # it only produced a deprecation warning on every command.
+#
+# RAFTKV_MGMT_TOKEN guards /join and /remove (R6.1). It is interpolated from the
+# environment with a dev-only fallback so `docker compose up` still works out of
+# the box — but the fallback is a KNOWN constant and must not be used anywhere
+# real. Set it for anything beyond a laptop:
+#
+#     export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
+#
+# The endpoints are closed, not open, when it is unset — so a cluster that forgets
+# this cannot grow rather than being silently world-writable.
 services:
   node1:
     image: raftkv:latest
@@ -7,6 +17,7 @@ services:
     environment:
       - NODE_ID=node1
       - BOOTSTRAP=true
+      - RAFTKV_MGMT_TOKEN=${RAFTKV_MGMT_TOKEN:-dev-only-insecure-token}
     ports:
       # 8080 is the client HTTP API. 6000 is the management API (/status,
       # /join, /remove), published from Phase 4 on because a client can no
@@ -34,6 +45,7 @@ services:
     environment:
       - NODE_ID=node2
       - JOIN_ADDR=node1:6000
+      - RAFTKV_MGMT_TOKEN=${RAFTKV_MGMT_TOKEN:-dev-only-insecure-token}
     depends_on:
       node1:
         # Without this, node2 starts its join retry loop against a node1 that is
@@ -62,6 +74,7 @@ services:
     environment:
       - NODE_ID=node3
       - JOIN_ADDR=node1:6000
+      - RAFTKV_MGMT_TOKEN=${RAFTKV_MGMT_TOKEN:-dev-only-insecure-token}
     depends_on:
       node1:
         condition: service_healthy

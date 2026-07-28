@@ -4,6 +4,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -57,6 +58,10 @@ type Config struct {
 	TrailingLogs      uint64
 	// LogLevel is the slog threshold: debug|info|warn|error (R5.1).
 	LogLevel string
+
+	// MgmtToken is the cluster-admin bearer token guarding /join and /remove
+	// (R6.1). Empty DISABLES those endpoints rather than leaving them open.
+	MgmtToken string
 }
 
 // flags holds the command-line flag pointers
@@ -75,6 +80,7 @@ var flags struct {
 	snapshotThreshold *uint64
 	trailingLogs      *uint64
 	logLevel          *string
+	mgmtToken         *string
 }
 
 func init() {
@@ -97,6 +103,9 @@ func init() {
 	flags.snapshotThreshold = flag.Uint64("snapshot-threshold", DefaultSnapshotThreshold, "Applied entries since the last snapshot before a new one is taken")
 	flags.trailingLogs = flag.Uint64("trailing-logs", DefaultTrailingLogs, "Log entries to retain behind a snapshot")
 	flags.logLevel = flag.String("log-level", DefaultLogLevel, "Log threshold: debug|info|warn|error")
+	// Default comes from the environment so the token never has to appear in a
+	// process listing, where any local user could read it off `ps`.
+	flags.mgmtToken = flag.String("mgmt-token", os.Getenv("RAFTKV_MGMT_TOKEN"), "Cluster-admin bearer token for /join and /remove (prefer RAFTKV_MGMT_TOKEN)")
 }
 
 // Parse parses command-line flags and returns a Config.
@@ -118,6 +127,7 @@ func Parse() *Config {
 		SnapshotThreshold: *flags.snapshotThreshold,
 		TrailingLogs:      *flags.trailingLogs,
 		LogLevel:          *flags.logLevel,
+		MgmtToken:         *flags.mgmtToken,
 	}
 }
 

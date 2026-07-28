@@ -29,6 +29,10 @@ func SetLogger(l *slog.Logger) {
 }
 
 type JoinConfig struct {
+	// AuthToken is the cluster-admin bearer token the leader requires (R6.1/R6.2).
+	// Empty means none is sent, which the leader will refuse unless it too is
+	// unconfigured.
+	AuthToken      string
 	LeaderMgmtAddr string
 	NodeID         string
 	RaftAddr       string
@@ -109,7 +113,15 @@ func (j *Joiner) JoinAsync() {
 
 // attemptJoin makes a single attempt to join the cluster.
 func (j *Joiner) attemptJoin(url string) error {
-	resp, err := j.client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("building join request: %w", err)
+	}
+	if j.config.AuthToken != "" {
+		req.Header.Set("Authorization", "Bearer "+j.config.AuthToken)
+	}
+
+	resp, err := j.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("connection failed: %w", err)
 	}

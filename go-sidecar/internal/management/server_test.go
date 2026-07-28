@@ -41,6 +41,19 @@ func TestMain(m *testing.M) {
 // in cmd/sidecar/main.go, which passes a *raftnode.Node to NewServer.
 var _ RaftControl = (*raftnode.Node)(nil)
 
+// testAuthToken is the cluster-admin token used by tests that exercise the
+// MUTATING endpoints. Those endpoints are closed by default since R6.1, so a test
+// that wants to reach the handler behind the auth check has to present one — the
+// auth behavior itself is covered separately by TestJoinRequiresAToken.
+const testAuthToken = "test-cluster-admin-token"
+
+// authedRequest builds a request carrying the cluster-admin token.
+func authedRequest(method, target string) *http.Request {
+	req := httptest.NewRequest(method, target, nil)
+	req.Header.Set("Authorization", "Bearer "+testAuthToken)
+	return req
+}
+
 // addVoterCall records the arguments of a single AddVoter invocation.
 type addVoterCall struct {
 	id      string
@@ -243,10 +256,11 @@ func TestHandleJoin(t *testing.T) {
 			// isLeader: only the leader does the work itself. Since R4.12 a
 			// follower forwards instead, which TestJoinForwarding covers.
 			node := &fakeRaftControl{isLeader: true, addVoterErr: tc.addVoterErr}
-			server := NewServer(node, "6000", nil, nil)
+			server := NewServer(node, "6000", nil, nil).
+				WithAuthToken(testAuthToken)
 
 			rec := httptest.NewRecorder()
-			server.handleJoin(rec, httptest.NewRequest(tc.method, tc.target, nil))
+			server.handleJoin(rec, authedRequest(tc.method, tc.target))
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
@@ -630,7 +644,7 @@ func TestStartServesAndStops(t *testing.T) {
 		firstLogIndex: 8001,
 	}
 	port := freePort(t)
-	server := NewServer(node, port, nil, nil)
+	server := NewServer(node, port, nil, nil).WithAuthToken(testAuthToken)
 
 	server.Start()
 	t.Cleanup(func() {
@@ -662,16 +676,27 @@ func TestStartServesAndStops(t *testing.T) {
 
 	// Every route Start registers must be reachable at its real path.
 	for _, route := range []struct {
-		path     string
-		wantBody string
+		path      string
+		wantBody  string
+		needsAuth bool
 	}{
-		{"/health", "OK"},
+		{"/health", "OK", false},
 		{"/status", `{"is_leader":true,"leader_addr":"node1:8088",` +
 			`"first_log_index":8001,"last_log_index":9000,"applied_index":9000,` +
-			`"commit_index":9000,"last_snapshot_index":8500}`},
-		{"/join?peerID=node2&peerAddress=node2:8088", "Joined successfully"},
+			`"commit_index":9000,"last_snapshot_index":8500}`, false},
+		{"/join?peerID=node2&peerAddress=node2:8088", "Joined successfully", true},
 	} {
-		resp, err := client.Get(baseURL + route.path)
+		req, err := http.NewRequest(http.MethodGet, baseURL+route.path, nil)
+		if err != nil {
+			t.Fatalf("building GET %s: %v", route.path, err)
+		}
+		// Only the mutating route carries a credential. The read-only ones are
+		// deliberately requested WITHOUT one, so this loop also proves probes and
+		// scrapers are not gated (R6.1).
+		if route.needsAuth {
+			req.Header.Set("Authorization", "Bearer "+testAuthToken)
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("GET %s: %v", route.path, err)
 		}
@@ -765,11 +790,12 @@ func TestJoinForwarding(t *testing.T) {
 		fwd := &recordingForwarder{
 			result: &ForwardResult{Status: http.StatusOK, Body: []byte("Joined successfully")},
 		}
-		server := NewServer(node, "6000", resolver, fwd)
+		server := NewServer(node, "6000", resolver, fwd).
+			WithAuthToken(testAuthToken)
 
 		rec := httptest.NewRecorder()
-		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
-			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+		server.handleJoin(rec, authedRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088"))
 
 		if rec.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -798,11 +824,12 @@ func TestJoinForwarding(t *testing.T) {
 	t.Run("the leader does the work and does not forward", func(t *testing.T) {
 		node := &fakeRaftControl{isLeader: true}
 		fwd := &recordingForwarder{}
-		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd).
+			WithAuthToken(testAuthToken)
 
 		rec := httptest.NewRecorder()
-		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
-			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+		server.handleJoin(rec, authedRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088"))
 
 		if rec.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -823,10 +850,11 @@ func TestJoinForwarding(t *testing.T) {
 		fwd := &recordingForwarder{
 			result: &ForwardResult{Status: http.StatusOK, Body: []byte("should never be used")},
 		}
-		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd).
+			WithAuthToken(testAuthToken)
 
-		req := httptest.NewRequest(http.MethodPost,
-			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil)
+		req := authedRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088")
 		req.Header.Set(ForwardedHeader, "1")
 
 		rec := httptest.NewRecorder()
@@ -849,11 +877,12 @@ func TestJoinForwarding(t *testing.T) {
 		node := &fakeRaftControl{isLeader: false, leaderAddr: ""}
 		fwd := &recordingForwarder{}
 		server := NewServer(node, "6000",
-			&fakeResolver{err: errors.New("peers: no leader address known")}, fwd)
+			&fakeResolver{err: errors.New("peers: no leader address known")}, fwd).
+			WithAuthToken(testAuthToken)
 
 		rec := httptest.NewRecorder()
-		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
-			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+		server.handleJoin(rec, authedRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088"))
 
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
@@ -866,11 +895,12 @@ func TestJoinForwarding(t *testing.T) {
 	t.Run("a failed relay is 503, not a masked success", func(t *testing.T) {
 		node := &fakeRaftControl{isLeader: false, leaderAddr: "node1:8088"}
 		fwd := &recordingForwarder{err: errors.New("connection refused")}
-		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd).
+			WithAuthToken(testAuthToken)
 
 		rec := httptest.NewRecorder()
-		server.handleJoin(rec, httptest.NewRequest(http.MethodPost,
-			"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil))
+		server.handleJoin(rec, authedRequest(http.MethodPost,
+			"/join?peerID=node2&peerAddress=10.0.0.2:8088"))
 
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
@@ -930,10 +960,11 @@ func TestHandleRemove(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			node := &fakeRaftControl{isLeader: tc.isLeader, removeServerErr: tc.removeErr}
-			server := NewServer(node, "6000", nil, nil)
+			server := NewServer(node, "6000", nil, nil).
+				WithAuthToken(testAuthToken)
 
 			rec := httptest.NewRecorder()
-			server.handleRemove(rec, httptest.NewRequest(tc.method, tc.target, nil))
+			server.handleRemove(rec, authedRequest(tc.method, tc.target))
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.wantStatus,
@@ -954,10 +985,11 @@ func TestHandleRemove(t *testing.T) {
 		fwd := &recordingForwarder{
 			result: &ForwardResult{Status: http.StatusOK, Body: []byte("Removed successfully")},
 		}
-		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd)
+		server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd).
+			WithAuthToken(testAuthToken)
 
 		rec := httptest.NewRecorder()
-		server.handleRemove(rec, httptest.NewRequest(http.MethodPost, "/remove?peerID=node3", nil))
+		server.handleRemove(rec, authedRequest(http.MethodPost, "/remove?peerID=node3"))
 
 		if rec.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
@@ -1178,5 +1210,211 @@ func TestReadyBoundsASlowProbe(t *testing.T) {
 	}
 	if probe.callCount() != 1 {
 		t.Errorf("probe called %d times, want 1", probe.callCount())
+	}
+}
+
+// --- R6.1/R6.2: cluster-admin token on the mutating endpoints -------------
+
+// TestJoinRequiresAToken is the Phase 6 headline: before this, anyone who could
+// reach port 6000 could add a voter to the cluster.
+func TestJoinRequiresAToken(t *testing.T) {
+	const token = "s3cret-cluster-admin"
+
+	tests := []struct {
+		name       string
+		configured string // token the server is configured with
+		header     string // raw Authorization header sent, "" for none
+		wantStatus int
+		wantAdded  bool
+	}{
+		{
+			name:       "no token configured disables the endpoint",
+			configured: "",
+			header:     "Bearer " + token,
+			wantStatus: http.StatusForbidden,
+			wantAdded:  false,
+		},
+		{
+			// THE test. An unauthenticated caller must not be able to grow the
+			// cluster, and the assertion that matters is wantAdded=false — a 403
+			// that still called AddVoter would be worse than no check at all.
+			name:       "missing header is rejected and the peer is NOT added",
+			configured: token,
+			header:     "",
+			wantStatus: http.StatusUnauthorized,
+			wantAdded:  false,
+		},
+		{
+			name:       "wrong token is rejected and the peer is NOT added",
+			configured: token,
+			header:     "Bearer wrong-token",
+			wantStatus: http.StatusForbidden,
+			wantAdded:  false,
+		},
+		{
+			name:       "a token of the right length but wrong bytes is rejected",
+			configured: token,
+			header:     "Bearer " + strings.Repeat("x", len(token)),
+			wantStatus: http.StatusForbidden,
+			wantAdded:  false,
+		},
+		{
+			// A prefix must not pass: this is what a timing attack would try to
+			// build up one byte at a time.
+			name:       "a correct prefix is rejected",
+			configured: token,
+			header:     "Bearer " + token[:5],
+			wantStatus: http.StatusForbidden,
+			wantAdded:  false,
+		},
+		{
+			name:       "the wrong auth scheme is rejected",
+			configured: token,
+			header:     "Basic " + token,
+			wantStatus: http.StatusUnauthorized,
+			wantAdded:  false,
+		},
+		{
+			name:       "the correct token joins",
+			configured: token,
+			header:     "Bearer " + token,
+			wantStatus: http.StatusOK,
+			wantAdded:  true,
+		},
+		{
+			// RFC 7235 says the scheme is case-insensitive, and a client sending
+			// "bearer" is not the attacker this defends against.
+			name:       "the scheme is case-insensitive",
+			configured: token,
+			header:     "bearer " + token,
+			wantStatus: http.StatusOK,
+			wantAdded:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &fakeRaftControl{isLeader: true}
+			server := NewServer(node, "6000", nil, nil).WithAuthToken(tc.configured)
+
+			req := httptest.NewRequest(http.MethodPost,
+				"/join?peerID=node2&peerAddress=10.0.0.2:8088", nil)
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+
+			rec := httptest.NewRecorder()
+			server.handleJoin(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d (body %q)", rec.Code, tc.wantStatus,
+					rec.Body.String())
+			}
+			added := len(node.addVoterCallsSnapshot()) > 0
+			if added != tc.wantAdded {
+				t.Errorf("AddVoter called = %v, want %v — an unauthorized caller "+
+					"must not be able to change cluster membership", added, tc.wantAdded)
+			}
+		})
+	}
+}
+
+// TestRemoveRequiresAToken: /remove can shrink the cluster below quorum, so it is
+// at least as sensitive as /join.
+func TestRemoveRequiresAToken(t *testing.T) {
+	const token = "s3cret"
+	node := &fakeRaftControl{isLeader: true}
+	server := NewServer(node, "6000", nil, nil).WithAuthToken(token)
+
+	rec := httptest.NewRecorder()
+	server.handleRemove(rec,
+		httptest.NewRequest(http.MethodPost, "/remove?peerID=node3", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if ids := node.removeServerIDsSnapshot(); len(ids) != 0 {
+		t.Errorf("unauthenticated caller removed %v from the cluster", ids)
+	}
+}
+
+// TestReadOnlyEndpointsStayUnauthenticated: probes and scrapers must keep working.
+// Requiring a token on /ready would mean an orchestrator could never see a node as
+// healthy, and on /metrics that Prometheus could never scrape it.
+func TestReadOnlyEndpointsStayUnauthenticated(t *testing.T) {
+	node := &fakeRaftControl{
+		isLeader:   true,
+		leaderAddr: "node1:8088",
+		stats:      map[string]string{"state": "Leader"},
+	}
+	server := NewServer(node, "6000", nil, nil).
+		WithAuthToken("s3cret").
+		WithBackendProbe(&fakeProbe{})
+
+	for _, tc := range []struct {
+		name    string
+		handler func(http.ResponseWriter, *http.Request)
+		path    string
+	}{
+		{"health", server.handleHealth, "/health"},
+		{"ready", server.handleReady, "/ready"},
+		{"status", server.handleStatus, "/status"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tc.handler(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("%s returned %d without a token; probes and scrapers "+
+					"cannot authenticate and must not be gated", tc.path, rec.Code)
+			}
+		})
+	}
+}
+
+// TestUnauthorizedJoinIsNotForwarded: a rejected request must be refused where it
+// lands, not relayed to the leader for the leader to reject again. Forwarding it
+// would let an unauthenticated caller generate traffic to the leader at will.
+func TestUnauthorizedJoinIsNotForwarded(t *testing.T) {
+	node := &fakeRaftControl{isLeader: false, leaderAddr: "node1:8088"}
+	fwd := &recordingForwarder{
+		result: &ForwardResult{Status: http.StatusOK, Body: []byte("should not happen")},
+	}
+	server := NewServer(node, "6000", &fakeResolver{addr: "node1:6000"}, fwd).
+		WithAuthToken("s3cret")
+
+	rec := httptest.NewRecorder()
+	server.handleJoin(rec,
+		httptest.NewRequest(http.MethodPost, "/join?peerID=n&peerAddress=a:1", nil))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if fwd.callCount() != 0 {
+		t.Errorf("relayed an unauthenticated request %d times, want 0",
+			fwd.callCount())
+	}
+}
+
+func TestExtractBearer(t *testing.T) {
+	for _, tc := range []struct {
+		header string
+		want   string
+	}{
+		{"Bearer abc", "abc"},
+		{"bearer abc", "abc"},
+		{"BEARER abc", "abc"},
+		{"Bearer   abc  ", "abc"},
+		{"Basic abc", ""},
+		{"abc", ""},
+		{"", ""},
+		{"Bearer", ""},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		if tc.header != "" {
+			req.Header.Set("Authorization", tc.header)
+		}
+		if got := extractBearer(req); got != tc.want {
+			t.Errorf("extractBearer(%q) = %q, want %q", tc.header, got, tc.want)
+		}
 	}
 }

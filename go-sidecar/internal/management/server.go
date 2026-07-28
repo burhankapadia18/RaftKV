@@ -74,6 +74,18 @@ type Server struct {
 
 	// metricsHandler is mounted at /metrics when set (R5.3).
 	metricsHandler http.Handler
+
+	// authToken guards the mutating endpoints (R6.1). Empty means they are
+	// DISABLED, not open — see authorize().
+	authToken string
+}
+
+// WithAuthToken sets the cluster-admin bearer token for /join and /remove.
+//
+// Without it those endpoints are disabled rather than open.
+func (s *Server) WithAuthToken(token string) *Server {
+	s.authToken = token
+	return s
 }
 
 // WithBackendProbe adds the state-machine reachability check to /ready.
@@ -143,6 +155,12 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Authorize before validating parameters: an unauthenticated caller should not
+	// be able to probe what this endpoint accepts.
+	if s.authorize(w, r) {
+		return
+	}
+
 	peerAddress := r.URL.Query().Get("peerAddress")
 	peerID := r.URL.Query().Get("peerID")
 
@@ -171,6 +189,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.authorize(w, r) {
 		return
 	}
 

@@ -103,18 +103,22 @@ func main() {
 	prometheus.MustRegister(metrics.NewRaftCollector(node))
 
 	mgmtServer := management.NewServer(node, cfg.MgmtPort, resolver,
-		management.NewHTTPForwarder(mgmtForwardTimeout)).
+		management.NewHTTPForwarder(mgmtForwardTimeout).
+			WithAuthToken(cfg.MgmtToken)).
+		WithAuthToken(cfg.MgmtToken).
 		WithBackendProbe(storeReader).
 		WithMetricsHandler(promhttp.Handler())
 	mgmtServer.Start()
 
 	// Join cluster if requested
 	if cfg.JoinAddr != "" {
-		joiner := cluster.NewJoiner(cluster.DefaultJoinConfig(
+		joinCfg := cluster.DefaultJoinConfig(
 			cfg.JoinAddr,
 			cfg.NodeID,
 			cfg.AdvertiseAddr(),
-		))
+		)
+		joinCfg.AuthToken = cfg.MgmtToken
+		joiner := cluster.NewJoiner(joinCfg)
 		joiner.JoinAsync()
 	}
 
