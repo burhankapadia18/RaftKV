@@ -562,13 +562,41 @@ public:
    * connection is still answered.
    */
   void stop() {
-    stopping_.store(true, std::memory_order_relaxed);
+    request_stop();
+    // Joining the workers is the part that must NOT happen in a signal handler,
+    // which is why it lives here and not in request_stop().
+    pool_.stop();
     if (server_fd_ >= 0) {
-      ::shutdown(server_fd_, SHUT_RDWR);
       close(server_fd_);
       server_fd_ = -1;
     }
-    pool_.stop();
+  }
+
+  /**
+   * @brief Ask the accept loop to stop, using only async-signal-safe calls.
+   *
+   * Safe to call from a POSIX signal handler, which is the whole reason it is
+   * separate from stop(). Only two things happen here: an atomic store, and
+   * shutdown(2) on the listen socket. Both are async-signal-safe.
+   *
+   * stop() joins the worker pool, and joining threads from a signal handler is
+   * not safe — it takes locks the interrupted thread may already hold, so the
+   * process can deadlock or die without ever running the handler's own code.
+   * That was not theoretical: the first version of the SIGTERM path called
+   * stop() directly from the handler and produced no output at all before the
+   * process went away.
+   *
+   * shutdown() rather than close(): closing the descriptor here would race a
+   * worker still using it, and shutdown() is what actually unblocks a thread
+   * parked in accept(). run() then sees the flag and returns, and main does the
+   * real cleanup from normal context.
+   */
+  void request_stop() {
+    stopping_.store(true, std::memory_order_relaxed);
+    const int fd = server_fd_;
+    if (fd >= 0) {
+      ::shutdown(fd, SHUT_RDWR);
+    }
   }
 
 private:

@@ -109,8 +109,39 @@ echo "Starting Go Sidecar with args: $GO_ARGS"
 ./sidecar $GO_ARGS &
 GO_PID=$!
 
-# 5. Wait for any process to exit
-wait -n
+# 5. Forward SIGTERM/SIGINT to both children (R5.7).
+#
+# Without this, `docker compose stop` signalled this shell only. The children were
+# never told, the grace period expired, and docker SIGKILLed everything — so the
+# C++ side never drained its in-flight requests and the sidecar never got to hand
+# leadership away. A planned stop cost the cluster a full election, and
+# `docker compose stop` took the entire timeout every time.
+forward_shutdown() {
+    echo "--- Node $ID received a shutdown signal, forwarding to children ---"
+    SHUTTING_DOWN=1
+    # `|| true`: a child that has already exited is not an error here.
+    [ -n "$CPP_PID" ] && kill -TERM "$CPP_PID" 2>/dev/null || true
+    [ -n "$GO_PID" ] && kill -TERM "$GO_PID" 2>/dev/null || true
+}
 
-# Exit with status of process that exited first
-exit $?
+SHUTTING_DOWN=
+trap forward_shutdown TERM INT
+
+# Block until a child exits on its own (a crash) or a signal interrupts us.
+# `wait` is interruptible by a trapped signal; that is what lets the handler run.
+wait -n
+FIRST_EXIT=$?
+
+# On a signal, `wait -n` returns as soon as the handler has run, with the children
+# still shutting down. Wait for them properly rather than exiting and letting
+# docker SIGKILL them mid-drain — the whole point of the graceful path.
+if [ -n "$SHUTTING_DOWN" ]; then
+    wait "$CPP_PID" 2>/dev/null || true
+    wait "$GO_PID" 2>/dev/null || true
+    echo "--- Node $ID shut down cleanly ---"
+    exit 0
+fi
+
+# Otherwise a child died unexpectedly: exit with its status so the container
+# reports the failure.
+exit $FIRST_EXIT

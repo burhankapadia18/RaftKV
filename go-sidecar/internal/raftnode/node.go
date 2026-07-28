@@ -198,6 +198,24 @@ func (n *Node) AddVoter(id, address string) error {
 	return future.Error()
 }
 
+// LeadershipTransfer asks Raft to hand leadership to another voter (R5.8).
+//
+// Called on shutdown so a planned stop does not cost an election. Without it the
+// cluster notices the leader is gone only when heartbeats time out, so every
+// client write fails for the election window — for a deploy or a restart, that is
+// downtime nobody needed to take.
+//
+// Fails on a follower and when there is no other voter to hand off to; both are
+// expected, so callers log and carry on rather than treating it as fatal.
+func (n *Node) LeadershipTransfer() error {
+	return n.Raft.LeadershipTransfer().Error()
+}
+
+// Shutdown stops Raft and waits for it to finish.
+func (n *Node) Shutdown() error {
+	return n.Raft.Shutdown().Error()
+}
+
 // Barrier blocks until every entry committed before the call has been applied to
 // this node's FSM.
 //

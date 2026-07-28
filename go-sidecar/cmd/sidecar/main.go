@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
@@ -26,6 +27,15 @@ import (
 // blocked while we wait, so an unbounded relay would turn one slow peer into a
 // stalled request on whichever node received it.
 const mgmtForwardTimeout = 10 * time.Second
+
+// leadershipTransferTimeout bounds the handoff on shutdown. Generous enough for a
+// healthy cluster to complete one, short enough that a wedged transfer does not
+// hold a container stop open until the orchestrator SIGKILLs it — which would
+// throw away the graceful shutdown entirely.
+const leadershipTransferTimeout = 5 * time.Second
+
+// shutdownTimeout bounds draining the management server.
+const shutdownTimeout = 5 * time.Second
 
 func main() {
 	// Parse configuration
@@ -100,14 +110,57 @@ func main() {
 	// store through this.
 	grpcServer := rpc.NewServer(node, forwarder).WithLocalReader(storeReader)
 
-	// Setup graceful shutdown
+	// Graceful shutdown (R5.8). The ORDER matters and each step earns its place:
+	//
+	//  1. Hand leadership away first, while we can still serve. Skipping this
+	//     costs the cluster a full election timeout on every planned restart, and
+	//     every client write fails for that window — downtime nobody needed.
+	//  2. Stop accepting new work (gRPC GracefulStop, management Shutdown) but
+	//     let in-flight requests finish. Dropping them would fail writes that were
+	//     already accepted.
+	//  3. Shut raft down last. It is what the FSM and the RPC handlers talk to, so
+	//     stopping it first would make the requests drained in step 2 fail anyway.
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
+		sig := <-sigCh
+		log.Printf("Received %s, shutting down gracefully", sig)
 
-		log.Println("Shutting down...")
+		if node.IsLeader() {
+			log.Println("This node is the leader; transferring leadership before exit")
+			// Bounded, and a failure is logged rather than fatal: there may be no
+			// other voter to hand off to (a single-node cluster, or peers already
+			// gone), and refusing to shut down over that would be worse than
+			// taking the election.
+			done := make(chan error, 1)
+			go func() { done <- node.LeadershipTransfer() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					log.Printf("Leadership transfer failed (continuing shutdown): %v", err)
+				} else {
+					log.Println("Leadership transferred")
+				}
+			case <-time.After(leadershipTransferTimeout):
+				log.Printf("Leadership transfer did not complete within %s; "+
+					"continuing shutdown", leadershipTransferTimeout)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := mgmtServer.Stop(ctx); err != nil {
+			log.Printf("Management server shutdown: %v", err)
+		}
+
+		// GracefulStop, not Stop: in-flight proposals have already been accepted
+		// and dropping them would fail writes a client believes are in progress.
 		grpcServer.Stop()
+
+		if err := node.Shutdown(); err != nil {
+			log.Printf("Raft shutdown: %v", err)
+		}
+		log.Println("Shutdown complete")
 	}()
 
 	// Log startup info

@@ -15,6 +15,16 @@ services:
       # ask who leads, and tests/e2e needs that to verify forwarding at all.
       - "8080:8080"
       - "6000:6000"
+    restart: unless-stopped
+    healthcheck:
+      # /ready, not /health: this gates depends_on, and what a dependent node
+      # needs to know is whether node1 can actually serve a join — which is
+      # readiness, not merely "the process started".
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
     volumes:
       - ./vol-node1:/app/data
 
@@ -24,9 +34,25 @@ services:
     environment:
       - NODE_ID=node2
       - JOIN_ADDR=node1:6000
+    depends_on:
+      node1:
+        # Without this, node2 starts its join retry loop against a node1 that is
+        # not up yet. cluster.Joiner retries 20 times so it recovered anyway, but
+        # the first several attempts were guaranteed to fail and the logs said so.
+        condition: service_healthy
     ports:
       - "8081:8080"
       - "6001:6000"
+    restart: unless-stopped
+    healthcheck:
+      # /ready, not /health: this gates depends_on, and what a dependent node
+      # needs to know is whether node1 can actually serve a join — which is
+      # readiness, not merely "the process started".
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
     volumes:
       - ./vol-node2:/app/data
 
@@ -36,8 +62,21 @@ services:
     environment:
       - NODE_ID=node3
       - JOIN_ADDR=node1:6000
+    depends_on:
+      node1:
+        condition: service_healthy
     ports:
       - "8082:8080"
       - "6002:6000"
+    restart: unless-stopped
+    healthcheck:
+      # /ready, not /health: this gates depends_on, and what a dependent node
+      # needs to know is whether node1 can actually serve a join — which is
+      # readiness, not merely "the process started".
+      test: ["CMD", "curl", "-fsS", "http://localhost:6000/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
     volumes:
       - ./vol-node3:/app/data
