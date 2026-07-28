@@ -208,8 +208,15 @@ jobs:
       # the standalone `docker-compose` binary is not guaranteed to be. The
       # compose file's top-level `version:` key produces a deprecation warning
       # on modern compose — that is expected and harmless.
+      # The snapshot override is applied HERE, not only in the crash/snapshot
+      # step, because the cluster is started once for the whole job. Without it
+      # tests/e2e/test_snapshot.py detects production snapshot tunables and
+      # SKIPS — which would leave Phase 3's headline requirement (a wiped
+      # follower catching up by snapshot transfer) ungated in CI while the job
+      # still reported green. `-rs` on the requires_docker run prints skip
+      # reasons so that can never happen silently again.
       - name: Start cluster
-        run: docker compose up -d
+        run: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
 
       # Bounded readiness poll instead of a fixed sleep. Two conditions:
       #   1. all three published HTTP ports answer a GET;

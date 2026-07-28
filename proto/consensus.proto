@@ -10,6 +10,29 @@ service RaftNode {
 
 service StateMachine {
   rpc Apply(Command) returns (ApplyResponse);
+
+  // Phase 3 — raft snapshot lifecycle. The C++ engine owns the state, so it
+  // serves both directions: Go asks for a snapshot to hand to raft, and hands
+  // a snapshot back when raft restores one.
+  //
+  // Chunk payloads are the Phase 2 base-file encoding ("KVB1" + length-prefixed
+  // records) — one format for disk and wire, so a snapshot is byte-identical to
+  // what kv.db would contain.
+  rpc GetSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
+  rpc RestoreSnapshot(stream SnapshotChunk) returns (RestoreResponse);
+}
+
+// Empty today; exists so the request can gain fields (a sequence number, a
+// requested format version) without changing the method signature.
+message SnapshotRequest {}
+
+message SnapshotChunk {
+  bytes data = 1;
+}
+
+message RestoreResponse {
+  bool success = 1;
+  string error = 2;
 }
 
 message Command {

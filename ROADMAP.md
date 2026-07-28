@@ -50,9 +50,14 @@ The gaps, confirmed by code review:
   flipped. A pre-Phase-2 `kv.db` is migrated on first read. An e2e test
   (`pytest tests/e2e -m requires_docker`) SIGKILLs a node and checks its disk
   before letting it restart.
-- **No snapshots.** `DiscardSnapshotStore` + `DummySnapshot` mean the raft log
-  grows forever, restarts replay the entire history, and a lagging follower can
-  never catch up via snapshot transfer.
+- ✅ **Snapshots and log compaction work** (Phase 3, complete). A real
+  `FileSnapshotStore`, streaming `GetSnapshot`/`RestoreSnapshot` RPCs over the
+  Phase 2 base-file encoding, and `SnapshotInterval`/`SnapshotThreshold`/
+  `TrailingLogs` tunables. The log is bounded, restarts apply a snapshot plus
+  the tail instead of replaying all history, and a follower whose volume is
+  deleted entirely rejoins and catches up by snapshot transfer — all three
+  proven by `tests/e2e/test_snapshot.py`. `TrailingLogs` is the setting that
+  actually truncates the log; snapshotting alone does not.
 - **Unusable from a client's perspective.** Writes to a follower are rejected
   rather than forwarded — the 503 does now name the leader, but it names its
   *Raft* address (`node1:8088`), which is not something a client can dial.
@@ -111,7 +116,7 @@ criteria) and implementation plan in `docs/phases/`:
 | 0 — Tests and CI | ✅ Complete | [docs/phases/phase-0-tests-and-ci.md](docs/phases/phase-0-tests-and-ci.md) |
 | 1 — Truthful errors | ✅ Complete | [docs/phases/phase-1-truthful-errors.md](docs/phases/phase-1-truthful-errors.md) |
 | 2 — Durability | ✅ Complete | [docs/phases/phase-2-durability.md](docs/phases/phase-2-durability.md) |
-| 3 — Snapshots & compaction | Not started | [docs/phases/phase-3-snapshots.md](docs/phases/phase-3-snapshots.md) |
+| 3 — Snapshots & compaction | ✅ Complete | [docs/phases/phase-3-snapshots.md](docs/phases/phase-3-snapshots.md) |
 | 4 — Client usability | Not started | [docs/phases/phase-4-client-usability.md](docs/phases/phase-4-client-usability.md) |
 | 5 — Operability | Not started | [docs/phases/phase-5-operability.md](docs/phases/phase-5-operability.md) |
 | 6 — Security | Not started | [docs/phases/phase-6-security.md](docs/phases/phase-6-security.md) |
@@ -322,7 +327,7 @@ README, CHANGELOG, tagged `v1.0.0` with multi-arch images pushed to a registry.
 | 0 | ✅ Complete | Tests + CI | M | everything |
 | 1 | ✅ Complete | Truthful errors | S–M | 2, 3, 4 |
 | 2 | ✅ Complete | Durability (WAL, atomic persist) | M | 3 |
-| 3 | Not started | Snapshots + compaction | L | 4 (wiped-node rejoin) |
+| 3 | ✅ Complete | Snapshots + compaction | L | 4 (wiped-node rejoin) |
 | 4 | Not started | Leader forwarding, consistency, HTTP rework | L | 5, 7 |
 | 5 | Not started | Logging, metrics, lifecycle | M | 7 |
 | 6 | Not started | TLS/auth, fuzzing | M | release |

@@ -71,6 +71,16 @@ public:
     return entries_.count(key) > 0;
   }
 
+  /** @brief Snapshot support (R3.2); the HTTP surface never calls these. */
+  [[nodiscard]] StateMap snapshot_state() const override {
+    return StateMap(entries_.begin(), entries_.end());
+  }
+
+  void restore_state(StateMap state) override {
+    entries_.clear();
+    entries_.insert(state.begin(), state.end());
+  }
+
 private:
   std::map<std::string, std::string> entries_;
 };

@@ -2,18 +2,34 @@ package management
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"my-raft-sidecar/internal/raftnode"
 )
+
+// TestMain silences the handlers' log chatter: /join logs every request and
+// /status logs a failed log-store read, both of which these tests trigger on
+// purpose.
+func TestMain(m *testing.M) {
+	log.SetOutput(io.Discard)
+	code := m.Run()
+	log.SetOutput(os.Stderr)
+	os.Exit(code)
+}
 
 // Compile-time proof that the real Raft node satisfies the consumer-side
 // interface this package declares.
@@ -40,12 +56,18 @@ type addVoterCall struct {
 // edge, so the recorder is mutex-guarded — same reasoning as joinRecorder in
 // internal/cluster/joiner_test.go.
 //
-// isLeader/leaderAddr/addVoterErr are configured before Start and never
-// written afterwards, so they need no lock.
+// isLeader/leaderAddr/addVoterErr/stats/firstLogIndex/firstLogErr are
+// configured before Start and never written afterwards, so they need no lock.
 type fakeRaftControl struct {
 	isLeader    bool
 	leaderAddr  string
 	addVoterErr error
+
+	// stats stands in for raft.Raft.Stats(). A nil map is a legitimate case:
+	// it is what a status poll sees if the library ever renames these keys.
+	stats         map[string]string
+	firstLogIndex uint64
+	firstLogErr   error
 
 	mu            sync.Mutex
 	addVoterCalls []addVoterCall
@@ -56,6 +78,30 @@ var _ RaftControl = (*fakeRaftControl)(nil)
 func (f *fakeRaftControl) IsLeader() bool { return f.isLeader }
 
 func (f *fakeRaftControl) LeaderAddr() string { return f.leaderAddr }
+
+func (f *fakeRaftControl) Stats() map[string]string { return f.stats }
+
+func (f *fakeRaftControl) FirstLogIndex() (uint64, error) {
+	if f.firstLogErr != nil {
+		return 0, f.firstLogErr
+	}
+	return f.firstLogIndex, nil
+}
+
+// raftStats builds a stats map with the four keys /status reads, in the decimal
+// string form raft.Raft.Stats() produces.
+func raftStats(lastLog, applied, commit, lastSnapshot uint64) map[string]string {
+	return map[string]string{
+		"last_log_index":      strconv.FormatUint(lastLog, 10),
+		"applied_index":       strconv.FormatUint(applied, 10),
+		"commit_index":        strconv.FormatUint(commit, 10),
+		"last_snapshot_index": strconv.FormatUint(lastSnapshot, 10),
+		// Raft reports a good deal more than this; carrying one extra key
+		// proves the handler projects the ones it wants rather than dumping
+		// the map.
+		"state": "Leader",
+	}
+}
 
 func (f *fakeRaftControl) AddVoter(id, address string) error {
 	f.mu.Lock()
@@ -196,53 +242,130 @@ func TestHandleJoin(t *testing.T) {
 	}
 }
 
-// TestHandleStatus pins the exact bytes produced by the current hand-rolled
-// fmt.Fprintf implementation, including the fact that the leader address is
-// quoted with Go's %q verb rather than by encoding/json.
+// TestHandleStatus pins the exact bytes of the /status payload.
 //
-// PIN: Phase 5 (R5.6) rewrites this handler with encoding/json and extends the
-// payload; these expectations are meant to change there, not before.
+// PIN: Phase 3 (R3.6) rewrote this handler with encoding/json and added the
+// five index fields. The earlier pins described a hand-rolled fmt.Fprintf body
+// with a space after each colon and Go %q quoting, and said Phase 5 (R5.6)
+// would make this change — Phase 3 got there first, because compaction is only
+// demonstrable if the log indices are exposed, and seven fields hand-formatted
+// with %v/%q is exactly the liability encoding/json exists to remove.
+//
+// Two consequences of the switch are pinned deliberately below:
+//   - no space after the colons (compact encoding/json output);
+//   - JSON escaping rather than Go quoting, so "<" becomes "\u003c"
+//     (encoding/json HTML-escapes by default and that default is kept).
 func TestHandleStatus(t *testing.T) {
 	tests := []struct {
-		name       string
-		isLeader   bool
-		leaderAddr string
-		wantBody   string
+		name     string
+		node     *fakeRaftControl
+		wantBody string
 	}{
 		{
-			name:       "leader",
-			isLeader:   true,
-			leaderAddr: "10.0.0.1:8088",
-			wantBody:   `{"is_leader": true, "leader_addr": "10.0.0.1:8088"}`,
+			name: "leader with a compacted log",
+			node: &fakeRaftControl{
+				isLeader:      true,
+				leaderAddr:    "10.0.0.1:8088",
+				stats:         raftStats(9000, 9000, 9000, 8500),
+				firstLogIndex: 8001,
+			},
+			wantBody: `{"is_leader":true,"leader_addr":"10.0.0.1:8088",` +
+				`"first_log_index":8001,"last_log_index":9000,"applied_index":9000,` +
+				`"commit_index":9000,"last_snapshot_index":8500}`,
 		},
 		{
-			name:       "follower with a known leader",
-			isLeader:   false,
-			leaderAddr: "10.0.0.1:8088",
-			wantBody:   `{"is_leader": false, "leader_addr": "10.0.0.1:8088"}`,
+			name: "follower lagging behind the commit index",
+			node: &fakeRaftControl{
+				isLeader:      false,
+				leaderAddr:    "10.0.0.1:8088",
+				stats:         raftStats(120, 100, 118, 0),
+				firstLogIndex: 1,
+			},
+			wantBody: `{"is_leader":false,"leader_addr":"10.0.0.1:8088",` +
+				`"first_log_index":1,"last_log_index":120,"applied_index":100,` +
+				`"commit_index":118,"last_snapshot_index":0}`,
 		},
 		{
-			name:       "follower with no leader elected yet",
-			isLeader:   false,
-			leaderAddr: "",
-			wantBody:   `{"is_leader": false, "leader_addr": ""}`,
+			name: "fresh node with no leader and an empty log",
+			node: &fakeRaftControl{
+				stats: raftStats(0, 0, 0, 0),
+			},
+			wantBody: `{"is_leader":false,"leader_addr":"",` +
+				`"first_log_index":0,"last_log_index":0,"applied_index":0,` +
+				`"commit_index":0,"last_snapshot_index":0}`,
 		},
 		{
-			// %q applies Go quoting, not JSON escaping: the double quote is
-			// backslash-escaped, but "<" is passed through verbatim, whereas
-			// encoding/json (HTML-escaping by default) would emit it as a
-			// numeric unicode escape. Pinned so Phase 5's rewrite shows here.
-			name:       "address is escaped with Go quoting",
-			isLeader:   false,
-			leaderAddr: `a"b<c`,
-			wantBody:   `{"is_leader": false, "leader_addr": "a\"b<c"}`,
+			// PIN: JSON escaping, not Go quoting. The quote is backslashed by
+			// both, but "<" only becomes a numeric escape under encoding/json.
+			name: "address is escaped by encoding/json",
+			node: &fakeRaftControl{
+				leaderAddr: `a"b<c`,
+				stats:      raftStats(0, 0, 0, 0),
+			},
+			wantBody: `{"is_leader":false,"leader_addr":"a\"b\u003cc",` +
+				`"first_log_index":0,"last_log_index":0,"applied_index":0,` +
+				`"commit_index":0,"last_snapshot_index":0}`,
+		},
+		{
+			// PIN: unknown/absent stat keys read as 0 rather than failing the
+			// whole poll. This is what a raft upgrade that renames a key would
+			// look like from outside.
+			name: "missing stat keys degrade to zero",
+			node: &fakeRaftControl{
+				isLeader:      true,
+				leaderAddr:    "node1:8088",
+				stats:         map[string]string{"last_log_index": "42"},
+				firstLogIndex: 7,
+			},
+			wantBody: `{"is_leader":true,"leader_addr":"node1:8088",` +
+				`"first_log_index":7,"last_log_index":42,"applied_index":0,` +
+				`"commit_index":0,"last_snapshot_index":0}`,
+		},
+		{
+			// PIN: a nil stats map is survivable — every index reads 0.
+			name: "nil stats map is survivable",
+			node: &fakeRaftControl{isLeader: true, leaderAddr: "node1:8088"},
+			wantBody: `{"is_leader":true,"leader_addr":"node1:8088",` +
+				`"first_log_index":0,"last_log_index":0,"applied_index":0,` +
+				`"commit_index":0,"last_snapshot_index":0}`,
+		},
+		{
+			// PIN: a non-numeric stat value is treated like a missing one.
+			name: "unparseable stat value degrades to zero",
+			node: &fakeRaftControl{
+				stats: map[string]string{
+					"last_log_index":      "not-a-number",
+					"applied_index":       "-1",
+					"commit_index":        "3",
+					"last_snapshot_index": "",
+				},
+			},
+			wantBody: `{"is_leader":false,"leader_addr":"",` +
+				`"first_log_index":0,"last_log_index":0,"applied_index":0,` +
+				`"commit_index":3,"last_snapshot_index":0}`,
+		},
+		{
+			// PIN: a log-store failure is reported in-band. /status still
+			// answers 200 with everything it does know, because the CI and e2e
+			// readiness polls depend on it answering at all.
+			name: "log store failure is reported as a field, not a 500",
+			node: &fakeRaftControl{
+				isLeader:      true,
+				leaderAddr:    "node1:8088",
+				stats:         raftStats(50, 50, 50, 40),
+				firstLogIndex: 41,
+				firstLogErr:   errors.New("database not open"),
+			},
+			wantBody: `{"is_leader":true,"leader_addr":"node1:8088",` +
+				`"first_log_index":0,"last_log_index":50,"applied_index":50,` +
+				`"commit_index":50,"last_snapshot_index":40,` +
+				`"log_store_error":"database not open"}`,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			node := &fakeRaftControl{isLeader: tc.isLeader, leaderAddr: tc.leaderAddr}
-			server := NewServer(node, "6000")
+			server := NewServer(tc.node, "6000")
 
 			rec := httptest.NewRecorder()
 			server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -261,13 +384,20 @@ func TestHandleStatus(t *testing.T) {
 
 	// PIN: /status does not check the request method; every verb is served.
 	t.Run("any method is served", func(t *testing.T) {
-		node := &fakeRaftControl{isLeader: true, leaderAddr: "10.0.0.1:8088"}
+		node := &fakeRaftControl{
+			isLeader:      true,
+			leaderAddr:    "10.0.0.1:8088",
+			stats:         raftStats(5, 5, 5, 0),
+			firstLogIndex: 1,
+		}
 		server := NewServer(node, "6000")
 
 		rec := httptest.NewRecorder()
 		server.handleStatus(rec, httptest.NewRequest(http.MethodDelete, "/status", nil))
 
-		want := `{"is_leader": true, "leader_addr": "10.0.0.1:8088"}`
+		want := `{"is_leader":true,"leader_addr":"10.0.0.1:8088",` +
+			`"first_log_index":1,"last_log_index":5,"applied_index":5,` +
+			`"commit_index":5,"last_snapshot_index":0}`
 		if rec.Code != http.StatusOK {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
 		}
@@ -275,6 +405,105 @@ func TestHandleStatus(t *testing.T) {
 			t.Errorf("body = %q, want %q", got, want)
 		}
 	})
+
+	// PIN: the log_store_error field is absent, not empty, on the happy path.
+	t.Run("log_store_error is omitted when the read succeeds", func(t *testing.T) {
+		node := &fakeRaftControl{stats: raftStats(1, 1, 1, 0), firstLogIndex: 1}
+		server := NewServer(node, "6000")
+
+		rec := httptest.NewRecorder()
+		server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+		if strings.Contains(rec.Body.String(), "log_store_error") {
+			t.Errorf("body = %q, must not mention log_store_error", rec.Body.String())
+		}
+	})
+}
+
+// ciReadinessPattern is the regexp CI's "Wait for cluster readiness" step greps
+// the /status body with (.github/workflows/ci.yml). Phase 3 moved this handler
+// to encoding/json, which drops the space after the colon — the pattern already
+// tolerated that, and this test is what keeps the two in step. Breaking it does
+// not fail any Go test on its own; it hangs the e2e job for 120s and then
+// reports an unready cluster, which is a much worse way to find out.
+var ciReadinessPattern = regexp.MustCompile(`"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"`)
+
+func TestStatusBodyMatchesCIReadinessProbe(t *testing.T) {
+	tests := []struct {
+		name       string
+		leaderAddr string
+		wantMatch  bool
+	}{
+		{name: "elected leader matches", leaderAddr: "node1:8088", wantMatch: true},
+		{name: "ipv4 leader matches", leaderAddr: "10.0.0.1:8088", wantMatch: true},
+		{
+			// The probe must NOT match before an election: an empty
+			// leader_addr is precisely the "not ready yet" state.
+			name:       "no leader yet does not match",
+			leaderAddr: "",
+			wantMatch:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node := &fakeRaftControl{leaderAddr: tc.leaderAddr, stats: raftStats(3, 3, 3, 0)}
+			server := NewServer(node, "6000")
+
+			rec := httptest.NewRecorder()
+			server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+			body := rec.Body.String()
+			if got := ciReadinessPattern.MatchString(body); got != tc.wantMatch {
+				t.Errorf("CI readiness pattern matched %v for body %q, want %v", got, body, tc.wantMatch)
+			}
+		})
+	}
+}
+
+// TestStatusIsValidJSON complements the byte-exact pins above: those would also
+// pass for a string that merely looks like JSON, which is how the hand-rolled
+// %q version managed to emit a raw "<" for years.
+func TestStatusIsValidJSON(t *testing.T) {
+	node := &fakeRaftControl{
+		isLeader:      true,
+		leaderAddr:    `weird"host<8088`,
+		stats:         raftStats(9000, 8999, 9000, 8500),
+		firstLogIndex: 8001,
+	}
+	server := NewServer(node, "6000")
+
+	rec := httptest.NewRecorder()
+	server.handleStatus(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	var decoded map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decoding %q: %v", rec.Body.String(), err)
+	}
+
+	if got := decoded["leader_addr"]; got != `weird"host<8088` {
+		t.Errorf("leader_addr = %v, want %q", got, `weird"host<8088`)
+	}
+
+	// json.Unmarshal into `any` yields float64; every index must survive the
+	// round trip as a JSON number, not a string.
+	wantIndices := map[string]float64{
+		"first_log_index":     8001,
+		"last_log_index":      9000,
+		"applied_index":       8999,
+		"commit_index":        9000,
+		"last_snapshot_index": 8500,
+	}
+	for key, want := range wantIndices {
+		got, ok := decoded[key].(float64)
+		if !ok {
+			t.Errorf("%s = %#v, want a JSON number", key, decoded[key])
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %v, want %v", key, got, want)
+		}
+	}
 }
 
 // TestHandleHealth pins that /health is unconditionally 200 "OK": it never
@@ -375,7 +604,12 @@ func freePort(t *testing.T) string {
 // mux wiring untested — this is the only test that proves /join, /status and
 // /health are actually registered on the paths clients use.
 func TestStartServesAndStops(t *testing.T) {
-	node := &fakeRaftControl{isLeader: true, leaderAddr: "node1:8088"}
+	node := &fakeRaftControl{
+		isLeader:      true,
+		leaderAddr:    "node1:8088",
+		stats:         raftStats(9000, 9000, 9000, 8500),
+		firstLogIndex: 8001,
+	}
 	port := freePort(t)
 	server := NewServer(node, port)
 
@@ -413,7 +647,9 @@ func TestStartServesAndStops(t *testing.T) {
 		wantBody string
 	}{
 		{"/health", "OK"},
-		{"/status", `{"is_leader": true, "leader_addr": "node1:8088"}`},
+		{"/status", `{"is_leader":true,"leader_addr":"node1:8088",` +
+			`"first_log_index":8001,"last_log_index":9000,"applied_index":9000,` +
+			`"commit_index":9000,"last_snapshot_index":8500}`},
 		{"/join?peerID=node2&peerAddress=node2:8088", "Joined successfully"},
 	} {
 		resp, err := client.Get(baseURL + route.path)

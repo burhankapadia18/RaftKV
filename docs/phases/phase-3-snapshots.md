@@ -88,3 +88,85 @@ This removes the limitation CLAUDE.md flags as "its own project".
 - `go test -race ./...`, `ctest`.
 - Full e2e including `test_snapshot.py` via CI; manual run of the wipe-and-rejoin
   scenario watching `docker compose logs` for restore lines on the rejoined node.
+
+## Outcome
+
+**Status: ✅ Complete.** All eight requirements landed. This is the phase CLAUDE.md
+called "its own project"; it is now the one with the strongest end-to-end evidence.
+
+### Verified results
+
+| Layer | Result |
+|---|---|
+| C++ | **224 tests**, 100% pass via CTest — up from 191 in Phase 2 |
+| C++ sanitizers | 224/224 under `-fsanitize=address,undefined` |
+| clang-format | gate clean across `cpp-app/src` and `cpp-app/tests` |
+| Go | `gofmt` clean, `go vet` clean, `go test -race` green. `internal/raftnode` has tests for the first time (71%); `fsm` and `rpc` at 100%, `management` 91.8%, `config` 89.5%, `backend` 87.2% |
+| e2e (default) | 13 passed, 4 deselected |
+| e2e (`-m requires_docker`) | **4/4** — the Phase 2 crash test plus all three Phase 3 snapshot scenarios |
+
+### The three snapshot scenarios, and the evidence they are real
+
+Run against a cluster started with `docker-compose.test.yml`
+(`SnapshotInterval=2s SnapshotThreshold=20 TrailingLogs=10`):
+
+1. **The log actually compacts.** `/status` after the run:
+   `first_log_index=83, last_log_index=96, last_snapshot_index=92` on the leader —
+   the first 82 entries are gone. A snapshot directory (`2-92-…`) exists on disk.
+   Asserting on `first_log_index` rather than on the file's existence is the point:
+   a snapshot that is written but never truncates anything is the default
+   behavior, not a working one.
+2. **A wiped follower catches up by snapshot transfer.** Its volume is deleted
+   entirely, then it rejoins. The logs show the mechanism rather than a lucky
+   replay:
+   `raft: Installed remote snapshot`, `snapshot restore progress: … 100.00%`,
+   `fsm: restored a 4937 byte snapshot into the C++ state machine`, and on the C++
+   side `[StateMachine] Restored snapshot: 87 entries (4937 bytes)`.
+3. **A normal restart applies snapshot + tail**, not the whole history.
+
+### Decisions taken during implementation
+
+- **`Snapshot()` captures eagerly; `Persist()` only writes.** R3.4 describes
+  opening the stream inside `Persist()`. That is wrong under raft's contract:
+  raft calls `Snapshot()` on the FSM goroutine with no `Apply` in flight, then may
+  call `Persist()` later, *concurrently with subsequent Applies*. Streaming from
+  the live store at Persist time would produce a snapshot labelled index N whose
+  contents are the state at some later index N+k. Because this store is
+  idempotent the cluster would re-converge on replay, so the bug would pass every
+  test while being wrong in general. The cost of doing it correctly is the whole
+  store in memory during a snapshot — a real scaling limit, documented in the code
+  rather than left implicit.
+- **`restore_state()` resets the WAL *before* writing the base file** — the
+  opposite order from compaction, deliberately. Compaction's WAL records are
+  already subsumed by the new base file, so a crash between the two costs an
+  idempotent re-replay. A restore's WAL holds *pre-restore* commands that the
+  snapshot neither contains nor was built from, so "persist snapshot, crash,
+  replay stale WAL on top" would recover to a state no replica ever had.
+- **One codec, not two.** The KVB1 encoder/decoder moved out of
+  `PersistentKVStore` into free `serialize_state`/`deserialize_state` functions
+  that both the base file and the snapshot stream go through, so the disk format
+  and the wire format cannot drift.
+- **The RPC bodies are thin adapters** over transport-free helpers
+  (`snapshot::for_each_chunk`, `snapshot::restore_from_payload`), because
+  `grpc::ServerWriter`/`ServerReader` cannot be constructed outside a running
+  server. The chunking and the decode-fully-before-touching-the-store rule are
+  unit-tested directly; the RPC wiring itself is covered only by the e2e suite,
+  which is stated plainly rather than papered over with a test that pretends.
+
+### Two real bugs found while verifying
+
+- **`entrypoint.sh` passed `-bootstrap true`.** Go's `flag` package treats the
+  bare `true` as the first positional argument and *stops parsing flags there*, so
+  every flag after it was silently discarded. Harmless while nothing followed it;
+  Phase 3 appends the snapshot tunables, so the bootstrap node was running
+  production snapshot settings while its command line said otherwise. Fixed to
+  `-bootstrap=true`. This was caught by `test_snapshot.py` refusing to run against
+  a cluster whose *reported* settings did not match the override — a guard written
+  to avoid a vacuous pass found a live misconfiguration instead.
+- **`raft-boltdb` v1 cannot be tested under `-race`.** It pulls
+  `github.com/boltdb/bolt`, which is unmaintained and trips Go's `checkptr`
+  instrumentation — and `-race` enables `checkptr`. `internal/raftnode` had no
+  tests before this phase, so nothing had ever opened a BoltDB store under the
+  race detector; the first test that did died with "converted pointer straddles
+  multiple allocations". Migrated to `raft-boltdb/v2` (bbolt), which shares the
+  on-disk format and is a drop-in.

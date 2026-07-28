@@ -67,11 +67,41 @@ GO_ARGS="-id $ID -raft $RAFT_PORT -srv $SIDE_PORT -app localhost:$APP_PORT -mgmt
 GO_ARGS="$GO_ARGS -advertise $ID"
 
 if [ "$BOOTSTRAP" = "true" ]; then
-    GO_ARGS="$GO_ARGS -bootstrap true"
+    # `-bootstrap=true`, NOT `-bootstrap true`. Go's flag package treats a bare
+    # `true` as the first POSITIONAL argument and stops parsing flags there, so
+    # the space-separated form silently discards every flag that follows it.
+    # That was harmless while nothing came after it; Phase 3 appends the
+    # snapshot tunables, and on the bootstrap node they were being dropped —
+    # the node ran production snapshot settings while its command line said
+    # otherwise. Caught by test_snapshot.py refusing to run against a cluster
+    # whose reported settings did not match the override.
+    GO_ARGS="$GO_ARGS -bootstrap=true"
 fi
 
 if [ ! -z "$JOIN_ADDR" ]; then
     GO_ARGS="$GO_ARGS -join $JOIN_ADDR"
+fi
+
+# Snapshot tunables (Phase 3). Each is forwarded only when set, so an unset
+# variable means "use the sidecar's own default" (HashiCorp Raft's: 120s /
+# 8192 entries / 10240 trailing logs) rather than a value picked here -- there
+# is exactly one place these defaults live, internal/config/config.go.
+#
+# docker-compose.test.yml sets all three far below production values so that
+# tests/e2e/test_snapshot.py can observe a snapshot and a log truncation inside
+# a test run. TRAILING_LOGS is not optional for that: Raft truncates to
+# snapshot_index - TrailingLogs, so with the default the log never shrinks
+# however often the node snapshots.
+if [ ! -z "$SNAPSHOT_INTERVAL" ]; then
+    GO_ARGS="$GO_ARGS -snapshot-interval $SNAPSHOT_INTERVAL"
+fi
+
+if [ ! -z "$SNAPSHOT_THRESHOLD" ]; then
+    GO_ARGS="$GO_ARGS -snapshot-threshold $SNAPSHOT_THRESHOLD"
+fi
+
+if [ ! -z "$TRAILING_LOGS" ]; then
+    GO_ARGS="$GO_ARGS -trailing-logs $TRAILING_LOGS"
 fi
 
 # 4. Start Go Sidecar (Foreground)

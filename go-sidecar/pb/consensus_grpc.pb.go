@@ -121,7 +121,9 @@ var RaftNode_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	StateMachine_Apply_FullMethodName = "/consensus.StateMachine/Apply"
+	StateMachine_Apply_FullMethodName           = "/consensus.StateMachine/Apply"
+	StateMachine_GetSnapshot_FullMethodName     = "/consensus.StateMachine/GetSnapshot"
+	StateMachine_RestoreSnapshot_FullMethodName = "/consensus.StateMachine/RestoreSnapshot"
 )
 
 // StateMachineClient is the client API for StateMachine service.
@@ -129,6 +131,15 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type StateMachineClient interface {
 	Apply(ctx context.Context, in *Command, opts ...grpc.CallOption) (*ApplyResponse, error)
+	// Phase 3 — raft snapshot lifecycle. The C++ engine owns the state, so it
+	// serves both directions: Go asks for a snapshot to hand to raft, and hands
+	// a snapshot back when raft restores one.
+	//
+	// Chunk payloads are the Phase 2 base-file encoding ("KVB1" + length-prefixed
+	// records) — one format for disk and wire, so a snapshot is byte-identical to
+	// what kv.db would contain.
+	GetSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error)
+	RestoreSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SnapshotChunk, RestoreResponse], error)
 }
 
 type stateMachineClient struct {
@@ -149,11 +160,52 @@ func (c *stateMachineClient) Apply(ctx context.Context, in *Command, opts ...grp
 	return out, nil
 }
 
+func (c *stateMachineClient) GetSnapshot(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SnapshotChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StateMachine_ServiceDesc.Streams[0], StateMachine_GetSnapshot_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SnapshotRequest, SnapshotChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_GetSnapshotClient = grpc.ServerStreamingClient[SnapshotChunk]
+
+func (c *stateMachineClient) RestoreSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SnapshotChunk, RestoreResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StateMachine_ServiceDesc.Streams[1], StateMachine_RestoreSnapshot_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SnapshotChunk, RestoreResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_RestoreSnapshotClient = grpc.ClientStreamingClient[SnapshotChunk, RestoreResponse]
+
 // StateMachineServer is the server API for StateMachine service.
 // All implementations must embed UnimplementedStateMachineServer
 // for forward compatibility.
 type StateMachineServer interface {
 	Apply(context.Context, *Command) (*ApplyResponse, error)
+	// Phase 3 — raft snapshot lifecycle. The C++ engine owns the state, so it
+	// serves both directions: Go asks for a snapshot to hand to raft, and hands
+	// a snapshot back when raft restores one.
+	//
+	// Chunk payloads are the Phase 2 base-file encoding ("KVB1" + length-prefixed
+	// records) — one format for disk and wire, so a snapshot is byte-identical to
+	// what kv.db would contain.
+	GetSnapshot(*SnapshotRequest, grpc.ServerStreamingServer[SnapshotChunk]) error
+	RestoreSnapshot(grpc.ClientStreamingServer[SnapshotChunk, RestoreResponse]) error
 	mustEmbedUnimplementedStateMachineServer()
 }
 
@@ -166,6 +218,12 @@ type UnimplementedStateMachineServer struct{}
 
 func (UnimplementedStateMachineServer) Apply(context.Context, *Command) (*ApplyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Apply not implemented")
+}
+func (UnimplementedStateMachineServer) GetSnapshot(*SnapshotRequest, grpc.ServerStreamingServer[SnapshotChunk]) error {
+	return status.Error(codes.Unimplemented, "method GetSnapshot not implemented")
+}
+func (UnimplementedStateMachineServer) RestoreSnapshot(grpc.ClientStreamingServer[SnapshotChunk, RestoreResponse]) error {
+	return status.Error(codes.Unimplemented, "method RestoreSnapshot not implemented")
 }
 func (UnimplementedStateMachineServer) mustEmbedUnimplementedStateMachineServer() {}
 func (UnimplementedStateMachineServer) testEmbeddedByValue()                      {}
@@ -206,6 +264,24 @@ func _StateMachine_Apply_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StateMachine_GetSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SnapshotRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(StateMachineServer).GetSnapshot(m, &grpc.GenericServerStream[SnapshotRequest, SnapshotChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_GetSnapshotServer = grpc.ServerStreamingServer[SnapshotChunk]
+
+func _StateMachine_RestoreSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(StateMachineServer).RestoreSnapshot(&grpc.GenericServerStream[SnapshotChunk, RestoreResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StateMachine_RestoreSnapshotServer = grpc.ClientStreamingServer[SnapshotChunk, RestoreResponse]
+
 // StateMachine_ServiceDesc is the grpc.ServiceDesc for StateMachine service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -218,6 +294,17 @@ var StateMachine_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _StateMachine_Apply_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "GetSnapshot",
+			Handler:       _StateMachine_GetSnapshot_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "RestoreSnapshot",
+			Handler:       _StateMachine_RestoreSnapshot_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "consensus.proto",
 }

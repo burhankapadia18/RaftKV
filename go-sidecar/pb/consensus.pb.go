@@ -21,6 +21,140 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Empty today; exists so the request can gain fields (a sequence number, a
+// requested format version) without changing the method signature.
+type SnapshotRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotRequest) Reset() {
+	*x = SnapshotRequest{}
+	mi := &file_consensus_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotRequest) ProtoMessage() {}
+
+func (x *SnapshotRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotRequest.ProtoReflect.Descriptor instead.
+func (*SnapshotRequest) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{0}
+}
+
+type SnapshotChunk struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Data          []byte                 `protobuf:"bytes,1,opt,name=data,proto3" json:"data,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SnapshotChunk) Reset() {
+	*x = SnapshotChunk{}
+	mi := &file_consensus_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SnapshotChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SnapshotChunk) ProtoMessage() {}
+
+func (x *SnapshotChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SnapshotChunk.ProtoReflect.Descriptor instead.
+func (*SnapshotChunk) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *SnapshotChunk) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+type RestoreResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	Error         string                 `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RestoreResponse) Reset() {
+	*x = RestoreResponse{}
+	mi := &file_consensus_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RestoreResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RestoreResponse) ProtoMessage() {}
+
+func (x *RestoreResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RestoreResponse.ProtoReflect.Descriptor instead.
+func (*RestoreResponse) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *RestoreResponse) GetSuccess() bool {
+	if x != nil {
+		return x.Success
+	}
+	return false
+}
+
+func (x *RestoreResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 type Command struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Op            string                 `protobuf:"bytes,1,opt,name=op,proto3" json:"op,omitempty"` // "SET", "DELETE"
@@ -33,7 +167,7 @@ type Command struct {
 
 func (x *Command) Reset() {
 	*x = Command{}
-	mi := &file_consensus_proto_msgTypes[0]
+	mi := &file_consensus_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -45,7 +179,7 @@ func (x *Command) String() string {
 func (*Command) ProtoMessage() {}
 
 func (x *Command) ProtoReflect() protoreflect.Message {
-	mi := &file_consensus_proto_msgTypes[0]
+	mi := &file_consensus_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -58,7 +192,7 @@ func (x *Command) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Command.ProtoReflect.Descriptor instead.
 func (*Command) Descriptor() ([]byte, []int) {
-	return file_consensus_proto_rawDescGZIP(), []int{0}
+	return file_consensus_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *Command) GetOp() string {
@@ -99,7 +233,7 @@ type ProposeResponse struct {
 
 func (x *ProposeResponse) Reset() {
 	*x = ProposeResponse{}
-	mi := &file_consensus_proto_msgTypes[1]
+	mi := &file_consensus_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -111,7 +245,7 @@ func (x *ProposeResponse) String() string {
 func (*ProposeResponse) ProtoMessage() {}
 
 func (x *ProposeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_consensus_proto_msgTypes[1]
+	mi := &file_consensus_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -124,7 +258,7 @@ func (x *ProposeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProposeResponse.ProtoReflect.Descriptor instead.
 func (*ProposeResponse) Descriptor() ([]byte, []int) {
-	return file_consensus_proto_rawDescGZIP(), []int{1}
+	return file_consensus_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ProposeResponse) GetSuccess() bool {
@@ -156,7 +290,7 @@ type ApplyResponse struct {
 
 func (x *ApplyResponse) Reset() {
 	*x = ApplyResponse{}
-	mi := &file_consensus_proto_msgTypes[2]
+	mi := &file_consensus_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -168,7 +302,7 @@ func (x *ApplyResponse) String() string {
 func (*ApplyResponse) ProtoMessage() {}
 
 func (x *ApplyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_consensus_proto_msgTypes[2]
+	mi := &file_consensus_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -181,7 +315,7 @@ func (x *ApplyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyResponse.ProtoReflect.Descriptor instead.
 func (*ApplyResponse) Descriptor() ([]byte, []int) {
-	return file_consensus_proto_rawDescGZIP(), []int{2}
+	return file_consensus_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ApplyResponse) GetSuccess() bool {
@@ -202,7 +336,13 @@ var File_consensus_proto protoreflect.FileDescriptor
 
 const file_consensus_proto_rawDesc = "" +
 	"\n" +
-	"\x0fconsensus.proto\x12\tconsensus\"U\n" +
+	"\x0fconsensus.proto\x12\tconsensus\"\x11\n" +
+	"\x0fSnapshotRequest\"#\n" +
+	"\rSnapshotChunk\x12\x12\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"A\n" +
+	"\x0fRestoreResponse\x12\x18\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"U\n" +
 	"\aCommand\x12\x0e\n" +
 	"\x02op\x18\x01 \x01(\tR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x14\n" +
@@ -215,9 +355,11 @@ const file_consensus_proto_rawDesc = "" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error2E\n" +
 	"\bRaftNode\x129\n" +
-	"\aPropose\x12\x12.consensus.Command\x1a\x1a.consensus.ProposeResponse2E\n" +
+	"\aPropose\x12\x12.consensus.Command\x1a\x1a.consensus.ProposeResponse2\xd7\x01\n" +
 	"\fStateMachine\x125\n" +
-	"\x05Apply\x12\x12.consensus.Command\x1a\x18.consensus.ApplyResponseB\x06Z\x04./pbb\x06proto3"
+	"\x05Apply\x12\x12.consensus.Command\x1a\x18.consensus.ApplyResponse\x12E\n" +
+	"\vGetSnapshot\x12\x1a.consensus.SnapshotRequest\x1a\x18.consensus.SnapshotChunk0\x01\x12I\n" +
+	"\x0fRestoreSnapshot\x12\x18.consensus.SnapshotChunk\x1a\x1a.consensus.RestoreResponse(\x01B\x06Z\x04./pbb\x06proto3"
 
 var (
 	file_consensus_proto_rawDescOnce sync.Once
@@ -231,19 +373,26 @@ func file_consensus_proto_rawDescGZIP() []byte {
 	return file_consensus_proto_rawDescData
 }
 
-var file_consensus_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_consensus_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_consensus_proto_goTypes = []any{
-	(*Command)(nil),         // 0: consensus.Command
-	(*ProposeResponse)(nil), // 1: consensus.ProposeResponse
-	(*ApplyResponse)(nil),   // 2: consensus.ApplyResponse
+	(*SnapshotRequest)(nil), // 0: consensus.SnapshotRequest
+	(*SnapshotChunk)(nil),   // 1: consensus.SnapshotChunk
+	(*RestoreResponse)(nil), // 2: consensus.RestoreResponse
+	(*Command)(nil),         // 3: consensus.Command
+	(*ProposeResponse)(nil), // 4: consensus.ProposeResponse
+	(*ApplyResponse)(nil),   // 5: consensus.ApplyResponse
 }
 var file_consensus_proto_depIdxs = []int32{
-	0, // 0: consensus.RaftNode.Propose:input_type -> consensus.Command
-	0, // 1: consensus.StateMachine.Apply:input_type -> consensus.Command
-	1, // 2: consensus.RaftNode.Propose:output_type -> consensus.ProposeResponse
-	2, // 3: consensus.StateMachine.Apply:output_type -> consensus.ApplyResponse
-	2, // [2:4] is the sub-list for method output_type
-	0, // [0:2] is the sub-list for method input_type
+	3, // 0: consensus.RaftNode.Propose:input_type -> consensus.Command
+	3, // 1: consensus.StateMachine.Apply:input_type -> consensus.Command
+	0, // 2: consensus.StateMachine.GetSnapshot:input_type -> consensus.SnapshotRequest
+	1, // 3: consensus.StateMachine.RestoreSnapshot:input_type -> consensus.SnapshotChunk
+	4, // 4: consensus.RaftNode.Propose:output_type -> consensus.ProposeResponse
+	5, // 5: consensus.StateMachine.Apply:output_type -> consensus.ApplyResponse
+	1, // 6: consensus.StateMachine.GetSnapshot:output_type -> consensus.SnapshotChunk
+	2, // 7: consensus.StateMachine.RestoreSnapshot:output_type -> consensus.RestoreResponse
+	4, // [4:8] is the sub-list for method output_type
+	0, // [0:4] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -260,7 +409,7 @@ func file_consensus_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_consensus_proto_rawDesc), len(file_consensus_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

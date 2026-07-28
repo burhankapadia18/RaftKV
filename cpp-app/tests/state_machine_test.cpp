@@ -1,6 +1,7 @@
 /**
  * @file state_machine_test.cpp
- * @brief Unit tests for StateMachineService::Apply (spec R1.2 / R1.3).
+ * @brief Unit tests for StateMachineService::Apply (spec R1.2 / R1.3) and for
+ *        the snapshot helpers behind GetSnapshot / RestoreSnapshot (R3.3).
  *
  * Apply() is the apply boundary: every committed raft entry, on every node,
  * arrives here and nowhere else. It is also the first and only place the
@@ -12,13 +13,28 @@
  * These tests exercise the service in-process with a fake IKVStore, so
  * "the store was not touched" can be asserted precisely. No gRPC server is
  * involved: Apply() ignores its ServerContext, so a null one is fine.
+ *
+ * The two snapshot RPCs cannot be driven the same way - grpc::ServerWriter and
+ * grpc::ServerReader have no public constructor and only a running server can
+ * hand you one. So the logic that can actually be wrong lives in
+ * kvdb::snapshot::for_each_chunk() and kvdb::snapshot::restore_from_payload(),
+ * which are covered here directly, and the RPC bodies are thin adapters over
+ * them. What that leaves uncovered by unit tests is exactly the adapter layer:
+ * that GetSnapshot pushes each chunk into ServerWriter::Write, that
+ * RestoreSnapshot drains ServerReader into one buffer, and the status codes
+ * they return. Those are covered by the e2e suite against a real cluster.
  */
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
 
 #include <msgpack.hpp>
 
@@ -61,6 +77,17 @@ public:
 
   [[nodiscard]] bool contains(const std::string &key) const override {
     return data.count(key) > 0;
+  }
+
+  /** @brief Snapshot support (R3.2): a plain copy of the contents. */
+  [[nodiscard]] StateMap snapshot_state() const override {
+    return StateMap(data.begin(), data.end());
+  }
+
+  /** @brief Snapshot support (R3.2): replace, never merge. */
+  void restore_state(StateMap state) override {
+    data.clear();
+    data.insert(state.begin(), state.end());
   }
 
   /** @brief Every set()/remove() call, whether or not it changed anything. */
@@ -362,6 +389,312 @@ TEST(StateMachineServiceTest, ApplyRejectsAWrongTypedFieldDeterministically) {
   EXPECT_EQ(reply.error().rfind("malformed payload: ", 0), 0u)
       << "error was: " << reply.error();
   EXPECT_EQ(store.writes, 0);
+}
+
+// --- Snapshot chunking (R3.3, the GetSnapshot half) -----------------------
+//
+// GetSnapshot itself is a five-line adapter: serialize, then push each chunk
+// into ServerWriter::Write. Everything that decides what goes on the wire is
+// for_each_chunk(), so that is what is tested here.
+
+/** @brief Everything for_each_chunk() emitted, plus whether it finished. */
+struct ChunkLog {
+  std::vector<std::string> chunks;
+  bool completed = false;
+
+  [[nodiscard]] std::string joined() const {
+    std::string out;
+    for (const std::string &chunk : chunks) {
+      out.append(chunk);
+    }
+    return out;
+  }
+};
+
+/** @brief Drive for_each_chunk() with an emitter that accepts everything. */
+ChunkLog collect_chunks(const std::string &payload, size_t chunk_size) {
+  ChunkLog log;
+  log.completed =
+      snapshot::for_each_chunk(payload, chunk_size, [&log](std::string_view c) {
+        log.chunks.emplace_back(c);
+        return true;
+      });
+  return log;
+}
+
+TEST(SnapshotChunkingTest, AnEmptyStoreStillStreamsItsHeader) {
+  // The failure this pins: short-circuiting an empty store to "no chunks".
+  // An empty snapshot is a real snapshot - it says "the agreed state is
+  // nothing" - and a receiver that got zero bytes has to be able to tell that
+  // apart from a stream that died before its first chunk.
+  const std::string payload = serialize_state({});
+  ASSERT_FALSE(payload.empty());
+
+  const ChunkLog log = collect_chunks(payload, snapshot::kChunkSize);
+
+  EXPECT_TRUE(log.completed);
+  ASSERT_EQ(log.chunks.size(), 1u);
+  EXPECT_EQ(log.joined(), payload);
+  EXPECT_EQ(payload.rfind("KVB1", 0), 0u) << "chunks carry the KVB1 image";
+}
+
+TEST(SnapshotChunkingTest, ASnapshotSmallerThanOneChunkIsSentWhole) {
+  const std::string payload =
+      serialize_state({{"user:1", "alice"}, {"user:2", "bob"}});
+  ASSERT_LT(payload.size(), snapshot::kChunkSize);
+
+  const ChunkLog log = collect_chunks(payload, snapshot::kChunkSize);
+
+  EXPECT_TRUE(log.completed);
+  ASSERT_EQ(log.chunks.size(), 1u);
+  EXPECT_EQ(log.chunks.front(), payload);
+}
+
+TEST(SnapshotChunkingTest, ALargeSnapshotSpansChunksWithARaggedTail) {
+  // Sized against the real 64 KiB wire chunk, not a toy one, so the constant
+  // itself is under test.
+  StateMap state;
+  const std::string value(1000, 'v');
+  for (int i = 0; i < 200; ++i) {
+    state["key:" + std::to_string(100000 + i)] = value;
+  }
+  const std::string payload = serialize_state(state);
+  ASSERT_GT(payload.size(), 2 * snapshot::kChunkSize);
+  ASSERT_NE(payload.size() % snapshot::kChunkSize, 0u)
+      << "this test is only interesting when the final chunk is a partial one";
+
+  const ChunkLog log = collect_chunks(payload, snapshot::kChunkSize);
+
+  EXPECT_TRUE(log.completed);
+  const size_t expected_chunks =
+      (payload.size() + snapshot::kChunkSize - 1) / snapshot::kChunkSize;
+  ASSERT_EQ(log.chunks.size(), expected_chunks);
+  for (size_t i = 0; i + 1 < log.chunks.size(); ++i) {
+    EXPECT_EQ(log.chunks[i].size(), snapshot::kChunkSize) << "chunk " << i;
+  }
+  EXPECT_EQ(log.chunks.back().size(),
+            payload.size() % snapshot::kChunkSize); // the ragged tail
+  EXPECT_EQ(log.joined(), payload);
+}
+
+TEST(SnapshotChunkingTest, AnExactMultipleDoesNotEmitATrailingEmptyChunk) {
+  const std::string payload(24, 'x');
+
+  const ChunkLog log = collect_chunks(payload, 8);
+
+  EXPECT_TRUE(log.completed);
+  ASSERT_EQ(log.chunks.size(), 3u);
+  EXPECT_EQ(log.joined(), payload);
+}
+
+TEST(SnapshotChunkingTest, AnEmptyPayloadStillEmitsExactlyOneChunk) {
+  // Not reachable from a real store - serialize_state() always writes at least
+  // the header - but the "never zero chunks" rule is pinned for the degenerate
+  // input too, so it cannot be lost to a later "optimisation".
+  const ChunkLog log = collect_chunks("", snapshot::kChunkSize);
+
+  EXPECT_TRUE(log.completed);
+  ASSERT_EQ(log.chunks.size(), 1u);
+  EXPECT_TRUE(log.chunks.front().empty());
+}
+
+TEST(SnapshotChunkingTest, StopsAtTheFirstRefusedWrite) {
+  // ServerWriter::Write() returning false means the peer is gone or the call
+  // was cancelled. The stream has to stop there and report failure, not keep
+  // pushing chunks at a dead connection.
+  const std::string payload(100, 'x');
+  int attempts = 0;
+
+  const bool completed =
+      snapshot::for_each_chunk(payload, 10, [&attempts](std::string_view) {
+        ++attempts;
+        return attempts < 3; // the third write fails
+      });
+
+  EXPECT_FALSE(completed);
+  EXPECT_EQ(attempts, 3) << "nothing may be written after a refused write";
+}
+
+TEST(SnapshotChunkingTest, RejectsAZeroChunkSize) {
+  // Would otherwise emit empty chunks forever.
+  EXPECT_THROW((void)snapshot::for_each_chunk(
+                   "data", 0, [](std::string_view) { return true; }),
+               std::invalid_argument);
+}
+
+// --- Snapshot install (R3.3, the RestoreSnapshot half) --------------------
+//
+// The rule under test throughout: decode fully, THEN touch the store. A node
+// that half-restores serves a state no member of the cluster ever had, and
+// nothing says so - strictly worse than refusing the snapshot outright.
+
+TEST(SnapshotRestoreTest, RestoresTheDecodedStateIntoTheStore) {
+  FakeKVStore store;
+  const std::string payload =
+      serialize_state({{"user:1", "alice"}, {"user:2", "bob"}});
+
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(store, payload);
+
+  ASSERT_FALSE(refusal.has_value()) << "refused: " << refusal.value_or("");
+  ASSERT_TRUE(store.get("user:1").has_value());
+  EXPECT_EQ(*store.get("user:1"), "alice");
+  ASSERT_TRUE(store.get("user:2").has_value());
+  EXPECT_EQ(*store.get("user:2"), "bob");
+}
+
+TEST(SnapshotRestoreTest, RestoreReplacesTheStoreRatherThanMergingIntoIt) {
+  // A restore means "this node's state is now exactly the snapshot". A key the
+  // node held that the snapshot does not must disappear, or a wiped follower
+  // rejoins carrying state the cluster never agreed on.
+  FakeKVStore store;
+  store.data["stale"] = "leftover";
+  const std::string payload = serialize_state({{"fresh", "value"}});
+
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(store, payload);
+
+  ASSERT_FALSE(refusal.has_value()) << "refused: " << refusal.value_or("");
+  EXPECT_FALSE(store.contains("stale"));
+  ASSERT_TRUE(store.get("fresh").has_value());
+  EXPECT_EQ(*store.get("fresh"), "value");
+}
+
+TEST(SnapshotRestoreTest, RestoringAnEmptySnapshotEmptiesTheStore) {
+  FakeKVStore store;
+  store.data["stale"] = "leftover";
+  const std::string payload = serialize_state({});
+
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(store, payload);
+
+  ASSERT_FALSE(refusal.has_value()) << "refused: " << refusal.value_or("");
+  EXPECT_FALSE(store.contains("stale"));
+}
+
+TEST(SnapshotRestoreTest, RefusesABadMagicWithoutTouchingTheStore) {
+  FakeKVStore store;
+  store.data["keep"] = "me";
+  std::string payload = serialize_state({{"intruder", "value"}});
+  ASSERT_FALSE(payload.empty());
+  payload[0] = 'X'; // "XVB1..."
+
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(store, payload);
+
+  ASSERT_TRUE(refusal.has_value());
+  // rfind(prefix, 0) == 0 is "starts with" without pulling in gmock (the
+  // test target links gtest only, and CI installs libgtest-dev alone).
+  EXPECT_EQ(refusal->rfind("invalid snapshot: ", 0), 0u) << *refusal;
+  EXPECT_GT(refusal->size(), std::string("invalid snapshot: ").size())
+      << "a refusal has to say what was wrong with it";
+  EXPECT_FALSE(store.contains("intruder"));
+  ASSERT_TRUE(store.get("keep").has_value());
+  EXPECT_EQ(*store.get("keep"), "me");
+  EXPECT_EQ(store.writes, 0);
+}
+
+TEST(SnapshotRestoreTest, RefusesATruncatedPayloadWithoutTouchingTheStore) {
+  // A stream cut short mid-record. The header still looks plausible, so this is
+  // the case where "validate the magic and go" would install a partial state.
+  FakeKVStore store;
+  store.data["keep"] = "me";
+  const std::string payload =
+      serialize_state({{"intruder", "a value long enough to cut"}});
+  ASSERT_GT(payload.size(), 5u);
+  const std::string truncated = payload.substr(0, payload.size() - 5);
+  ASSERT_EQ(truncated.rfind("KVB1", 0), 0u) << "the magic is still intact";
+
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(store, truncated);
+
+  ASSERT_TRUE(refusal.has_value());
+  EXPECT_EQ(refusal->rfind("invalid snapshot: ", 0), 0u) << *refusal;
+  EXPECT_FALSE(store.contains("intruder"));
+  ASSERT_TRUE(store.get("keep").has_value());
+  EXPECT_EQ(*store.get("keep"), "me");
+  EXPECT_EQ(store.writes, 0);
+}
+
+TEST(SnapshotRestoreTest, RefusesAnEmptyPayloadWithoutTouchingTheStore) {
+  // Zero bytes is what the receiver sees when the stream dies before the first
+  // chunk. It is NOT an empty snapshot - that one carries the header - so it
+  // must be refused rather than silently wiping the node.
+  FakeKVStore store;
+  store.data["keep"] = "me";
+
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(store, "");
+
+  ASSERT_TRUE(refusal.has_value());
+  EXPECT_EQ(refusal->rfind("invalid snapshot: ", 0), 0u) << *refusal;
+  ASSERT_TRUE(store.get("keep").has_value());
+  EXPECT_EQ(*store.get("keep"), "me");
+  EXPECT_EQ(store.writes, 0);
+}
+
+// --- Both halves together -------------------------------------------------
+
+TEST(SnapshotRoundTripTest, SnapshotOfOneStoreRestoresIntoAnother) {
+  // The whole transfer, minus gRPC: what GetSnapshot does to produce the bytes,
+  // then what RestoreSnapshot does with them on the far side.
+  FakeKVStore source;
+  source.set("user:1", "alice");
+  source.set("user:2", "bob");
+
+  const std::string payload = serialize_state(source.snapshot_state());
+  std::string received;
+  const bool completed = snapshot::for_each_chunk(
+      payload, snapshot::kChunkSize, [&received](std::string_view chunk) {
+        received.append(chunk.data(), chunk.size());
+        return true;
+      });
+  ASSERT_TRUE(completed);
+  ASSERT_EQ(received, payload);
+
+  FakeKVStore target;
+  target.data["obsolete"] = "state";
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(target, received);
+
+  ASSERT_FALSE(refusal.has_value()) << "refused: " << refusal.value_or("");
+  EXPECT_FALSE(target.contains("obsolete"));
+  ASSERT_TRUE(target.get("user:1").has_value());
+  EXPECT_EQ(*target.get("user:1"), "alice");
+  ASSERT_TRUE(target.get("user:2").has_value());
+  EXPECT_EQ(*target.get("user:2"), "bob");
+}
+
+TEST(SnapshotRoundTripTest, KeysThatBreakLineFormatsSurviveChunking) {
+  // The reason the wire format is the KVB1 image and not something ad hoc:
+  // '=', newlines and NUL bytes ride through untouched, including when a chunk
+  // boundary lands in the middle of one.
+  const StateMap state = {
+      {"a=b", "value=with=equals"},
+      {"multi\nline", "two\nlines"},
+      {std::string("nul\0key", 7), std::string("nul\0value", 9)},
+  };
+  const std::string payload = serialize_state(state);
+
+  std::string received;
+  const bool completed =
+      snapshot::for_each_chunk(payload, 7, [&received](std::string_view chunk) {
+        received.append(chunk.data(), chunk.size());
+        return true;
+      });
+  ASSERT_TRUE(completed);
+  ASSERT_EQ(received, payload);
+
+  FakeKVStore store;
+  const std::optional<std::string> refusal =
+      snapshot::restore_from_payload(store, received);
+
+  ASSERT_FALSE(refusal.has_value()) << "refused: " << refusal.value_or("");
+  for (const auto &[key, value] : state) {
+    ASSERT_TRUE(store.get(key).has_value())
+        << "key of " << key.size() << " bytes went missing";
+    EXPECT_EQ(*store.get(key), value);
+  }
 }
 
 } // namespace

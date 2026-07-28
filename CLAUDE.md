@@ -8,7 +8,7 @@ RaftKV is a distributed key-value store using a **sidecar pattern**: each node r
 
 - `cpp-app/` — C++17 storage engine: HTTP API, in-memory KV store with crash-safe persistence (write-ahead log + atomically rewritten binary base file), and a gRPC `StateMachine` server (binary: `kvdb_node`)
 - `go-sidecar/` — Go consensus sidecar wrapping HashiCorp Raft: leader election, log replication, cluster membership (Go module name: `my-raft-sidecar`)
-- `proto/consensus.proto` — the single gRPC contract between them (`RaftNode.Propose` and `StateMachine.Apply`)
+- `proto/consensus.proto` — the single gRPC contract between them (`RaftNode.Propose`, `StateMachine.Apply`, and the streaming `StateMachine.GetSnapshot` / `StateMachine.RestoreSnapshot`)
 
 ## Commands
 
@@ -123,8 +123,7 @@ These are acknowledged simplifications. If a task touches one, call it out and c
 
 Phase 0 removed none of these — it **pinned** them with tests that assert the current (wrong) behavior, each commented with the phase that will change it. Fixing a limitation therefore means updating its pinning tests in the same PR: see the pinned-behavior tables in `tests/e2e/README.md` and the `CURRENT LOSSY BEHAVIOR` / `PINNED` comments in `cpp-app/tests/` and `go-sidecar/internal/fsm/fsm_test.go`. This list shrinks as phases land — Phase 1 removed the stringly-error entry and Phase 2 removed the durability entry (WAL + atomic base file + binary format), so do not reintroduce either.
 
-- **No snapshots**: `CppFSM` returns a `DummySnapshot` and the raft node uses `NewDiscardSnapshotStore()` — the raft log grows unbounded and restarts replay the full log.
-- **HTTP server**: single-threaded accept loop, one 4KB read per request, no keep-alive, no body-size cap, no URL decoding. (Status lines and error bodies are truthful as of Phase 1; a negative `Content-Length` is still unhandled.)
+- **HTTP server**: single-threaded accept loop, one 4KB read per request, no keep-alive, no body-size cap, no URL decoding. (Status lines and error bodies are truthful as of Phase 1, and `http_request.hpp` now rejects a negative `Content-Length` alongside an unparseable one — that clause is fixed, don't reinstate it.)
 - **No leader forwarding**: a write to a follower is answered with 503 and the leader's *Raft* address, which is not something a client can dial. Phase 4.
 - **Stale reads**: `GET /get-val` is served from the local store with no read-index check, and there is no way to request a linearizable read. Phase 4.
 - **Validation happens after commit**: a command with an unknown op or an empty key is replicated first and rejected at apply time, costing a raft log entry and returning 502.

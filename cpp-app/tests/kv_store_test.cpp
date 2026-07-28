@@ -13,6 +13,9 @@
  *      without any base-file rewrite (R2.7), legacy files migrate (R2.3), the
  *      WAL compacts (R2.6), and a corrupt or torn file fails loudly instead of
  *      loading garbage (R2.5).
+ *   4. Pin the Phase 3 snapshot seam (R3.2 / R3.7): snapshot_state() /
+ *      restore_state(), and the serialize_state() / deserialize_state() codec
+ *      they share with the base file - one encoding for disk and for the wire.
  *
  * The Phase 0 version of this file pinned the *lossiness* of the old
  * "key=value\n" format: keys containing '=' were rewritten, anything
@@ -33,6 +36,8 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -746,6 +751,320 @@ TEST_F(PersistentKVStoreTest, ACorruptBaseFileIsNotPartiallyLoaded) {
   // The file was left exactly as it was: nothing half-loaded, nothing
   // helpfully rewritten over the operator's evidence.
   EXPECT_EQ(read_db_file(), contents);
+}
+
+// --- The state codec (R3.1/R3.2) -------------------------------------------
+//
+// serialize_state()/deserialize_state() are the codec the base file and the
+// snapshot stream share. They were lifted out of PersistentKVStore rather than
+// copied, so the tests above already exercise the same encoder and decoder
+// through the store; what follows covers them directly, including the
+// malformed inputs a peer can now put on the wire and not just the ones a disk
+// can produce.
+
+/**
+ * @brief Assert deserialize_state() refuses @p image, mentioning @p reason.
+ *
+ * "Refuses" means a std::runtime_error - not a crash, not an out-of-bounds
+ * read (these run under ASan in CI), and not a partially decoded map.
+ */
+void expect_bad_image(const std::string &image, const std::string &reason) {
+  try {
+    const StateMap decoded = deserialize_state(image);
+    ADD_FAILURE() << "expected a decode failure; got " << decoded.size()
+                  << " entries";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+        << error.what();
+  }
+}
+
+TEST(StateCodecTest, SerializeStateEmitsTheKvb1Layout) {
+  // Single entry, so unordered_map iteration order cannot matter.
+  const std::string image = serialize_state(StateMap{{"alpha", "beta"}});
+
+  EXPECT_EQ(image, std::string("KVB1") + u32le(1) + u32le(5) + "alpha" +
+                       u32le(4) + "beta");
+  EXPECT_EQ(image, kvb1({{"alpha", "beta"}}));
+}
+
+TEST(StateCodecTest, AnEmptyStateIsAMagicAndAZeroCount) {
+  const std::string image = serialize_state(StateMap{});
+
+  EXPECT_EQ(image, kvb1({}));
+  EXPECT_EQ(image.size(), 8u);
+  EXPECT_TRUE(deserialize_state(image).empty());
+}
+
+TEST(StateCodecTest, ManyEntriesWithHostileBytesRoundTrip) {
+  StateMap state;
+  for (int i = 0; i < 200; ++i) {
+    const std::string suffix = std::to_string(i);
+    state[std::string("k\0=", 3) + suffix] = std::string("v\n\0", 3) + suffix;
+  }
+
+  const StateMap decoded = deserialize_state(serialize_state(state));
+
+  EXPECT_EQ(decoded.size(), 200u);
+  EXPECT_EQ(decoded, state);
+}
+
+TEST(StateCodecTest, RejectsAMissingMagic) {
+  expect_bad_image("", "magic");
+  expect_bad_image("KVB", "magic"); // shorter than the magic itself
+  expect_bad_image(std::string("KVB2") + u32le(0), "magic");
+  // A legacy "key=value" file is not a state image either. Migration is the
+  // store's business (it checks the magic first); the codec just says no.
+  expect_bad_image("alpha=beta\n", "magic");
+}
+
+TEST(StateCodecTest, RejectsATruncatedHeader) {
+  expect_bad_image("KVB1", "truncated entry count");
+  expect_bad_image(std::string("KVB1") + "ab", "truncated entry count");
+}
+
+TEST(StateCodecTest, RejectsAnEntryCountThatDisagreesWithTheData) {
+  // The classic length-lie: a count no amount of remaining bytes could hold.
+  // It must be refused before it is used to size anything.
+  expect_bad_image(std::string("KVB1") + u32le(0xFFFFFFFFu), "exceeds");
+  expect_bad_image(std::string("KVB1") + u32le(1), "exceeds");
+
+  // Two claimed, one and a half supplied. Small enough to pass the bound
+  // check above, so this is the per-entry check doing the work.
+  expect_bad_image(std::string("KVB1") + u32le(2) + blob("k") + blob("v") +
+                       blob("k2"),
+                   "entry 1 is truncated");
+
+  // Fewer claimed than supplied: the leftovers are not silently ignored.
+  expect_bad_image(kvb1({{"a", "b"}}) + blob("extra") + blob("entry"),
+                   "trailing bytes");
+  expect_bad_image(std::string("KVB1") + u32le(0) + blob("k") + blob("v"),
+                   "trailing bytes");
+}
+
+TEST(StateCodecTest, RejectsABlobLengthThatOverrunsTheBuffer) {
+  // key_len says 5, four bytes follow.
+  expect_bad_image(std::string("KVB1") + u32le(1) + u32le(5) + "alph",
+                   "entry 0 is truncated");
+
+  // value_len is a lie pointing far past the end. There are enough bytes for
+  // one entry, so the entry-count bound cannot catch this - it is read_blob
+  // refusing a length it cannot cover that keeps the decode in bounds.
+  expect_bad_image(std::string("KVB1") + u32le(1) + blob("k") +
+                       u32le(0x7FFFFFFFu) + "v",
+                   "entry 0 is truncated");
+}
+
+// --- Snapshots (R3.2 / R3.7) ------------------------------------------------
+
+TEST_F(PersistentKVStoreTest, SnapshotStateReturnsTheWholeStore) {
+  PersistentKVStore store(path(), fast_options());
+  store.set("a", "1");
+  store.set("b", "2");
+  ASSERT_TRUE(store.remove("a"));
+  store.set("c", "3");
+
+  const StateMap expected{{"b", "2"}, {"c", "3"}};
+  EXPECT_EQ(store.snapshot_state(), expected);
+}
+
+TEST_F(PersistentKVStoreTest, SnapshotOfAnEmptyStoreIsLegal) {
+  const PersistentKVStore store(path(), fast_options());
+
+  const StateMap snapshot = store.snapshot_state();
+
+  EXPECT_TRUE(snapshot.empty());
+  EXPECT_EQ(serialize_state(snapshot), kvb1({}));
+  EXPECT_TRUE(deserialize_state(serialize_state(snapshot)).empty());
+}
+
+TEST_F(PersistentKVStoreTest, SnapshotRoundTripsThroughTheStateCodec) {
+  // Every byte the pre-Phase-2 line format mangled, in both positions.
+  const std::string hostile_key("k\0ey=with\nall", 13);
+  const std::string hostile_value("v\0al=ue\nbytes\0", 14);
+
+  PersistentKVStore store(path(), fast_options());
+  store.set(hostile_key, hostile_value);
+  store.set("a=b", "c=d");
+  store.set("line1\nline2", "x\ny");
+  store.set("empty-value", "");
+
+  const StateMap snapshot = store.snapshot_state();
+  const StateMap decoded = deserialize_state(serialize_state(snapshot));
+
+  EXPECT_EQ(decoded, snapshot);
+  EXPECT_EQ(decoded.size(), 4u);
+  ASSERT_EQ(decoded.count(hostile_key), 1u);
+  EXPECT_EQ(decoded.at(hostile_key), hostile_value);
+  EXPECT_EQ(decoded.at(hostile_key).size(), 14u);
+}
+
+TEST_F(PersistentKVStoreTest, TheSnapshotImageIsExactlyTheBaseFile) {
+  // The Phase 3 seam: one encoding for disk and wire, so what a node streams
+  // to a peer is byte-for-byte what its kv.db holds. Single entry, so
+  // unordered_map iteration order cannot make this flaky.
+  DurabilityOptions options = fast_options();
+  options.wal_max_records = 1; // compact after every write
+
+  PersistentKVStore store(path(), options);
+  store.set("alpha", "beta");
+
+  ASSERT_EQ(read_wal_file().size(), 0u); // folded into the base file
+  EXPECT_EQ(serialize_state(store.snapshot_state()), read_db_file());
+  EXPECT_EQ(read_db_file(), kvb1({{"alpha", "beta"}}));
+}
+
+TEST_F(PersistentKVStoreTest, RestoreStateReplacesRatherThanMerges) {
+  // The obvious bug in a restore is to apply the snapshot on top of what is
+  // already there. A key the local node has and the snapshot does not is not
+  // part of the agreed state and must disappear.
+  PersistentKVStore store(path(), fast_options());
+  store.set("stale", "gone");
+  store.set("shared", "old");
+
+  const StateMap snapshot{{"shared", "new"}, {"fresh", "1"}};
+  store.restore_state(snapshot);
+
+  EXPECT_FALSE(store.contains("stale"));
+  EXPECT_FALSE(store.get("stale").has_value());
+  expect_value(store, "shared", "new");
+  expect_value(store, "fresh", "1");
+  EXPECT_EQ(store.snapshot_state(), snapshot);
+}
+
+TEST_F(PersistentKVStoreTest, RestoringAnEmptyStateClearsEverything) {
+  PersistentKVStore store(path(), fast_options());
+  store.set("a", "1");
+
+  store.restore_state(StateMap{});
+
+  EXPECT_FALSE(store.contains("a"));
+  EXPECT_TRUE(store.snapshot_state().empty());
+  EXPECT_EQ(read_db_file(), kvb1({}));
+  EXPECT_EQ(read_wal_file().size(), 0u);
+}
+
+TEST_F(PersistentKVStoreTest, RestoreStatePersistsTheSnapshotAndResetsTheWal) {
+  PersistentKVStore store(path(), fast_options());
+  store.set("stale", "gone");
+  ASSERT_GT(read_wal_file().size(), 0u);
+  ASSERT_FALSE(std::filesystem::exists(db_path_));
+
+  store.restore_state(StateMap{{"only", "entry"}});
+
+  // Both halves of R3.7 in one place: the base file is the snapshot, and the
+  // WAL that used to describe the old state is empty.
+  EXPECT_EQ(read_db_file(), kvb1({{"only", "entry"}}));
+  EXPECT_EQ(read_wal_file().size(), 0u);
+}
+
+TEST_F(PersistentKVStoreTest, AFreshStoreOnTheSamePathSeesTheRestoredState) {
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("a", "1");
+    store.set("b", "2");
+    store.restore_state(StateMap{{"x", "10"}, {"y", "20"}});
+  }
+
+  // Nothing else ran between the restore and this reopen, which is the shape
+  // of "the process was killed one instruction after the restore" (R3.7).
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  const StateMap expected{{"x", "10"}, {"y", "20"}};
+  EXPECT_EQ(reloaded.snapshot_state(), expected);
+  EXPECT_FALSE(reloaded.contains("a"));
+  EXPECT_FALSE(reloaded.contains("b"));
+}
+
+TEST_F(PersistentKVStoreTest, WalRecordsWrittenBeforeARestoreAreNotReplayed) {
+  // The failure this exists to catch: leave the WAL in place across a restore
+  // and the next start replays pre-restore commands *over* the snapshot,
+  // reconstructing a state no replica ever had - silently, and with no error
+  // anywhere. Both writes below live only in the WAL, so if the reset were
+  // skipped they would come straight back.
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("pre", "restore");
+    store.set("also-pre", "restore");
+    ASSERT_FALSE(std::filesystem::exists(db_path_)) << "no base file yet";
+    ASSERT_GT(read_wal_file().size(), 0u);
+
+    store.restore_state(StateMap{{"snap", "1"}});
+    ASSERT_EQ(read_wal_file().size(), 0u);
+  }
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  expect_value(reloaded, "snap", "1");
+  EXPECT_FALSE(reloaded.contains("pre"));
+  EXPECT_FALSE(reloaded.contains("also-pre"));
+  EXPECT_EQ(reloaded.snapshot_state(), (StateMap{{"snap", "1"}}));
+}
+
+TEST_F(PersistentKVStoreTest, WritesAfterARestoreAreLoggedAndSurvive) {
+  // The WAL has to be usable again after being reset - the append fd survives
+  // the truncation, and a write that lands after a restore is as durable as
+  // any other.
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("before", "gone");
+    store.restore_state(StateMap{{"snap", "1"}});
+
+    store.set("after", "2");
+    ASSERT_TRUE(store.remove("snap"));
+    store.set("snap", "3");
+  }
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  expect_value(reloaded, "after", "2");
+  expect_value(reloaded, "snap", "3");
+  EXPECT_FALSE(reloaded.contains("before"));
+}
+
+TEST_F(PersistentKVStoreTest, SnapshotStateIsConsistentUnderConcurrentWrites) {
+  // snapshot_state() copies under the same mutex every writer takes, so a
+  // snapshot may be missing a key but can never contain a torn one or a
+  // dangling node. This is also the deadlock check: the copy must not re-enter
+  // a locking method, and std::mutex is not recursive.
+  constexpr int kWriters = 4;
+  constexpr int kWritesPerWriter = 50;
+
+  PersistentKVStore store(path(), fast_options());
+
+  std::vector<std::thread> writers;
+  writers.reserve(kWriters);
+  for (int writer = 0; writer < kWriters; ++writer) {
+    writers.emplace_back([&store, writer] {
+      for (int i = 0; i < kWritesPerWriter; ++i) {
+        const std::string suffix =
+            std::to_string(writer) + ":" + std::to_string(i);
+        store.set("key" + suffix, "value" + suffix);
+      }
+    });
+  }
+
+  // Every writer's value is derived from its key, so a snapshot that observed
+  // a half-applied write shows up as a mismatch. Recorded rather than
+  // asserted on the spot: the writers are still running, and an ASSERT_ here
+  // would return from the test with joinable threads and abort the binary.
+  std::string torn;
+  for (int round = 0; round < 100 && torn.empty(); ++round) {
+    for (const auto &[key, value] : store.snapshot_state()) {
+      if (value != "value" + key.substr(3)) {
+        torn = key + " -> " + value;
+        break;
+      }
+    }
+  }
+
+  for (std::thread &writer : writers) {
+    writer.join();
+  }
+
+  EXPECT_TRUE(torn.empty()) << "torn snapshot entry: " << torn;
+  EXPECT_EQ(store.snapshot_state().size(),
+            static_cast<size_t>(kWriters) * kWritesPerWriter);
 }
 
 } // namespace

@@ -1,0 +1,60 @@
+# Compose override for the Phase 3 snapshot end-to-end scenarios.
+#
+#     docker build -t raftkv:latest .
+#     docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+#     pytest tests/e2e -m requires_docker -v -rs
+#
+# It changes exactly one thing: how eagerly Raft snapshots and truncates its
+# log. Everything else (ports, volumes, node ids, the join topology) comes from
+# docker-compose.yml, which this file is layered on top of.
+#
+# Why an override instead of new defaults
+# ---------------------------------------
+# The production defaults are HashiCorp Raft's own (120s / 8192 entries / 10240
+# trailing logs, see internal/config/config.go). A cluster running those would
+# need thousands of writes and up to two minutes before it ever snapshotted,
+# which no test can wait for -- so the test cluster drives them low enough that
+# a snapshot happens within a few seconds of a modest write burst, while the
+# shipped configuration stays untouched.
+#
+# tests/e2e/test_snapshot.py reads the values back out of each sidecar's startup
+# log line and SKIPS if they are not this aggressive, so running the suite
+# against a cluster started without this file reports "not verified here"
+# instead of failing or, worse, timing out.
+#
+# All three tunables matter, and the third is the one that is easy to miss
+# ------------------------------------------------------------------------
+#   SNAPSHOT_INTERVAL   how often a node checks whether a snapshot is due.
+#                       Raft randomises this to between 1x and 2x the value.
+#   SNAPSHOT_THRESHOLD  applied entries since the last snapshot before that
+#                       check actually takes one.
+#   TRAILING_LOGS       entries kept BEHIND the snapshot. Raft truncates to
+#                       snapshot_index - TrailingLogs, so with the default
+#                       10240 the log never shrinks at all until it is longer
+#                       than 10240 entries -- however often it snapshots. The
+#                       acceptance criterion for this phase is that BoltDB's
+#                       first index advances, and it is unreachable without
+#                       lowering this one.
+#
+# There is no `version:` key: it is deprecated, and compose takes the top-level
+# keys from the first file anyway.
+
+x-snapshot-tunables: &snapshot-tunables
+  SNAPSHOT_INTERVAL: "2s"
+  SNAPSHOT_THRESHOLD: "20"
+  TRAILING_LOGS: "10"
+
+services:
+  # `environment` is merged key-by-key across compose files (unlike `ports`,
+  # which concatenates), so each service keeps its NODE_ID / BOOTSTRAP /
+  # JOIN_ADDR from docker-compose.yml and gains these three. The list form used
+  # in the base file and the map form used here are normalised to the same
+  # thing before the merge.
+  node1:
+    environment: *snapshot-tunables
+
+  node2:
+    environment: *snapshot-tunables
+
+  node3:
+    environment: *snapshot-tunables

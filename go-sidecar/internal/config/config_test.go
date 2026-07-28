@@ -2,8 +2,12 @@ package config
 
 import (
 	"flag"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // NOTE ON TESTABILITY (Phase 0 pins the current shape, it does not change it):
@@ -37,6 +41,70 @@ var expectedFlags = []struct {
 	{name: "data", defValue: "raft-data", usage: "Directory to store Raft logs"},
 	{name: "join", defValue: "", usage: "Address of Leader's Management API to join"},
 	{name: "advertise", defValue: "", usage: "Address to advertise to other nodes"},
+	// Phase 3 (R3.6). These three are not decoration: the e2e snapshot suite
+	// drives all of them far below the production defaults, so their names are
+	// part of the contract with docker-compose/entrypoint.sh just as much as
+	// -data or -bootstrap are.
+	{name: "snapshot-interval", defValue: "2m0s", usage: "How often to check whether a Raft snapshot is due"},
+	{name: "snapshot-threshold", defValue: "8192", usage: "Applied entries since the last snapshot before a new one is taken"},
+	{name: "trailing-logs", defValue: "10240", usage: "Log entries to retain behind a snapshot"},
+}
+
+// TestSnapshotFlagDefaultsMatchConstants ties the flag defaults to the exported
+// Default* constants. Without this the two can drift: raftnode and any future
+// programmatic caller read the constants, while a container reads the flags.
+func TestSnapshotFlagDefaultsMatchConstants(t *testing.T) {
+	tests := []struct {
+		flagName string
+		want     string
+	}{
+		{flagName: "snapshot-interval", want: DefaultSnapshotInterval.String()},
+		{flagName: "snapshot-threshold", want: strconv.FormatUint(DefaultSnapshotThreshold, 10)},
+		{flagName: "trailing-logs", want: strconv.FormatUint(DefaultTrailingLogs, 10)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.flagName, func(t *testing.T) {
+			f := flag.Lookup(tt.flagName)
+			if f == nil {
+				t.Fatalf("flag -%s is not registered on flag.CommandLine", tt.flagName)
+			}
+			if f.DefValue != tt.want {
+				t.Errorf("flag -%s default = %q, constant = %q", tt.flagName, f.DefValue, tt.want)
+			}
+		})
+	}
+}
+
+// TestSnapshotDefaultsMatchRaftDefaults checks the values against the library
+// they are copied from, rather than against literals — a literal here would
+// only restate the constant.
+//
+// The point is that a node started with no snapshot flags must behave exactly
+// as hashicorp/raft intends: Phase 3 changes whether snapshots are *kept*, not
+// how often they are taken. If a raft upgrade retunes these, this test is the
+// notification, and the decision is whether to follow the library or to pin our
+// own values on purpose.
+func TestSnapshotDefaultsMatchRaftDefaults(t *testing.T) {
+	raftDefaults := raft.DefaultConfig()
+
+	tests := []struct {
+		name string
+		got  uint64
+		want uint64
+	}{
+		{name: "SnapshotInterval", got: uint64(DefaultSnapshotInterval), want: uint64(raftDefaults.SnapshotInterval)},
+		{name: "SnapshotThreshold", got: DefaultSnapshotThreshold, want: raftDefaults.SnapshotThreshold},
+		{name: "TrailingLogs", got: DefaultTrailingLogs, want: raftDefaults.TrailingLogs},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("Default%s = %d, raft.DefaultConfig() uses %d", tt.name, tt.got, tt.want)
+			}
+		})
+	}
 }
 
 func TestRegisteredFlags(t *testing.T) {
@@ -162,21 +230,32 @@ func TestAdvertiseAddr(t *testing.T) {
 	}
 }
 
+// TestConfigString pins the startup log line.
+//
+// PIN: Phase 3 (R3.6) appended the three snapshot tunables. That is deliberate
+// — main.go logs this line, and it is the only place an operator can confirm
+// that the aggressive values a test container was launched with arrived. The
+// pre-Phase-3 prefix is unchanged, so anything grepping for the earlier fields
+// still matches.
 func TestConfigString(t *testing.T) {
 	cfg := Config{
-		NodeID:        "node1",
-		RaftPort:      "8088",
-		SidecarPort:   "50052",
-		AppAddr:       "localhost:50051",
-		MgmtPort:      "6000",
-		Bootstrap:     true,
-		DataDir:       "/data",
-		JoinAddr:      "node1:6000",
-		RaftAdvertise: "node3",
+		NodeID:            "node1",
+		RaftPort:          "8088",
+		SidecarPort:       "50052",
+		AppAddr:           "localhost:50051",
+		MgmtPort:          "6000",
+		Bootstrap:         true,
+		DataDir:           "/data",
+		JoinAddr:          "node1:6000",
+		RaftAdvertise:     "node3",
+		SnapshotInterval:  5 * time.Second,
+		SnapshotThreshold: 64,
+		TrailingLogs:      32,
 	}
 
 	want := "Config{NodeID: node1, RaftPort: 8088, SidecarPort: 50052, " +
-		"AppAddr: localhost:50051, MgmtPort: 6000, Bootstrap: true, DataDir: /data}"
+		"AppAddr: localhost:50051, MgmtPort: 6000, Bootstrap: true, DataDir: /data, " +
+		"SnapshotInterval: 5s, SnapshotThreshold: 64, TrailingLogs: 32}"
 
 	if got := cfg.String(); got != want {
 		t.Errorf("String() =\n\t%q\nwant\n\t%q", got, want)
@@ -187,14 +266,17 @@ func TestConfigStringOmitsJoinAndAdvertise(t *testing.T) {
 	// PIN: String() deliberately (or accidentally) leaves JoinAddr and RaftAdvertise
 	// out of the startup log line. Anything changing the log format must update this.
 	cfg := Config{
-		NodeID:        "node1",
-		RaftPort:      "8088",
-		SidecarPort:   "50052",
-		AppAddr:       "localhost:50051",
-		MgmtPort:      "6000",
-		DataDir:       "/data",
-		JoinAddr:      "leader-mgmt:6000",
-		RaftAdvertise: "advertised-host",
+		NodeID:            "node1",
+		RaftPort:          "8088",
+		SidecarPort:       "50052",
+		AppAddr:           "localhost:50051",
+		MgmtPort:          "6000",
+		DataDir:           "/data",
+		JoinAddr:          "leader-mgmt:6000",
+		RaftAdvertise:     "advertised-host",
+		SnapshotInterval:  DefaultSnapshotInterval,
+		SnapshotThreshold: DefaultSnapshotThreshold,
+		TrailingLogs:      DefaultTrailingLogs,
 	}
 
 	got := cfg.String()
@@ -208,7 +290,8 @@ func TestConfigStringOmitsJoinAndAdvertise(t *testing.T) {
 func TestConfigStringZeroValue(t *testing.T) {
 	var cfg Config
 
-	want := "Config{NodeID: , RaftPort: , SidecarPort: , AppAddr: , MgmtPort: , Bootstrap: false, DataDir: }"
+	want := "Config{NodeID: , RaftPort: , SidecarPort: , AppAddr: , MgmtPort: , Bootstrap: false, DataDir: , " +
+		"SnapshotInterval: 0s, SnapshotThreshold: 0, TrailingLogs: 0}"
 
 	if got := cfg.String(); got != want {
 		t.Errorf("String() = %q, want %q", got, want)

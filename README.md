@@ -354,17 +354,53 @@ truncates the WAL — that order is the correctness argument, since a crash
 between the two costs only a replay of records already folded into the base
 file, and replaying a `SET`/`DELETE` twice is idempotent.
 
-Note that a restart replays the *entire* raft log through the state machine
-(there are no snapshots yet), and each of those applies appends to the WAL
-again — so the WAL grows on every restart until the next compaction folds it
-away.
+Since Phase 3 a restart applies the newest **snapshot** and then only the log
+entries after it, rather than replaying the entire history. Each of those
+applies still appends to the WAL, so the WAL grows a little on every restart
+until the next compaction folds it away — but it is now bounded by the snapshot
+interval rather than by the age of the cluster.
 
 ### `logs.dat`
 
-Owned by the Go sidecar: `raftnode.New` uses one BoltDB file as both the raft
-log store and the stable store. Deleting it erases the node's raft identity and
-log; deleting `kv.db`/`kv.wal` erases its data. For a clean slate,
+Owned by the Go sidecar: `raftnode.New` uses one bbolt file (via
+`raft-boltdb/v2`) as both the raft log store and the stable store. Deleting it
+erases the node's raft identity and log; deleting `kv.db`/`kv.wal` erases its
+data. For a clean slate,
 `docker compose down -v && rm -rf vol-node1 vol-node2 vol-node3`.
+
+### `snapshots/`
+
+Owned by the Go sidecar: `raft.NewFileSnapshotStore` keeps the two most recent
+snapshots here, each a directory holding `meta.json` and `state.bin`. The
+payload is byte-for-byte the same `KVB1` encoding as `kv.db` — one format for
+disk and for the wire — produced by the C++ engine over the `GetSnapshot`
+stream and pushed back over `RestoreSnapshot`.
+
+Snapshotting is what bounds the raft log, and it is tunable from the sidecar's
+flags (see `internal/config`), each forwarded by `entrypoint.sh` only when the
+matching environment variable is set:
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `-snapshot-interval` | `SNAPSHOT_INTERVAL` | `120s` | How often a node checks whether a snapshot is due |
+| `-snapshot-threshold` | `SNAPSHOT_THRESHOLD` | `8192` | Applied entries since the last snapshot before taking a new one |
+| `-trailing-logs` | `TRAILING_LOGS` | `10240` | Entries kept *behind* a snapshot |
+
+**`-trailing-logs` is the one that actually shrinks the log.** Raft truncates to
+`snapshot_index - TrailingLogs`, so leaving it at the default means the log
+never shrinks however often the node snapshots. `docker-compose.test.yml`
+lowers all three so `tests/e2e/test_snapshot.py` can observe a real snapshot and
+a real truncation inside one test run:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+pytest tests/e2e -m requires_docker -v -rs
+```
+
+Compaction is observable on the management API: `/status` reports
+`first_log_index`, `last_log_index`, `applied_index`, `commit_index` and
+`last_snapshot_index`, which is how the e2e tests prove the log was really
+truncated rather than that a snapshot file merely appeared.
 
 ## Project Structure
 

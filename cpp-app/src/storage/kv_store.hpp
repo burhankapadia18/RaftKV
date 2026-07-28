@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -11,6 +12,8 @@
 #include <unordered_map>
 #include <utility>
 
+#include <fcntl.h>
+
 #include <msgpack.hpp>
 
 #include "../commands/kv_command.hpp"
@@ -20,6 +23,127 @@
 #include "wal.hpp"
 
 namespace kvdb {
+
+/**
+ * @brief The whole key-value state, as the store holds it in memory.
+ *
+ * Worth a name because it now sits in two contracts rather than one: the base
+ * file on disk (R2.1) and the snapshot streamed to another node over gRPC
+ * (R3.1) are the *same bytes*, produced from and parsed back into this type.
+ */
+using StateMap = std::unordered_map<std::string, std::string>;
+
+/** @brief State-image magic (R2.1). Four bytes, not NUL-terminated on disk. */
+inline constexpr const char *kStateMagic = "KVB1";
+inline constexpr size_t kStateMagicSize = 4;
+
+/**
+ * @brief Smallest number of bytes one entry can occupy.
+ *
+ * Two empty blobs, i.e. two uint32 length prefixes and no payload. Used to
+ * bound a declared entry count against the bytes actually available.
+ */
+inline constexpr size_t kStateMinEntrySize = 8;
+
+/** @brief Does @p bytes start with the state-image magic? */
+[[nodiscard]] inline bool has_state_magic(const std::string &bytes) {
+  return bytes.size() >= kStateMagicSize &&
+         bytes.compare(0, kStateMagicSize, kStateMagic, kStateMagicSize) == 0;
+}
+
+/**
+ * @brief Encode a whole map as a state image (R2.1 / R3.1).
+ *
+ * @code
+ *   "KVB1" | uint32 entry_count |
+ *   entry_count x ( uint32 key_len | key | uint32 value_len | value )
+ * @endcode
+ *
+ * All integers are little-endian and nothing is escaped, so keys and values
+ * may contain @c '=', newlines and NUL bytes.
+ *
+ * This is the single encoder in the program: the base file PersistentKVStore
+ * writes and the snapshot the state machine streams to the sidecar are
+ * byte-identical, which is what makes "ship the file you already have" a legal
+ * implementation of snapshot transfer.
+ *
+ * @throws std::length_error if a key or value is longer than a uint32 can
+ *         describe (from format::append_blob). Truncating the prefix instead
+ *         would silently corrupt the image.
+ */
+[[nodiscard]] inline std::string serialize_state(const StateMap &state) {
+  std::string out;
+  out.append(kStateMagic, kStateMagicSize);
+  // The format caps the map at 2^32-1 entries, which is far beyond what fits
+  // in memory here.
+  format::append_u32(out, static_cast<uint32_t>(state.size()));
+  for (const auto &[key, value] : state) {
+    format::append_blob(out, key);
+    format::append_blob(out, value);
+  }
+  return out;
+}
+
+/**
+ * @brief Decode a state image produced by serialize_state().
+ *
+ * Everything here is attacker-influenced input - it arrives off disk after a
+ * crash, or off the network from a peer - so a length read out of the buffer
+ * is never used to index, allocate or advance without first being checked
+ * against the bytes that actually remain. The map is built to the side and
+ * only returned once the whole image has parsed, so a corrupt image cannot
+ * leave a caller with a half-loaded state.
+ *
+ * @throws std::runtime_error naming what was wrong: a missing magic, a
+ *         truncated header or entry, an entry count that disagrees with the
+ *         bytes that follow it, or a blob length that overruns the buffer.
+ *         The message carries no path, because these bytes need not have come
+ *         from a file; callers that have one wrap the message with it.
+ */
+[[nodiscard]] inline StateMap deserialize_state(const std::string &bytes) {
+  if (!has_state_magic(bytes)) {
+    throw std::runtime_error("missing the \"KVB1\" magic");
+  }
+
+  size_t offset = kStateMagicSize;
+
+  uint32_t entry_count = 0;
+  if (!format::read_u32(bytes, offset, entry_count)) {
+    throw std::runtime_error("truncated entry count");
+  }
+
+  // Bound the count before it is used to size an allocation: a corrupt uint32
+  // must not be able to ask for a multi-gigabyte reserve.
+  const size_t remaining = bytes.size() - offset;
+  if (static_cast<size_t>(entry_count) > remaining / kStateMinEntrySize) {
+    throw std::runtime_error("entry count " + std::to_string(entry_count) +
+                             " exceeds the " + std::to_string(remaining) +
+                             " bytes that follow it");
+  }
+
+  StateMap state;
+  state.reserve(entry_count); // Safe: bounded by the check above.
+
+  for (uint32_t i = 0; i < entry_count; ++i) {
+    std::string key;
+    std::string value;
+    if (!format::read_blob(bytes, offset, key) ||
+        !format::read_blob(bytes, offset, value)) {
+      throw std::runtime_error("entry " + std::to_string(i) + " is truncated");
+    }
+    // Last one wins, matching the legacy reader. The writer never emits
+    // duplicates, so this only matters for hand-made images.
+    state[std::move(key)] = std::move(value);
+  }
+
+  if (offset != bytes.size()) {
+    throw std::runtime_error(std::to_string(bytes.size() - offset) +
+                             " trailing bytes after " +
+                             std::to_string(entry_count) + " entries");
+  }
+
+  return state;
+}
 
 /**
  * @brief Abstract interface for key-value storage.
@@ -40,6 +164,29 @@ public:
   virtual std::optional<std::string> get(const std::string &key) const = 0;
   virtual bool remove(const std::string &key) = 0;
   virtual bool contains(const std::string &key) const = 0;
+
+  /**
+   * @brief A consistent copy of the whole state (R3.2).
+   *
+   * "Consistent" is the whole point: the copy must not observe a write
+   * half-applied, which is why it is the store that produces it rather than
+   * the caller iterating. What the caller then does with it - serialize it,
+   * stream it to a peer - happens outside the store and outside its lock.
+   */
+  [[nodiscard]] virtual StateMap snapshot_state() const = 0;
+
+  /**
+   * @brief Replace the whole state with @p state, durably (R3.2 / R3.7).
+   *
+   * A replace, not a merge: keys the store holds and @p state does not are
+   * gone afterwards. This is the apply side of a raft snapshot install, so
+   * anything the local node had that the snapshot does not is by definition
+   * not part of the agreed state.
+   *
+   * Taken by value: callers hand over a map they have just built and it is
+   * moved into place.
+   */
+  virtual void restore_state(StateMap state) = 0;
 };
 
 /**
@@ -47,20 +194,12 @@ public:
  *
  * On-disk state is two files.
  *
- * The **base file**, at @c db_path, is a whole-map snapshot in the
- * length-prefixed binary format @c KVB1 (R2.1):
- *
- * @code
- *   "KVB1" | uint32 entry_count |
- *   entry_count x ( uint32 key_len | key | uint32 value_len | value )
- * @endcode
- *
- * All integers are little-endian and nothing is escaped, so keys and values may
- * contain @c '=', newlines and NUL bytes. The line-based format this replaces
- * mangled all three. It is written through atomic_write_file(), so the file a
- * reader sees is always a complete snapshot, never a half-finished one (R2.2).
- * A file that does not start with the magic is read once with the legacy line
- * parser and immediately rewritten in the new format (R2.3).
+ * The **base file**, at @c db_path, is a whole-map state image in the
+ * length-prefixed binary format @c KVB1 - see serialize_state() for the
+ * layout. It is written through atomic_write_file(), so the file a reader sees
+ * is always a complete image, never a half-finished one (R2.2). A file that
+ * does not start with the magic is read once with the legacy line parser and
+ * immediately rewritten in the new format (R2.3).
  *
  * The **write-ahead log** sits next to it (@c kv.db -> @c kv.wal). Every
  * set()/remove() appends one msgpack-encoded KVCommand and fsyncs it before
@@ -71,6 +210,10 @@ public:
  *
  * Recovery is therefore "load the base file, then replay the WAL over it"
  * (R2.5).
+ *
+ * Phase 3 adds the two ends of a raft snapshot on top of exactly the same
+ * machinery: snapshot_state() hands out a consistent copy for someone else to
+ * stream, and restore_state() installs one that arrived from a peer (R3.2).
  *
  * **Locking discipline.** Every public method holds @c mutex_ for its whole
  * body. Private helpers suffixed @c _unlocked assume the caller already holds
@@ -173,28 +316,79 @@ public:
     return store_.count(key) > 0;
   }
 
+  /**
+   * @brief Consistent copy of the whole map (R3.2).
+   *
+   * Copy under the lock, return, and nothing else - no serialization, no I/O.
+   * Serializing and streaming the result happens after the lock is released,
+   * so writers are blocked for O(copy) rather than O(network): a snapshot
+   * transfer that stalls on a slow peer must not stall this node's write path.
+   *
+   * The price is that the whole store exists twice in memory while a snapshot
+   * is in flight. That is affordable at this scale and is a deliberate trade
+   * against holding the lock, but it is a real ceiling - a store approaching a
+   * meaningful fraction of RAM would need an incremental or copy-on-write
+   * snapshot instead.
+   */
+  [[nodiscard]] StateMap snapshot_state() const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return store_;
+  }
+
+  /**
+   * @brief Install @p state as the entire contents of the store (R3.2, R3.7).
+   *
+   * Replaces, never merges: whatever the node held before is gone, including
+   * keys the snapshot does not mention. After this returns, @c kv.db holds
+   * exactly @p state and @c kv.wal is empty, so a crash one instruction later
+   * recovers to exactly the snapshot (R3.7) - not to the snapshot plus a
+   * replay of writes that predate it.
+   *
+   * **Ordering, and why it is the reverse of compact_unlocked().** Compaction
+   * writes a base file that already *contains* every record in the WAL, so
+   * crashing before the truncate costs one idempotent re-replay - hence base
+   * file first there. A restore has no such relationship: the WAL holds
+   * pre-restore commands that the incoming state neither contains nor was
+   * built from. Persisting the snapshot first and dying before the truncate
+   * would recover as "snapshot, then stale writes applied on top" - a state no
+   * replica ever had, reached silently and permanently. So the WAL is dropped
+   * first, and the drop is fsynced (reset_wal_unlocked()) so that it cannot
+   * still be in flight when the new base file lands.
+   *
+   * That leaves exactly three states a crash can expose, all of them sane: the
+   * pre-restore state, the pre-restore state minus its WAL tail, or the
+   * snapshot. Raft re-drives the install in the first two, because a restore
+   * that did not return success never advanced the applied index - and every
+   * command in a dropped WAL is still in the raft log.
+   *
+   * Encoding comes first because it is the one step that touches nothing: a
+   * state that cannot be encoded fails before the WAL has been dropped. The
+   * map is swapped in last, so a failed persist leaves the store serving the
+   * state it already had rather than one it has just told raft it could not
+   * install.
+   *
+   * @throws std::runtime_error if the WAL cannot be reset or the base file
+   *         cannot be written. Callers must surface it: a node that cannot
+   *         install a snapshot must not report that it did (R3.5).
+   */
+  void restore_state(StateMap state) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string image = serialize_state(state);
+    reset_wal_unlocked();
+    write_base_unlocked(image);
+    store_ = std::move(state);
+  }
+
 private:
   /** @brief Operation strings understood by KVCommand::parse_operation. */
   static constexpr const char *kOpSet = "SET";
   static constexpr const char *kOpDelete = "DELETE";
 
-  /** @brief Base file magic (R2.1). Four bytes, not NUL-terminated on disk. */
-  static constexpr const char *kMagic = "KVB1";
-  static constexpr size_t kMagicSize = 4;
-
-  /**
-   * @brief Smallest number of bytes an entry can occupy.
-   *
-   * Two empty blobs, i.e. two uint32 length prefixes and no payload. Used to
-   * bound a declared entry count against the bytes actually available.
-   */
-  static constexpr size_t kMinEntrySize = 8;
-
   // Declaration order matters: wal_'s initialiser reads db_path_.
   std::string db_path_;
   DurabilityOptions options_;
   Wal wal_;
-  std::unordered_map<std::string, std::string> store_;
+  StateMap store_;
   mutable std::mutex mutex_;
 
   /**
@@ -233,77 +427,26 @@ private:
       return false; // No file yet: empty store, and nothing to rewrite.
     }
 
-    if (has_magic(*contents)) {
+    if (has_state_magic(*contents)) {
       // A file that claims to be KVB1 is parsed as KVB1, full stop. Falling
       // back to the legacy parser when a binary file fails to parse would turn
       // detectable corruption into plausible-looking garbage, so a malformed
       // KVB1 file is a hard error instead. The converse ambiguity - a legacy
       // file whose first line happens to begin with "KVB1" - resolves the same
       // way: it fails loudly rather than loading wrong data.
-      parse_binary_unlocked(*contents);
+      try {
+        store_ = deserialize_state(*contents);
+      } catch (const std::runtime_error &error) {
+        // The decoder is shared with the snapshot path and knows nothing about
+        // where its bytes came from, so the path is attached here - an
+        // operator staring at a start-up failure needs to be told which file.
+        throw corrupt_base(error.what());
+      }
       return false;
     }
 
     parse_legacy_unlocked(*contents);
     return true;
-  }
-
-  /** @brief Does @p contents start with the KVB1 magic? */
-  [[nodiscard]] static bool has_magic(const std::string &contents) {
-    return contents.size() >= kMagicSize &&
-           contents.compare(0, kMagicSize, kMagic, kMagicSize) == 0;
-  }
-
-  /**
-   * @brief Parse the KVB1 base format into @c store_.
-   *
-   * Everything here is attacker-influenced input: a length read off disk is
-   * never used to index, allocate or advance without first being checked
-   * against the bytes that actually remain. The map is built to the side and
-   * only swapped in once the whole file has parsed, so a corrupt file leaves
-   * the store empty rather than half-loaded.
-   *
-   * @throws std::runtime_error naming the file and what was wrong with it.
-   */
-  void parse_binary_unlocked(const std::string &contents) {
-    size_t offset = kMagicSize;
-
-    uint32_t entry_count = 0;
-    if (!format::read_u32(contents, offset, entry_count)) {
-      throw corrupt_base("truncated entry count");
-    }
-
-    // Bound the count before it is used to size an allocation: a corrupt
-    // uint32 must not be able to ask for a multi-gigabyte reserve.
-    const size_t remaining = contents.size() - offset;
-    if (static_cast<size_t>(entry_count) > remaining / kMinEntrySize) {
-      throw corrupt_base("entry count " + std::to_string(entry_count) +
-                         " exceeds the " + std::to_string(remaining) +
-                         " bytes that follow it");
-    }
-
-    std::unordered_map<std::string, std::string> loaded;
-    loaded.reserve(entry_count); // Safe: bounded by the check above.
-
-    for (uint32_t i = 0; i < entry_count; ++i) {
-      std::string key;
-      std::string value;
-      if (!format::read_blob(contents, offset, key) ||
-          !format::read_blob(contents, offset, value)) {
-        throw corrupt_base("entry " + std::to_string(i) + " is truncated");
-      }
-      // Last one wins, matching the legacy reader. The writer never emits
-      // duplicates, so this only matters for hand-made files.
-      loaded[std::move(key)] = std::move(value);
-    }
-
-    if (offset != contents.size()) {
-      throw corrupt_base(std::to_string(contents.size() - offset) +
-                         " trailing bytes after " +
-                         std::to_string(entry_count) + " entries");
-    }
-
-    store_ = std::move(loaded);
   }
 
   /**
@@ -425,23 +568,50 @@ private:
     return std::string(buffer.data(), buffer.size());
   }
 
-  /** @brief Render the whole map in the KVB1 base format (R2.1). */
-  [[nodiscard]] std::string serialize_unlocked() const {
-    std::string out;
-    out.append(kMagic, kMagicSize);
-    // The format caps the map at 2^32-1 entries, which is far beyond what fits
-    // in memory here.
-    format::append_u32(out, static_cast<uint32_t>(store_.size()));
-    for (const auto &[key, value] : store_) {
-      format::append_blob(out, key);
-      format::append_blob(out, value);
-    }
-    return out;
+  /** @brief Atomically install an encoded state image as the base (R2.2). */
+  void write_base_unlocked(const std::string &image) const {
+    atomic_write_file(db_path_, image);
   }
 
-  /** @brief Write a complete base file, atomically (R2.2). */
+  /** @brief Write the current map as a complete base file, atomically. */
   void persist_unlocked() const {
-    atomic_write_file(db_path_, serialize_unlocked());
+    write_base_unlocked(serialize_state(store_));
+  }
+
+  /**
+   * @brief Drop every WAL record and force the truncation to stable storage.
+   *
+   * Wal::truncate() deliberately does not fsync, and for its two original
+   * callers that is right: a truncation lost to a crash costs nothing but a
+   * repeat of the torn-tail heal, or a re-replay of records the base file
+   * already contains. restore_state() is the caller for which it is not right
+   * - there, a WAL that survives the crash is replayed *over* an installed
+   * snapshot, which is corruption rather than a repeat. Hence the explicit
+   * fsync: the truncation must be on disk before the snapshot's base file can
+   * land, or the ordering argument in restore_state() buys nothing.
+   *
+   * @throws std::runtime_error if the WAL cannot be truncated or fsynced.
+   */
+  void reset_wal_unlocked() {
+    wal_.truncate();
+
+    const std::string &wal_path = wal_.path();
+    fileio::FdGuard fd(::open(wal_path.c_str(), O_WRONLY | O_CLOEXEC));
+    if (!fd.valid()) {
+      const int err = errno;
+      if (err == ENOENT) {
+        return; // Never created, so there is no truncation to make durable.
+      }
+      fileio::throw_errno("cannot open WAL to fsync", wal_path, err);
+    }
+    if (!fileio::fsync_retry(fd.get())) {
+      const int err = errno;
+      fileio::throw_errno("cannot fsync WAL", wal_path, err);
+    }
+    if (fd.close_checked() != 0) {
+      const int err = errno;
+      fileio::throw_errno("cannot close WAL", wal_path, err);
+    }
   }
 
   /**
@@ -450,7 +620,8 @@ private:
    * Order is the correctness argument: the base file is durable (fsynced and
    * renamed into place) before the records it subsumes are thrown away, so a
    * crash between the two costs at most a replay of records that are already
-   * in the base file - and SET/DELETE replay is idempotent.
+   * in the base file - and SET/DELETE replay is idempotent. restore_state()
+   * needs the opposite order for the opposite reason; see the note there.
    */
   void compact_unlocked() {
     persist_unlocked();

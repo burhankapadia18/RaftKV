@@ -1,6 +1,6 @@
 # RaftKV end-to-end suite
 
-Asserting replacement for `test_client.py`. Three families of test:
+Asserting replacement for `test_client.py`. Four families of test:
 
 - **R0.1–R0.5** (Phase 0) — a write on the leader replicates to **all** nodes,
   DELETE round-trips, a missing key is reported as missing, and a write to a
@@ -10,6 +10,11 @@ Asserting replacement for `test_client.py`. Three families of test:
   remote denial of service that a malformed `Content-Length` used to cause.
 - **R2.4/R2.5/R2.7** (Phase 2, `test_crash.py`) — an acknowledged write survives
   `kill -9`. Opt-in; see [The `requires_docker` split](#the-requires_docker-split).
+- **R3.x** (Phase 3, `test_snapshot.py`) — the raft log is bounded, a node whose
+  volume is deleted rejoins via snapshot transfer, and a restart applies a
+  snapshot plus the tail instead of all of history. Opt-in, and additionally
+  needs a cluster started with `docker-compose.test.yml`; see
+  [The snapshot scenarios](#the-snapshot-scenarios).
 
 ## The cluster must already be running
 
@@ -25,9 +30,13 @@ docker compose up -d
 
 ```bash
 pip install -r tests/e2e/requirements.txt
-pytest tests/e2e -v                      # the default suite: never touches docker
-pytest tests/e2e -m requires_docker -v   # the crash test: kills and restarts a node
+pytest tests/e2e -v                         # the default suite: never touches docker
+pytest tests/e2e -m requires_docker -v -rs  # crash + snapshot: kills, wipes, restarts
 ```
+
+`-rs` prints skip reasons. It matters for the opt-in run: the snapshot scenarios
+skip unless the cluster was started with the test override, and a skip nobody
+sees is an unverified requirement.
 
 Exit status is pytest's: non-zero on any failure. If no node accepts a write
 within the leader-discovery deadline, the suite fails with a message telling you
@@ -36,44 +45,106 @@ the cluster is not up and what each node answered instead.
 ## The `requires_docker` split
 
 `pytest.ini` sets `addopts = -m "not requires_docker"`, so the default run
-excludes `test_crash.py`. That is not a convenience — it is what keeps the rule
-above true.
+excludes `test_crash.py` and `test_snapshot.py`. That is not a convenience — it
+is what keeps the rule above true.
 
 The rule exists because it makes the suite portable: knowing nothing about *how*
 the nodes are run, it works against a local compose cluster, a remote host, or a
-k8s namespace, driven only by `RAFTKV_NODES`. Phase 2's acceptance criterion
-("`kill -9` at any instant loses no acknowledged write") cannot be expressed
-that way — it has to send a real SIGKILL to a real container, and specifically
-SIGKILL: `docker compose stop` sends SIGTERM, which is a graceful shutdown and
-would prove nothing.
+k8s namespace, driven only by `RAFTKV_NODES`. Two acceptance criteria cannot be
+expressed that way. Phase 2's ("`kill -9` at any instant loses no acknowledged
+write") has to send a real SIGKILL to a real container, and specifically SIGKILL:
+`docker compose stop` sends SIGTERM, which is a graceful shutdown and would prove
+nothing. Phase 3's ("a wiped node rejoins and catches up from a snapshot") has to
+delete a node's volume and start it again.
 
-So the exception is quarantined behind a marker and opted into explicitly rather
-than being smuggled into the default run. A command-line `-m` replaces the one
-in `addopts`, which is what makes the opt-in work.
+So the exceptions are quarantined behind a marker and opted into explicitly
+rather than being smuggled into the default run. A command-line `-m` replaces the
+one in `addopts`, which is what makes the opt-in work.
 
-The crash test **skips** — never fails — when it cannot do its job: no `docker`
+Both modules **skip** — never fail — when they cannot do their job: no `docker`
 CLI, no `docker compose` plugin, no reachable daemon, no containers in the
 compose project, or `RAFTKV_NODES` pointing at anything other than localhost
 (killing a local container proves nothing about a remote cluster). A skip means
 "not verified here".
 
-**What it actually proves.** Write K keys through the leader, confirm they
-replicated, `docker compose kill -s KILL` a follower, and — *while it is dead* —
-assert the keys are already in that node's `kv.db`/`kv.wal` on disk. That
-assertion is the point: the naive version of this test (kill, restart, read
-back) would pass with an empty store, because there are no raft snapshots yet
-and a restart replays the entire local BoltDB log back into the state machine.
-Only the on-disk check distinguishes "durable" from "refilled by replay". The
-read-back after the restart is then deliberately *not* polled — recovery
-finishes before the HTTP listener opens — and a final write proves the node
-rejoined the cluster rather than merely coming back to life. If the data
-directory cannot be read from the test host (named volume, remote daemon,
-permissions), the test still runs the kill/restart and emits a
+### What the crash test proves
+
+Write K keys through the leader, confirm they replicated,
+`docker compose kill -s KILL` a follower, and — *while it is dead* — assert the
+keys are already in that node's `kv.db`/`kv.wal` on disk. That assertion is the
+point: the naive version of this test (kill, restart, read back) would pass with
+an empty store, because a restart replays raft's log back into the state machine
+and would refill it. Only the on-disk check distinguishes "durable" from
+"refilled by replay". The read-back after the restart is then deliberately *not*
+polled — recovery finishes before the HTTP listener opens — and a final write
+proves the node rejoined the cluster rather than merely coming back to life. If
+the data directory cannot be read from the test host (named volume, remote
+daemon, permissions), the test still runs the kill/restart and emits a
 `DurabilityNotVerified` warning rather than pretending it proved more.
 
 The test always attempts to restart the node, including when an assertion
 fails; a run that dies between the kill and the restart leaves the cluster a
 node short, recoverable with `docker compose start <node>`.
+
+**Run it against the ordinary cluster, not the snapshot one.** Its final
+read-back is deliberately unpolled, and since Phase 3 a restarting node briefly
+serves *less* than its disk held: raft restores the local snapshot over the
+recovered store and only then replays the tail. With production snapshot
+settings that window does not arise inside a test run; with
+`docker-compose.test.yml` it can, and the unpolled read would be racing it. CI
+runs the crash test against the base cluster for exactly this reason.
+
+## The snapshot scenarios
+
+`test_snapshot.py` needs one thing beyond docker: a cluster that snapshots
+*inside a test run*. The shipped defaults are HashiCorp Raft's own (120s / 8192
+entries / 10240 trailing logs), which no test can wait for, so the cluster has
+to be started with the override:
+
+```bash
+docker compose down -v && rm -rf vol-node1 vol-node2 vol-node3
+docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+pytest tests/e2e -m requires_docker -v -rs
+```
+
+Each test reads the tunables back out of the sidecar's own startup log line
+(`Starting sidecar with config: Config{… SnapshotThreshold: 20, TrailingLogs: 10}`)
+and **skips** when they are production values — so running the opt-in suite
+against the ordinary cluster reports "not verified here" instead of timing out.
+That is also why adding this module did not change what CI's existing
+crash-test step does.
+
+Three scenarios, in file order, sharing one write burst:
+
+1. **A snapshot is taken and the log is truncated.** Both are asserted, and they
+   are different claims. `last_snapshot_index` rising says a snapshot happened;
+   `first_log_index` rising says the log was actually shortened. Raft truncates
+   to `snapshot_index - TrailingLogs`, so a cluster can snapshot forever and
+   still keep every entry. A complete snapshot directory (`meta.json` +
+   `state.bin`, not `*.tmp`) must exist in `<data dir>/snapshots/` as well.
+2. **A wiped follower rejoins.** Stop it, delete *everything* in its data
+   directory, start it, and require it to serve every key. Two independent facts
+   establish that it caught up by **snapshot transfer** rather than log replay:
+   the leader's `first_log_index` was > 1 immediately before the wipe (so the
+   beginning of history is gone and `InstallSnapshot` is raft's only option),
+   and the wiped node reports `last_snapshot_index` > 0 afterwards having had a
+   verified-empty snapshot store when it started.
+3. **A normal restart applies a snapshot plus the tail.** Measured as a delta on
+   the C++ engine's per-entry log lines: the number of entries replayed must not
+   exceed `last_log_index - last_snapshot_index` (plus a small slack), where
+   replaying all of history would be `last_log_index`. Restart *timing* is
+   deliberately not asserted — wall-clock on a shared runner is not evidence.
+
+Some of the evidence is log lines this repository emits itself
+(`fsm: restored a …`, `[StateMachine] Restored snapshot: …`, named in
+`snapshot_support.py`). That is a real coupling — renaming one breaks the test —
+and it is deliberate: no index distinguishes "raft installed a snapshot" from
+"the C++ engine actually took it", and R3.5's whole point is that the second
+must follow from the first. Log evidence is always counted before and after an
+action and compared, never grepped absolutely, because a restarted container's
+logs still contain everything it printed before the restart.
+
+The wiped node is always started again, including when an assertion fails.
 
 ## Configuration
 
@@ -95,6 +166,19 @@ All optional; every value has a working default for `docker-compose.yml`.
 | `RAFTKV_CRASH_KEYS` | `25` | How many keys to write before the kill |
 | `RAFTKV_RESTART_TIMEOUT` | `90.0` | Deadline for the restarted node to answer a read again |
 | `RAFTKV_DOCKER_TIMEOUT` | `60.0` | Budget for one `docker` CLI invocation |
+
+`test_snapshot.py` only (also ignored by the default run):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `RAFTKV_COMPOSE_FILES` | `<repo>/docker-compose.yml,<repo>/docker-compose.test.yml` | Comma-separated compose files, in `-f` order. Must match what the cluster was started with, or a restarted service loses the override |
+| `RAFTKV_SNAPSHOT_KEYS` | `60` | Keys written to push the cluster past the snapshot threshold |
+| `RAFTKV_COMPACTION_TIMEOUT` | `120.0` | Deadline for every node to snapshot *and* truncate |
+| `RAFTKV_CATCHUP_TIMEOUT` | `180.0` | Deadline for a wiped or restarted node to serve every key again |
+| `RAFTKV_DOCKER_POLL_INTERVAL` | `1.0` | Poll interval for `/status` and log probes (each costs a `docker compose exec`) |
+| `RAFTKV_MAX_SNAPSHOT_THRESHOLD` | `512` | Above this, the cluster counts as "not configured for these tests" and they skip |
+| `RAFTKV_MAX_TRAILING_LOGS` | `512` | Same, for `TrailingLogs` |
+| `RAFTKV_RESTART_TAIL_SLACK` | `8` | Extra applies tolerated above the expected tail on restart |
 
 ```bash
 RAFTKV_NODES=http://node1:8080,http://node2:8080,http://node3:8080 pytest tests/e2e -v
@@ -149,9 +233,15 @@ literal value.
   `cluster` fixture. `test_crash.py` follows the same rule, and additionally
   imports `assert_write_accepted` from `test_cluster` so the committed-write
   contract (200 + JSON + `{"ok":true}`) is asserted in exactly one place.
-- **All docker knowledge is in `test_crash.py`.** `conftest.py` stays
-  docker-free; the compose plumbing, the skip conditions and the on-disk format
-  checks live only in the module that needs them.
+  `test_snapshot.py` does the same and additionally imports the docker plumbing
+  from `test_crash.py` rather than growing a second copy of it.
+- **`conftest.py` stays docker-free.** The compose wrapper, the skip
+  conditions and the on-disk format checks live in `test_crash.py`; the pieces
+  the snapshot scenarios need on top — compose across two `-f` files, reading
+  `:6000/status` through `docker compose exec`, listing and emptying a data
+  directory from inside a container — live in `snapshot_support.py`, a plain
+  module next to the tests in the same way as `contracts.py`. Neither is
+  imported by anything that runs in the default suite.
 - **Raw sockets where `requests` cannot go.** `requests` derives
   `Content-Length` from the body, so the R1.8 regression test hand-builds the
   request bytes and reads the response off the socket itself.

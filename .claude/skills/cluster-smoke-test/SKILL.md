@@ -56,10 +56,10 @@ Use `docker compose` (the CLI plugin) throughout — the standalone
    `RAFTKV_NODES=http://host:8080,...`; other knobs are listed in
    `tests/e2e/README.md`.
 
-4b. **Run the crash-recovery test** (Phase 2). It is deselected from the run
-   above by `pytest.ini`, because it is the one test that touches docker — it
-   `SIGKILL`s a follower, asserts the acknowledged writes are already in that
-   node's `kv.db`/`kv.wal` *while it is dead*, then restarts it:
+5. **Run the crash-recovery test** (Phase 2) — deselected from the run above by
+   `pytest.ini`, because it is the one test that touches docker: it `SIGKILL`s a
+   follower, asserts the acknowledged writes are already in that node's
+   `kv.db`/`kv.wal` *while it is dead*, then restarts it and reads them back.
 
    ```bash
    pytest tests/e2e -m requires_docker -v -rs
@@ -69,11 +69,11 @@ Use `docker compose` (the CLI plugin) throughout — the standalone
    down, then rejoins). `-rs` matters: the test **skips** rather than fails when
    it cannot do its job — no docker CLI, no compose project, or `RAFTKV_NODES`
    pointing somewhere other than localhost — and a silent skip would look like a
-   pass. It always attempts the restart even when an assertion fails; if a run is
-   interrupted between the kill and the restart, bring the node back with
+   pass. It always attempts the restart even when an assertion fails; if a run
+   is interrupted between the kill and the restart, bring the node back with
    `docker compose start node2`.
 
-5. **Optional cross-check on the logs.** The suite already proves replication
+6. **Optional cross-check on the logs.** The suite already proves replication
    via HTTP reads on every node; this only helps when you are diagnosing a
    failure:
    ```bash
@@ -81,7 +81,7 @@ Use `docker compose` (the CLI plugin) throughout — the standalone
    ```
    Every node should show `[StateMachine] Applied:` lines for the e2e keys.
 
-6. **Tear down**:
+7. **Tear down**:
    ```bash
    docker compose down -v
    ```
