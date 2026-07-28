@@ -257,6 +257,40 @@ public:
    * @return gRPC status; non-OK if the state could not be serialized or the
    *         peer went away mid-stream
    */
+  /**
+   * @brief Read one key from the local store (R4.5).
+   *
+   * Deliberately NOT a linearizable read on its own — it is the second half of
+   * one. The sidecar calls this only after it has run a Barrier and confirmed
+   * with a quorum that it still leads; at that point the local store provably
+   * contains every acknowledged write, which is what makes the surrounding read
+   * linearizable. Called directly it gives exactly what
+   * `GET ?consistency=local` gives you.
+   *
+   * @param context gRPC server context (unused)
+   * @param request The key to look up
+   * @param reply found plus the value when present
+   * @return Always OK. A miss is a successful read that found nothing, not an
+   *         error, so there is nothing to report here.
+   */
+  grpc::Status Get(grpc::ServerContext *context,
+                   const consensus::GetRequest *request,
+                   consensus::GetResponse *reply) override {
+    const std::optional<std::string> value = store_.get(request->key());
+    if (!value.has_value()) {
+      reply->set_found(false);
+      return grpc::Status::OK;
+    }
+
+    reply->set_found(true);
+    // The two-argument form: `value` is a proto `bytes` field, and passing the
+    // length explicitly is what lets a value containing NUL bytes survive.
+    // Those have round-tripped since Phase 2 and must not start truncating
+    // here.
+    reply->set_value(value->data(), value->size());
+    return grpc::Status::OK;
+  }
+
   grpc::Status
   GetSnapshot(grpc::ServerContext *context,
               const consensus::SnapshotRequest *request,

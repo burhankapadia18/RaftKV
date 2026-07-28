@@ -42,9 +42,20 @@ public:
     return result;
   }
 
+  /** @brief Scriptable linearizable read (R4.5). */
+  ReadResult read(const std::string &key) override {
+    ++read_calls;
+    last_read_key = key;
+    return read_result;
+  }
+
   ProposeResult result = ProposeResult::ok();
   std::string last_payload;
   int calls = 0;
+
+  ReadResult read_result = ReadResult::miss();
+  std::string last_read_key;
+  int read_calls = 0;
 };
 
 /** @brief In-memory IKVStore double - no file, no locking. */

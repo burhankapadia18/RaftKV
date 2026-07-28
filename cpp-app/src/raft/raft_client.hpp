@@ -32,6 +32,42 @@ struct ProposeResult {
 };
 
 /**
+ * @brief Outcome of a linearizable read (R4.5).
+ *
+ * `found` is only meaningful when `ok` is true: a failed read knows nothing
+ * about whether the key exists, and conflating "no" with "could not tell" is
+ * how a stale answer gets dressed up as a definitive one.
+ */
+struct ReadResult {
+  bool ok = false;
+  bool found = false;
+  std::string value;
+  std::string error;
+
+  [[nodiscard]] static ReadResult hit(std::string v) {
+    ReadResult r;
+    r.ok = true;
+    r.found = true;
+    r.value = std::move(v);
+    return r;
+  }
+
+  [[nodiscard]] static ReadResult miss() {
+    ReadResult r;
+    r.ok = true;
+    r.found = false;
+    return r;
+  }
+
+  [[nodiscard]] static ReadResult failure(std::string reason) {
+    ReadResult r;
+    r.ok = false;
+    r.error = std::move(reason);
+    return r;
+  }
+};
+
+/**
  * @brief Abstract interface for Raft consensus client.
  *
  * Allows for easy mocking in unit tests and potential
@@ -48,6 +84,16 @@ public:
    * @return Success, or failure carrying the reason it failed
    */
   virtual ProposeResult propose(const std::string &payload) = 0;
+
+  /**
+   * @brief Read a key linearizably via the sidecar (R4.5).
+   *
+   * The sidecar forwards to the leader when needed and runs Barrier +
+   * VerifyLeader there, so a value returned here reflects every write
+   * acknowledged before the call. Contrast with reading the local store
+   * directly, which is what `consistency=local` does and may be stale.
+   */
+  virtual ReadResult read(const std::string &key) = 0;
 };
 
 /**
@@ -105,9 +151,7 @@ public:
 
     grpc::Status status = stub_->Propose(&context, cmd, &reply);
     if (!status.ok()) {
-      return ProposeResult::failure(
-          std::string(status_code_name(status.error_code())) + ": " +
-          status.error_message());
+      return ProposeResult::failure(grpc_failure_reason(status));
     }
 
     if (!reply.success()) {
@@ -120,6 +164,35 @@ public:
     return ProposeResult::ok();
   }
 
+  /**
+   * @brief Ask the sidecar for a linearizable read.
+   *
+   * `forwarded` is left unset: this is the ORIGINAL request entering the
+   * cluster, so the sidecar is free to forward it once. Setting it here would
+   * disable forwarding entirely and make a follower refuse every linearizable
+   * read.
+   */
+  ReadResult read(const std::string &key) override {
+    consensus::ReadRequest request;
+    request.set_key(key);
+
+    consensus::ReadResponse reply;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + kDefaultTimeout);
+
+    const grpc::Status status = stub_->Read(&context, request, &reply);
+    if (!status.ok()) {
+      return ReadResult::failure(grpc_failure_reason(status));
+    }
+    if (!reply.error().empty()) {
+      return ReadResult::failure(reply.error());
+    }
+    if (!reply.found()) {
+      return ReadResult::miss();
+    }
+    return ReadResult::hit(reply.value());
+  }
+
 private:
   std::unique_ptr<consensus::RaftNode::Stub> stub_;
 
@@ -130,6 +203,17 @@ private:
   // no bound on the sidecar side, so DEADLINE_EXCEEDED here is still reachable
   // and ProposeResult carries it as such.
   static constexpr std::chrono::seconds kDefaultTimeout{5};
+
+  /**
+   * @brief Render a failed gRPC status as "<CODE_NAME>: <message>".
+   *
+   * Shared by propose() and read() so both report a transport failure the same
+   * way; the HTTP layer maps either onto a 502 with this text in the body.
+   */
+  [[nodiscard]] static std::string grpc_failure_reason(const grpc::Status &s) {
+    return std::string(status_code_name(s.error_code())) + ": " +
+           s.error_message();
+  }
 
   /** @brief Stand-in when the sidecar reports failure with no reason. */
   static constexpr const char *kUnexplainedFailure =

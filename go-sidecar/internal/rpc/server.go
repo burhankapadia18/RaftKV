@@ -45,6 +45,12 @@ const NotLeaderPrefix = "not_leader:"
 // raftnode.Node.Apply, and it has to fail the node rather than continue.
 const proposeTimeout = 4 * time.Second
 
+// readTimeout bounds the Barrier in a linearizable read. Unlike proposeTimeout
+// this one does what its name says: raft.Barrier's timeout covers the whole
+// wait, so a leader that cannot make progress fails the read instead of hanging
+// the client.
+const readTimeout = 4 * time.Second
+
 // RaftProposer is the consumer-side view of the Raft node that the Propose
 // handler needs. Declaring it here (rather than depending on *raftnode.Node)
 // keeps this package testable with a fake and free of any dependency on
@@ -62,6 +68,34 @@ type RaftProposer interface {
 	Apply(data []byte, timeout time.Duration) (interface{}, error)
 	// LeaderAddr returns the current leader's Raft address, or "" if unknown.
 	LeaderAddr() string
+
+	// IsLeader reports this node's OWN belief about whether it leads. Cheap and
+	// local, and therefore only good enough to decide whether to forward —
+	// VerifyLeader is the authoritative check.
+	IsLeader() bool
+
+	// Barrier blocks until every entry committed before the call has been
+	// applied to this node's FSM. On the leader that is what turns a local read
+	// into a linearizable one (R4.5).
+	Barrier(timeout time.Duration) error
+
+	// VerifyLeader confirms with a quorum that this node is still the leader.
+	// Barrier alone is not enough: a partitioned old leader can satisfy its own
+	// barrier while a new leader elsewhere has already moved on.
+	VerifyLeader() error
+}
+
+// ReadForwarder relays a linearizable read to the leader on a follower's behalf.
+// *Forwarder satisfies it; kept as an interface so the handler can be tested
+// without a real peer.
+type ReadForwarder interface {
+	ForwardRead(ctx context.Context, raftAddr string, key string) (*pb.ReadResponse, error)
+}
+
+// LocalReader reads one key from this node's own C++ state machine.
+// The sidecar only calls it after establishing that this node is the leader.
+type LocalReader interface {
+	Get(ctx context.Context, key string) (found bool, value []byte, err error)
 }
 
 // ProposeForwarder relays a proposal to the leader on a follower's behalf.
@@ -76,6 +110,7 @@ type Server struct {
 	pb.UnimplementedRaftNodeServer
 	node       RaftProposer
 	forwarder  ProposeForwarder
+	reader     LocalReader
 	grpcServer *grpc.Server
 	listener   net.Listener
 }
@@ -92,6 +127,118 @@ func NewServer(node RaftProposer, forwarder ProposeForwarder) *Server {
 		forwarder:  forwarder,
 		grpcServer: grpc.NewServer(),
 	}
+}
+
+// WithLocalReader supplies the C++ state machine this node reads from when it
+// serves a linearizable read (R4.5).
+//
+// Separate from NewServer because Read is optional: without a reader the RPC
+// answers with a truthful error rather than a wrong value, and Propose — the
+// path every prior phase depends on — keeps working untouched.
+func (s *Server) WithLocalReader(reader LocalReader) *Server {
+	s.reader = reader
+	return s
+}
+
+// Read serves a linearizable read (R4.5).
+//
+// The linearizability argument, in order, because each step covers a failure the
+// others do not:
+//
+//  1. Only the leader may answer. A follower's local store can be arbitrarily
+//     stale, so it forwards — exactly once, same guard as Propose.
+//  2. Barrier() waits for everything committed before this call to be applied
+//     here. Without it the leader could answer from a state that is missing a
+//     write it has already acknowledged.
+//  3. VerifyLeader() confirms with a quorum that we still lead. Barrier alone is
+//     not enough: a partitioned old leader satisfies its own barrier happily
+//     while a new leader elsewhere has already accepted newer writes. Doing this
+//     AFTER the barrier is deliberate — it is the barrier's result we need to
+//     trust, so leadership has to hold as of the later moment.
+//  4. Only then read the local store, which is now known to contain every
+//     acknowledged write.
+//
+// Failures are reported in ReadResponse.error with a nil gRPC error, matching
+// Propose: the C++ client reads the field.
+func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadResponse, error) {
+	// Cheap local filter: a node that does not even think it leads has nothing
+	// to gain from a Barrier or a quorum check, so forward immediately. The
+	// authoritative VerifyLeader happens below, after the barrier.
+	if !s.node.IsLeader() {
+		return s.forwardRead(ctx, req), nil
+	}
+
+	if s.reader == nil {
+		return &pb.ReadResponse{
+			Error: "linearizable reads are not configured on this node",
+		}, nil
+	}
+
+	if err := s.node.Barrier(readTimeout); err != nil {
+		log.Printf("ERROR: read barrier failed: %v", err)
+		return &pb.ReadResponse{
+			Error: fmt.Sprintf("read barrier failed: %v", err),
+		}, nil
+	}
+
+	// After the barrier, not before — see step 3 above.
+	if err := s.node.VerifyLeader(); err != nil {
+		leader := s.node.LeaderAddr()
+		log.Printf("Read rejected: leadership not confirmed (%v, leader=%q)", err, leader)
+		return &pb.ReadResponse{Error: NotLeaderPrefix + leader}, nil
+	}
+
+	found, value, err := s.reader.Get(ctx, req.GetKey())
+	if err != nil {
+		log.Printf("ERROR: local read failed: %v", err)
+		return &pb.ReadResponse{
+			Error: fmt.Sprintf("local read failed: %v", err),
+		}, nil
+	}
+
+	return &pb.ReadResponse{Found: found, Value: value}, nil
+}
+
+// forwardRead relays a read to the leader, or explains why it could not.
+func (s *Server) forwardRead(ctx context.Context, req *pb.ReadRequest) *pb.ReadResponse {
+	leader := s.node.LeaderAddr()
+
+	// One hop only, same reasoning as Propose: if a peer sent this here
+	// believing we lead and we do not, our hint is no better than theirs.
+	if req.GetForwarded() {
+		log.Printf("Refusing already-forwarded read: this node is not the leader")
+		return &pb.ReadResponse{Error: NotLeaderPrefix + leader}
+	}
+	if s.forwarder == nil {
+		return &pb.ReadResponse{Error: NotLeaderPrefix + leader}
+	}
+
+	// No leader known at all — during an election, or before this node has heard
+	// from one. That is a "not here, not now" condition, identical to what the
+	// write path reports, so it gets the same not_leader: prefix and therefore
+	// the same 503. Attempting to forward to an empty address would instead
+	// surface a resolver error and map onto a 502, telling the client the
+	// cluster is broken when it is merely mid-election.
+	if leader == "" {
+		log.Printf("Read rejected: no leader known")
+		return &pb.ReadResponse{Error: NotLeaderPrefix}
+	}
+
+	readForwarder, ok := s.forwarder.(ReadForwarder)
+	if !ok {
+		return &pb.ReadResponse{Error: NotLeaderPrefix + leader}
+	}
+
+	log.Printf("Forwarding linearizable read to the leader at %s", leader)
+	resp, err := readForwarder.ForwardRead(ctx, leader, req.GetKey())
+	if err != nil {
+		log.Printf("Forwarding read to %s failed: %v", leader, err)
+		return &pb.ReadResponse{
+			Error: fmt.Sprintf("forwarding read to the leader at %s failed: %v",
+				leader, err),
+		}
+	}
+	return resp
 }
 
 // Propose handles client proposals to the Raft cluster.

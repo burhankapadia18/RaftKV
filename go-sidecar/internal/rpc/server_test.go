@@ -64,8 +64,22 @@ type fakeProposer struct {
 	err        error
 	leaderAddr string
 
-	mu    sync.Mutex
-	calls []applyCall
+	// Slice B (linearizable reads). isLeader is this node's own belief;
+	// verifyErr is what the quorum check reports. They are deliberately
+	// independent so a test can build the dangerous case: a partitioned old
+	// leader that still believes it leads but cannot confirm it.
+	isLeader   bool
+	barrierErr error
+	verifyErr  error
+
+	mu           sync.Mutex
+	calls        []applyCall
+	barrierCalls int
+	verifyCalls  int
+	// callOrder records barrier/verify in the order they happened, because the
+	// ORDER is the correctness property: verifying before the barrier would
+	// confirm leadership as of the wrong moment.
+	callOrder []string
 }
 
 var _ RaftProposer = (*fakeProposer)(nil)
@@ -78,6 +92,31 @@ func (f *fakeProposer) Apply(data []byte, timeout time.Duration) (interface{}, e
 }
 
 func (f *fakeProposer) LeaderAddr() string { return f.leaderAddr }
+
+func (f *fakeProposer) IsLeader() bool { return f.isLeader }
+
+func (f *fakeProposer) Barrier(timeout time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.barrierCalls++
+	f.callOrder = append(f.callOrder, "barrier")
+	return f.barrierErr
+}
+
+func (f *fakeProposer) VerifyLeader() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.verifyCalls++
+	f.callOrder = append(f.callOrder, "verify")
+	return f.verifyErr
+}
+
+// callOrderSnapshot returns a copy, safe to read from any goroutine.
+func (f *fakeProposer) callOrderSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.callOrder...)
+}
 
 // applyCallsSnapshot returns a copy of the recorded calls, safe to read from
 // any goroutine.
@@ -427,5 +466,239 @@ func TestStartServesProposeAndStops(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Error("Start() did not return after Stop()")
+	}
+}
+
+// --- R4.5: linearizable reads ---------------------------------------------
+
+// fakeLocalReader stands in for the C++ state machine's Get.
+type fakeLocalReader struct {
+	found bool
+	value []byte
+	err   error
+
+	mu   sync.Mutex
+	keys []string
+}
+
+func (f *fakeLocalReader) Get(ctx context.Context, key string) (bool, []byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keys = append(f.keys, key)
+	return f.found, f.value, f.err
+}
+
+func (f *fakeLocalReader) keysSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.keys...)
+}
+
+// fakeReadForwarder implements both ProposeForwarder and ReadForwarder so it can
+// be handed to NewServer.
+type fakeReadForwarder struct {
+	resp *pb.ReadResponse
+	err  error
+
+	mu      sync.Mutex
+	gotAddr string
+	gotKey  string
+	calls   int
+}
+
+func (f *fakeReadForwarder) ForwardPropose(ctx context.Context, raftAddr string, cmd *pb.Command) (*pb.ProposeResponse, error) {
+	return &pb.ProposeResponse{Success: true}, nil
+}
+
+func (f *fakeReadForwarder) ForwardRead(ctx context.Context, raftAddr string, key string) (*pb.ReadResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.gotAddr, f.gotKey = raftAddr, key
+	return f.resp, f.err
+}
+
+func (f *fakeReadForwarder) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// TestReadOnTheLeader covers the linearizability argument step by step.
+func TestReadOnTheLeader(t *testing.T) {
+	t.Run("barriers, verifies, then reads locally", func(t *testing.T) {
+		node := &fakeProposer{isLeader: true}
+		reader := &fakeLocalReader{found: true, value: []byte("v1")}
+		server := NewServer(node, nil).WithLocalReader(reader)
+
+		resp, err := server.Read(context.Background(), &pb.ReadRequest{Key: "k1"})
+		if err != nil {
+			t.Fatalf("Read returned a gRPC error: %v", err)
+		}
+		if resp.GetError() != "" {
+			t.Fatalf("Read reported %q, want success", resp.GetError())
+		}
+		if !resp.GetFound() || string(resp.GetValue()) != "v1" {
+			t.Errorf("got found=%v value=%q, want true/\"v1\"",
+				resp.GetFound(), resp.GetValue())
+		}
+
+		// THE ordering property: the barrier must come first, and leadership must
+		// be confirmed AFTER it. Verifying first would confirm leadership as of a
+		// moment before the barrier's wait, which is not what the read depends on.
+		want := []string{"barrier", "verify"}
+		if got := node.callOrderSnapshot(); !reflect.DeepEqual(got, want) {
+			t.Errorf("call order = %v, want %v — the barrier must precede the "+
+				"leadership check, see the Read doc comment", got, want)
+		}
+		if keys := reader.keysSnapshot(); !reflect.DeepEqual(keys, []string{"k1"}) {
+			t.Errorf("local reader saw keys %v, want [k1]", keys)
+		}
+	})
+
+	t.Run("a missing key is a successful read, not an error", func(t *testing.T) {
+		node := &fakeProposer{isLeader: true}
+		server := NewServer(node, nil).WithLocalReader(&fakeLocalReader{found: false})
+
+		resp, _ := server.Read(context.Background(), &pb.ReadRequest{Key: "absent"})
+		if resp.GetError() != "" {
+			t.Errorf("error = %q, want empty: a miss is a valid answer", resp.GetError())
+		}
+		if resp.GetFound() {
+			t.Error("found = true for a key the store does not have")
+		}
+	})
+
+	// The dangerous case: a partitioned old leader still believes it leads and
+	// its own barrier succeeds, but the quorum check fails. It must NOT answer.
+	t.Run("a barrier that succeeds cannot rescue a lost leadership", func(t *testing.T) {
+		node := &fakeProposer{
+			isLeader:   true,
+			verifyErr:  errors.New("leadership lost"),
+			leaderAddr: "node2:8088",
+		}
+		reader := &fakeLocalReader{found: true, value: []byte("stale")}
+		server := NewServer(node, nil).WithLocalReader(reader)
+
+		resp, _ := server.Read(context.Background(), &pb.ReadRequest{Key: "k1"})
+
+		if !strings.HasPrefix(resp.GetError(), NotLeaderPrefix) {
+			t.Errorf("error = %q, want the %q prefix", resp.GetError(), NotLeaderPrefix)
+		}
+		if resp.GetFound() {
+			t.Error("answered from the local store despite failing VerifyLeader — " +
+				"this is exactly the stale read the verify step exists to prevent")
+		}
+		if keys := reader.keysSnapshot(); len(keys) != 0 {
+			t.Errorf("read the local store anyway: %v", keys)
+		}
+	})
+
+	t.Run("a failed barrier fails the read", func(t *testing.T) {
+		node := &fakeProposer{isLeader: true, barrierErr: errors.New("timed out")}
+		reader := &fakeLocalReader{found: true, value: []byte("v")}
+		server := NewServer(node, nil).WithLocalReader(reader)
+
+		resp, _ := server.Read(context.Background(), &pb.ReadRequest{Key: "k1"})
+		if !strings.Contains(resp.GetError(), "barrier") {
+			t.Errorf("error = %q, want it to name the barrier", resp.GetError())
+		}
+		if keys := reader.keysSnapshot(); len(keys) != 0 {
+			t.Errorf("read the store after a failed barrier: %v", keys)
+		}
+	})
+
+	t.Run("no configured reader is a truthful error, not a wrong value", func(t *testing.T) {
+		server := NewServer(&fakeProposer{isLeader: true}, nil)
+
+		resp, _ := server.Read(context.Background(), &pb.ReadRequest{Key: "k1"})
+		if resp.GetError() == "" {
+			t.Error("reported success with no reader configured")
+		}
+		if resp.GetFound() {
+			t.Error("found = true with no reader configured")
+		}
+	})
+}
+
+// TestReadForwarding covers the follower side and the one-hop guard.
+func TestReadForwarding(t *testing.T) {
+	t.Run("a follower forwards and relays the answer", func(t *testing.T) {
+		node := &fakeProposer{isLeader: false, leaderAddr: "node1:8088"}
+		fwd := &fakeReadForwarder{
+			resp: &pb.ReadResponse{Found: true, Value: []byte("from-leader")},
+		}
+		server := NewServer(node, fwd)
+
+		resp, err := server.Read(context.Background(), &pb.ReadRequest{Key: "k1"})
+		if err != nil {
+			t.Fatalf("Read returned a gRPC error: %v", err)
+		}
+		if string(resp.GetValue()) != "from-leader" {
+			t.Errorf("value = %q, want the leader's answer relayed", resp.GetValue())
+		}
+		if fwd.gotAddr != "node1:8088" || fwd.gotKey != "k1" {
+			t.Errorf("forwarded (%q, %q), want (node1:8088, k1)", fwd.gotAddr, fwd.gotKey)
+		}
+		// A follower must never barrier or verify — both are leader-only and
+		// would just add latency to a request it cannot answer.
+		if order := node.callOrderSnapshot(); len(order) != 0 {
+			t.Errorf("follower ran %v before forwarding, want nothing", order)
+		}
+	})
+
+	t.Run("an already-forwarded read is refused, never relayed twice", func(t *testing.T) {
+		node := &fakeProposer{isLeader: false, leaderAddr: "node1:8088"}
+		fwd := &fakeReadForwarder{resp: &pb.ReadResponse{Found: true}}
+		server := NewServer(node, fwd)
+
+		resp, _ := server.Read(context.Background(),
+			&pb.ReadRequest{Key: "k1", Forwarded: true})
+
+		if !strings.HasPrefix(resp.GetError(), NotLeaderPrefix) {
+			t.Errorf("error = %q, want the %q prefix", resp.GetError(), NotLeaderPrefix)
+		}
+		if fwd.callCount() != 0 {
+			t.Errorf("relayed an already-forwarded read %d times, want 0 — this is "+
+				"the loop the forwarded flag exists to prevent", fwd.callCount())
+		}
+	})
+
+	t.Run("a failed relay is reported, not silently empty", func(t *testing.T) {
+		node := &fakeProposer{isLeader: false, leaderAddr: "node1:8088"}
+		fwd := &fakeReadForwarder{err: errors.New("connection refused")}
+		server := NewServer(node, fwd)
+
+		resp, _ := server.Read(context.Background(), &pb.ReadRequest{Key: "k1"})
+		if resp.GetError() == "" {
+			t.Error("a failed relay reported success")
+		}
+		if resp.GetFound() {
+			t.Error("found = true after a failed relay")
+		}
+	})
+}
+
+// TestReadWithNoLeaderKnown pins that a read during an election is reported the
+// same way a write is: not_leader (-> 503), not a generic failure (-> 502).
+//
+// Found by testing against a real cluster with quorum deliberately broken: the
+// read came back 502 "forwarding read to the leader at  failed", which tells a
+// client the cluster is broken when it is only mid-election.
+func TestReadWithNoLeaderKnown(t *testing.T) {
+	node := &fakeProposer{isLeader: false, leaderAddr: ""}
+	fwd := &fakeReadForwarder{resp: &pb.ReadResponse{Found: true}}
+	server := NewServer(node, fwd)
+
+	resp, err := server.Read(context.Background(), &pb.ReadRequest{Key: "k1"})
+	if err != nil {
+		t.Fatalf("Read returned a gRPC error: %v", err)
+	}
+	if !strings.HasPrefix(resp.GetError(), NotLeaderPrefix) {
+		t.Errorf("error = %q, want the %q prefix so the C++ layer answers 503",
+			resp.GetError(), NotLeaderPrefix)
+	}
+	if fwd.callCount() != 0 {
+		t.Errorf("tried to forward to an empty address (%d calls)", fwd.callCount())
 	}
 }

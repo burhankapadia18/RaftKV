@@ -198,6 +198,25 @@ func (n *Node) AddVoter(id, address string) error {
 	return future.Error()
 }
 
+// Barrier blocks until every entry committed before the call has been applied to
+// this node's FSM.
+//
+// It works by proposing a no-op entry and waiting for it to apply, so it only
+// succeeds on the leader — which is exactly the property a linearizable read
+// needs (R4.5).
+func (n *Node) Barrier(timeout time.Duration) error {
+	return n.Raft.Barrier(timeout).Error()
+}
+
+// VerifyLeader confirms with a quorum that this node is still the leader.
+//
+// Distinct from IsLeader(), which only reports this node's own belief. A
+// partitioned old leader still thinks it leads; VerifyLeader is what catches
+// that, which is why a linearizable read cannot rely on IsLeader alone.
+func (n *Node) VerifyLeader() error {
+	return n.Raft.VerifyLeader().Error()
+}
+
 // RemoveServer drops a peer from the cluster configuration.
 //
 // Leader-only, like AddVoter: on a follower the future fails with

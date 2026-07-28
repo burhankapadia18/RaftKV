@@ -80,7 +80,11 @@ func main() {
 	forwarder := rpc.NewForwarder(resolver)
 	defer forwarder.Close()
 
-	grpcServer := rpc.NewServer(node, forwarder)
+	// WithLocalReader is what makes linearizable reads (R4.5) available: after
+	// the Barrier and the quorum check, the leader answers from its own C++
+	// store through this.
+	grpcServer := rpc.NewServer(node, forwarder).
+		WithLocalReader(backend.NewStoreReader(backendClient.StateMachineClient))
 
 	// Setup graceful shutdown
 	go func() {

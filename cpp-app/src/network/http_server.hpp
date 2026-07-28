@@ -37,6 +37,18 @@ inline constexpr const char *kMsgpackContentType = "application/msgpack";
 inline constexpr const char *kNotLeaderPrefix = "not_leader:";
 
 /**
+ * @brief Read consistency modes for GET (R4.4).
+ *
+ * `local` is the default and the pre-Phase-4 behavior: answered from this
+ * node's own store, which on a follower may be stale. `linearizable` goes
+ * through the sidecar, which forwards to the leader and runs Barrier +
+ * VerifyLeader there. The default stays `local` because it is the cheap one and
+ * changing it would silently make every existing client pay for consensus.
+ */
+inline constexpr const char *kConsistencyLocal = "local";
+inline constexpr const char *kConsistencyLinearizable = "linearizable";
+
+/**
  * @brief Escape a string so it can be embedded in a JSON string literal.
  *
  * Deliberately tiny - no JSON library is linked into this binary. It covers
@@ -234,10 +246,7 @@ private:
     // gets a retryable status and the address to retry against.
     const std::optional<std::string> leader = not_leader_address(result.error);
     if (leader) {
-      std::string body = "{\"error\":\"not leader\",\"leader\":\"";
-      body += json_escape(*leader);
-      body += "\"}";
-      return HttpResponse::json(503, body);
+      return HttpResponse::json(503, not_leader_body(*leader));
     }
     return HttpResponse::json_error(502, result.error);
   }
@@ -253,11 +262,69 @@ private:
       return HttpResponse::json_error(400, message);
     }
 
+    // R4.4: consistency=local (default) | linearizable.
+    //
+    // `local` is what every read did before Phase 4 and still does: served
+    // straight from this node's store, which on a follower can be arbitrarily
+    // stale. That is now an explicit choice rather than an unmentioned
+    // property.
+    const auto consistency = params.find("consistency");
+    const std::string mode =
+        consistency == params.end() ? kConsistencyLocal : consistency->second;
+
+    if (mode == kConsistencyLinearizable) {
+      return handle_linearizable_get(it->second);
+    }
+    if (mode != kConsistencyLocal) {
+      return HttpResponse::json_error(
+          400, "consistency must be \"local\" or \"linearizable\"");
+    }
+
     const std::optional<std::string> value = store_.get(it->second);
     if (!value) {
       return HttpResponse::json_error(404, "key not found");
     }
     return HttpResponse::ok(*value);
+  }
+
+  /**
+   * @brief Serve a read that reflects every acknowledged write (R4.5).
+   *
+   * Delegates to the sidecar, which forwards to the leader when this node is
+   * not it, and there runs Barrier + VerifyLeader before reading its own store.
+   * None of that logic belongs here — this layer only maps the outcome onto a
+   * status code, and it maps it the same way a failed propose is mapped so a
+   * client sees one consistent error vocabulary.
+   */
+  [[nodiscard]] HttpResponse
+  handle_linearizable_get(const std::string &key) const {
+    const ReadResult result = raft_client_.read(key);
+
+    if (!result.ok) {
+      const std::optional<std::string> leader =
+          not_leader_address(result.error);
+      if (leader.has_value()) {
+        return HttpResponse::json(503, not_leader_body(*leader));
+      }
+      return HttpResponse::json_error(502, result.error);
+    }
+
+    if (!result.found) {
+      return HttpResponse::json_error(404, "key not found");
+    }
+    return HttpResponse::ok(result.value);
+  }
+
+  /**
+   * @brief The 503 body naming the leader a client should retry against.
+   *
+   * Shared by the write path and the linearizable-read path so both speak the
+   * same error vocabulary. The address is escaped because it originates outside
+   * this process, and it can legitimately be empty during an election.
+   */
+  [[nodiscard]] static std::string not_leader_body(const std::string &leader) {
+    return "{\"error\":\"not leader\",\"leader\":\"" + json_escape(leader) +
+           "\"}";
   }
 
   /**
