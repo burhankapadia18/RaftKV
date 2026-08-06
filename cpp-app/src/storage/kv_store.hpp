@@ -559,11 +559,20 @@ private:
     case Operation::DELETE:
       store_.erase(cmd.key);
       return true;
+    case Operation::USER_SET:
+    case Operation::USER_DEL:
+      // NOT a record this store ever writes. set()/remove() re-encode every
+      // mutation as SET or DELETE — a committed user write reaches the WAL as a
+      // plain SET of its `__sys:user:...` key — so a USER_* record in a WAL
+      // means the file was not produced by this store. Treated exactly like a
+      // record that will not decode: stop replay here rather than guess, which
+      // keeps recovery prefix-consistent.
+      return false;
     case Operation::UNKNOWN:
       break;
     }
-    // Unreachable: is_valid() already rejected UNKNOWN. Kept so the function
-    // cannot fall off the end if the two ever drift apart.
+    // Unreachable for UNKNOWN: is_valid() already rejected it. Kept so the
+    // function cannot fall off the end if the two ever drift apart.
     return false;
   }
 

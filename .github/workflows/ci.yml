@@ -415,6 +415,114 @@ jobs:
         run: docker compose down -v
 
   # ---------------------------------------------------------------------------
+  # The same cluster, brought up with client authentication enforced.
+  #
+  # A separate job for the same reason e2e-secure is one, only more so: with auth
+  # on, every unauthenticated request in the default suite is a 401, so the two
+  # profiles cannot share a cluster without one of them being tested dishonestly.
+  #
+  # What this job protects that no unit test can: that a user created through the
+  # leader is usable on ALL THREE nodes. A user record is a raft entry, so the
+  # chain being verified is propose -> replicate -> apply -> the follower's own
+  # authenticator reading it back. Every link is mocked out in the unit tests.
+  # ---------------------------------------------------------------------------
+  e2e-auth:
+    name: End-to-end cluster (client auth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/e2e/requirements.txt
+
+      - name: Build image
+        run: docker build -t raftkv:latest .
+
+      - name: Start cluster with client auth
+        run: |
+          # Generated ONCE, then shared with later steps — the same trap
+          # e2e-secure documents: calling `openssl rand` twice would start the
+          # cluster with one password and hand pytest another, and every test
+          # would then SKIP with "RAFTKV_ADMIN_PASSWORD does not match", which
+          # reads as a pass.
+          #
+          # A generated password rather than the compose fallback: a security job
+          # that used the dev fallback would be asserting that a publicly known
+          # credential works.
+          password="$(openssl rand -hex 16)"
+          echo "::add-mask::$password"
+          echo "RAFTKV_ADMIN_PASSWORD=$password" >> "$GITHUB_ENV"
+          export RAFTKV_ADMIN_PASSWORD="$password"
+          docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+
+      # Readiness is probed on /metrics, NOT on a data route. With auth on, an
+      # unauthenticated GET /get-val answers 401, so `curl -sf` on it fails
+      # forever and the poll would time out on a perfectly healthy cluster.
+      # /metrics is deliberately unauthenticated (the secure profile's proxy
+      # health-checks it), which makes it the right probe here.
+      - name: Wait for cluster readiness
+        run: |
+          deadline=$(( $(date +%s) + 120 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            ready=1
+
+            for port in 8080 8081 8082; do
+              curl -sf --max-time 2 "http://localhost:${port}/metrics" \
+                >/dev/null || ready=0
+            done
+
+            if [ "$ready" -eq 1 ]; then
+              for svc in node1 node2 node3; do
+                status="$(docker compose exec -T "$svc" \
+                  curl -sf --max-time 2 http://localhost:6000/status \
+                  2>/dev/null </dev/null || true)"
+                # Positive match on a non-empty leader_addr, for the reason
+                # spelled out in the `e2e` job: matching the empty case instead
+                # would be fail-open.
+                printf '%s' "$status" \
+                  | grep -Eq '"leader_addr"[[:space:]]*:[[:space:]]*"[^"]+"' || ready=0
+              done
+            fi
+
+            if [ "$ready" -eq 1 ]; then
+              echo "Cluster is ready."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::Cluster did not become ready within 120s"
+          docker compose -f docker-compose.yml -f docker-compose.auth.yml ps
+          exit 1
+
+      # `-rs` prints skip reasons, and here that is load-bearing rather than
+      # tidiness: every test in this module SKIPS when it cannot see an
+      # auth-enforcing cluster, so a misconfigured job would otherwise report
+      # green while verifying nothing at all.
+      - name: Run client-auth tests
+        run: pytest tests/e2e -m requires_auth -v -rs
+
+      - name: Dump cluster logs
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.auth.yml \
+            logs --no-color --timestamps
+
+      - name: Tear down cluster
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml down -v
+
+  # ---------------------------------------------------------------------------
   # bench/ is a SEPARATE Go module, so the `go` job above — which is scoped to
   # go-sidecar — never compiles it. Without this job kvbench rots silently and is
   # discovered broken the next time someone tries to reproduce a benchmark, which

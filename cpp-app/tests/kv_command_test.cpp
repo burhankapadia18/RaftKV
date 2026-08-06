@@ -235,6 +235,8 @@ TEST(KVCommandTest, ParseOperationTruthTable) {
   const Case cases[] = {
       {"SET", Operation::SET},
       {"DELETE", Operation::DELETE},
+      {"USER_SET", Operation::USER_SET},
+      {"USER_DEL", Operation::USER_DEL},
       // Matching is exact and case sensitive.
       {"set", Operation::UNKNOWN},
       {"Set", Operation::UNKNOWN},
@@ -242,12 +244,67 @@ TEST(KVCommandTest, ParseOperationTruthTable) {
       {" SET", Operation::UNKNOWN},
       {"SET ", Operation::UNKNOWN},
       {"GET", Operation::UNKNOWN},
+      {"user_set", Operation::UNKNOWN},
+      {"USER_DELETE", Operation::UNKNOWN},
+      {"USERSET", Operation::UNKNOWN},
       {"", Operation::UNKNOWN},
   };
 
   for (const Case &c : cases) {
     EXPECT_EQ(parse_operation(c.op), c.expected) << "op=[" << c.op << "]";
   }
+}
+
+TEST(KVCommandTest, IsUserOperationCoversExactlyTheTwoUserOps) {
+  // The guard in StateMachineService::Apply is written as "not a user operation
+  // AND a reserved key", so mis-classifying an op here either lets a plain SET
+  // into the reserved key space or blocks a legitimate user write.
+  EXPECT_TRUE(is_user_operation(Operation::USER_SET));
+  EXPECT_TRUE(is_user_operation(Operation::USER_DEL));
+  EXPECT_FALSE(is_user_operation(Operation::SET));
+  EXPECT_FALSE(is_user_operation(Operation::DELETE));
+  EXPECT_FALSE(is_user_operation(Operation::UNKNOWN));
+}
+
+TEST(KVCommandTest, EncodesUserOpsWithTheBareNameAsTheKey) {
+  const KVCommand user_set = decode(KVCommand::encode_user_set("alice", "rec"));
+  EXPECT_EQ(user_set.op, "USER_SET");
+  // The BARE name, never "__sys:user:alice": Apply derives the storage key, so
+  // the name and the key cannot disagree.
+  EXPECT_EQ(user_set.key, "alice");
+  EXPECT_EQ(user_set.value, "rec");
+  EXPECT_TRUE(user_set.is_valid());
+
+  const KVCommand user_del = decode(KVCommand::encode_user_del("alice"));
+  EXPECT_EQ(user_del.op, "USER_DEL");
+  EXPECT_EQ(user_del.key, "alice");
+  EXPECT_EQ(user_del.value, "");
+  EXPECT_TRUE(user_del.is_valid());
+}
+
+TEST(KVCommandTest, ValidationDoesNotRejectTheReservedPrefix) {
+  // PINNED, and it is not an oversight. PersistentKVStore calls is_valid() on
+  // every WAL record it replays and TRUNCATES the WAL at the first invalid one,
+  // while the store re-encodes a committed user write as a plain SET of a
+  // `__sys:user:...` key. A prefix rejection here would therefore silently
+  // discard every write after the first user record on restart. The guard lives
+  // in StateMachineService::Apply — see state_machine_test.cpp.
+  const KVCommand cmd = decode(pack_string_map(
+      {{"op", "SET"}, {"key", "__sys:user:admin"}, {"value", "forged"}}));
+
+  EXPECT_TRUE(cmd.is_valid());
+  EXPECT_FALSE(cmd.validation_error().has_value());
+}
+
+TEST(KVCommandTest, ValidationStillRejectsAnEmptyUserName) {
+  // For the user ops the key IS the user name, so the existing empty-key rule
+  // doubles as the cheapest name check. The full charset rule needs
+  // auth::username_error and is applied in Apply, which keeps this header free
+  // of a dependency on the auth layer.
+  const KVCommand cmd =
+      decode(pack_string_map({{"op", "USER_SET"}, {"key", ""}}));
+
+  EXPECT_FALSE(cmd.is_valid());
 }
 
 TEST(KVCommandTest, IsValidTruthTable) {

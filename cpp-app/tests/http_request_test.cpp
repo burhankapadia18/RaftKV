@@ -4,10 +4,14 @@
  *
  * The parser is hand-rolled and deliberately thin. These tests pin what it
  * ACTUALLY does today, including the sharp edges:
- *   - `request.headers` is declared but never filled in.
  *   - query parsing stops at the first segment without '=' and does no
  *     URL-decoding (Phase 4 R4.6 adds url_decode).
  * Most of this is still the "before" picture rather than a wish list.
+ *
+ * `request.headers` USED to be pinned as permanently empty. The auth phase
+ * populates it (client credentials arrive in a header), so that assertion was
+ * flipped rather than deleted — see PopulatesHeadersKeyedByLowercasedName
+ * below.
  *
  * The one guarantee here that is a deliberate, already-delivered property
  * rather than an observation is totality: parse() never throws. A
@@ -84,15 +88,89 @@ TEST(HttpRequestParserTest, EmptyRequestLineStillParses) {
   EXPECT_EQ(request.body, "");
 }
 
-TEST(HttpRequestParserTest, HeadersMapIsNeverPopulated) {
-  // CURRENT BEHAVIOR: parse() scans header lines only for Content-Length and
-  // Content-Type; HttpRequest::headers stays empty no matter what is sent.
+TEST(HttpRequestParserTest, PopulatesHeadersKeyedByLowercasedName) {
+  // WAS PINNED EMPTY before the auth phase: parse() scanned for Content-Length
+  // and Content-Type and dropped every other line, which is why no credential
+  // header could reach the handler. Names are lowercased (field names are
+  // case-insensitive); values keep their bytes and their case.
   const HttpRequest request = parse_ok("GET /get-val HTTP/1.1\r\n"
                                        "Host: localhost\r\n"
-                                       "X-Trace-Id: abc123\r\n"
+                                       "X-Trace-Id: AbC123\r\n"
+                                       "AUTHORIZATION: Basic YWxpY2U6cHc=\r\n"
                                        "\r\n");
 
-  EXPECT_TRUE(request.headers.empty());
+  EXPECT_EQ(request.headers.size(), 3u);
+  EXPECT_EQ(request.header("host"), "localhost");
+  EXPECT_EQ(request.header("x-trace-id"), "AbC123");
+  EXPECT_EQ(request.header("authorization"), "Basic YWxpY2U6cHc=");
+  // Absent headers read as empty rather than throwing or inserting.
+  EXPECT_EQ(request.header("x-absent"), "");
+  EXPECT_EQ(request.headers.count("x-absent"), 0u);
+}
+
+TEST(HttpRequestParserTest, TrimsPaddingAndTheTrailingCarriageReturn) {
+  // Header lines keep their '\r' (std::getline splits on '\n' only). A value
+  // that is USED as bytes rather than parsed as a number must not carry it: a
+  // base64 credential with a trailing CR does not decode, and the failure looks
+  // like a wrong password.
+  const HttpRequest request =
+      parse_ok("GET /get-val HTTP/1.1\r\n"
+               "Authorization:  \tBasic YWxpY2U6cHc= \r\n"
+               "\r\n");
+
+  EXPECT_EQ(request.header("authorization"), "Basic YWxpY2U6cHc=");
+}
+
+TEST(HttpRequestParserTest, KeepsValueBytesVerbatimIncludingColons) {
+  // Only the FIRST colon separates name from value, so a value may contain
+  // colons — base64 padding, a host:port, an absolute URL.
+  const HttpRequest request = parse_ok("GET /get-val HTTP/1.1\r\n"
+                                       "Host: localhost:8080\r\n"
+                                       "X-Url: http://example.com:9000/a\r\n"
+                                       "\r\n");
+
+  EXPECT_EQ(request.header("host"), "localhost:8080");
+  EXPECT_EQ(request.header("x-url"), "http://example.com:9000/a");
+}
+
+TEST(HttpRequestParserTest, SkipsLinesThatAreNotHeaders) {
+  // A line with no colon is not a header. Nothing is stored for it, and it does
+  // not abort the parse of the lines around it.
+  const HttpRequest request = parse_ok("GET /get-val HTTP/1.1\r\n"
+                                       "garbage-without-a-colon\r\n"
+                                       ": empty name\r\n"
+                                       "Host: localhost\r\n"
+                                       "\r\n");
+
+  EXPECT_EQ(request.headers.size(), 1u);
+  EXPECT_EQ(request.header("host"), "localhost");
+}
+
+TEST(HttpRequestParserTest, LastValueWinsForARepeatedHeader) {
+  const HttpRequest request = parse_ok("GET /get-val HTTP/1.1\r\n"
+                                       "X-Trace-Id: first\r\n"
+                                       "X-Trace-Id: second\r\n"
+                                       "\r\n");
+
+  EXPECT_EQ(request.header("x-trace-id"), "second");
+}
+
+TEST(HttpRequestParserTest, NameMatchingIsExactNotSubstring) {
+  // REGRESSION GUARD. The old parser asked whether the whole lowercased LINE
+  // contained "content-length:" / "content-type:" anywhere, so a header merely
+  // named like one hijacked both flags: X-Content-Type below used to set
+  // is_msgpack, and X-Content-Length used to set the body length. A field name
+  // is the text before the first colon and nothing else.
+  const HttpRequest request = parse_ok("POST /insert-val HTTP/1.1\r\n"
+                                       "X-Content-Type: application/msgpack\r\n"
+                                       "X-Content-Length: 99\r\n"
+                                       "\r\n");
+
+  EXPECT_FALSE(request.is_msgpack);
+  EXPECT_EQ(request.content_length, 0);
+  EXPECT_FALSE(request.bad_content_length);
+  // They are still captured under their own names.
+  EXPECT_EQ(request.header("x-content-length"), "99");
 }
 
 TEST(HttpRequestParserTest, BodyIsEverythingAfterTheBlankLine) {
@@ -226,6 +304,22 @@ TEST(HttpRequestParserTest, NegativeContentLengthIsFlagged) {
   }
 }
 
+TEST(HttpRequestParserTest, RepeatedContentLengthIsFlagged) {
+  // Two Content-Length headers mean the sender and this server may disagree
+  // about where the body ends — the shape of a request-smuggling attempt. RFC
+  // 9110 says reject; picking one is exactly the guess that lets a proxy and an
+  // origin frame the same bytes differently. Note this is NOT the general
+  // last-wins rule the header map uses: acting on a length demands agreement.
+  const HttpRequest request = parse_ok("POST /insert-val HTTP/1.1\r\n"
+                                       "Content-Length: 3\r\n"
+                                       "Content-Length: 11\r\n"
+                                       "\r\n"
+                                       "abc");
+
+  EXPECT_TRUE(request.bad_content_length);
+  EXPECT_EQ(request.content_length, 0);
+}
+
 // --- Content-Type ---------------------------------------------------------
 
 TEST(HttpRequestParserTest, DetectsMsgpackContentType) {
@@ -237,11 +331,22 @@ TEST(HttpRequestParserTest, DetectsMsgpackContentType) {
 }
 
 TEST(HttpRequestParserTest, MsgpackDetectionIsCaseInsensitive) {
-  // The entire header line is lowercased, so both the name and the value are
-  // matched case-insensitively.
+  // The field name is lowercased before lookup and the value is lowercased
+  // before the media-type test, so both are matched case-insensitively.
   const HttpRequest request = parse_ok("POST /insert-val HTTP/1.1\r\n"
                                        "CONTENT-TYPE: Application/MsgPack\r\n"
                                        "\r\n");
+
+  EXPECT_TRUE(request.is_msgpack);
+}
+
+TEST(HttpRequestParserTest, MsgpackDetectionAllowsMediaTypeParameters) {
+  // A parameterized media type still qualifies, which is why the value test is
+  // a substring match — tests/e2e/contracts.py depends on this.
+  const HttpRequest request =
+      parse_ok("POST /insert-val HTTP/1.1\r\n"
+               "Content-Type: application/msgpack; charset=binary\r\n"
+               "\r\n");
 
   EXPECT_TRUE(request.is_msgpack);
 }
@@ -257,8 +362,8 @@ TEST(HttpRequestParserTest, OtherContentTypesAreNotMsgpack) {
                                     "\r\n");
   EXPECT_FALSE(none.is_msgpack);
 
-  // The match requires both substrings on the SAME line, so an Accept header
-  // alone does not flip the flag.
+  // The media type is read from the Content-Type header only, so an Accept
+  // header naming msgpack does not flip the flag.
   const HttpRequest accept_only = parse_ok("POST /insert-val HTTP/1.1\r\n"
                                            "Accept: application/msgpack\r\n"
                                            "\r\n");

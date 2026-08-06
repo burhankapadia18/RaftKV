@@ -7,12 +7,14 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "../auth/auth_engine.hpp"
 #include "../commands/kv_command.hpp"
 #include "../common/log.hpp"
 #include "../common/metrics.hpp"
@@ -123,12 +125,32 @@ inline constexpr const char *kConsistencyLinearizable = "linearizable";
 }
 
 /**
+ * @brief The challenge sent with a 401, naming the scheme a client should use.
+ *
+ * RFC 9110 requires a 401 to carry WWW-Authenticate; without it a client has
+ * been told "authenticate" and not told how. Basic (not Bearer): the credential
+ * is a user name and password, and the management API's bearer token is a
+ * different thing guarding a different surface.
+ */
+inline constexpr const char *kBasicChallenge = "Basic realm=\"raftkv\"";
+
+/**
  * @brief HTTP response builder utility.
  */
 struct HttpResponse {
   int status_code = 200;
   std::string body;
   std::string content_type = kTextContentType;
+
+  /**
+   * @brief Extra header lines, emitted verbatim after the fixed ones.
+   *
+   * Exists for WWW-Authenticate. Names and values are NOT escaped or validated,
+   * because every value written here is a compile-time constant in this file;
+   * do not put attacker-influenced text in one without adding that check, since
+   * a CRLF in a value would be response splitting.
+   */
+  std::vector<std::pair<std::string, std::string>> extra_headers;
 
   /**
    * @brief Reason phrase for a status code (RFC 9110 section 15).
@@ -145,6 +167,10 @@ struct HttpResponse {
       return "Created";
     case 400:
       return "Bad Request";
+    case 401:
+      return "Unauthorized";
+    case 403:
+      return "Forbidden";
     case 404:
       return "Not Found";
     case 405:
@@ -178,26 +204,52 @@ struct HttpResponse {
     response += content_type;
     response += "\r\nContent-Length: ";
     response += std::to_string(body.size());
+    for (const auto &header : extra_headers) {
+      response += "\r\n";
+      response += header.first;
+      response += ": ";
+      response += header.second;
+    }
     response += "\r\n\r\n";
     response += body;
     return response;
   }
 
-  /** @brief 200 carrying a raw stored value as plain text. */
+  /**
+   * @brief 200 carrying a raw stored value as plain text.
+   *
+   * The trailing {} is the (empty) extra_headers list. It is spelled out
+   * because this aggregate is initialised positionally and -Wextra warns on a
+   * member left out — the build treats new warnings as errors to fix.
+   */
   [[nodiscard]] static HttpResponse ok(const std::string &body) {
-    return HttpResponse{200, body, kTextContentType};
+    return HttpResponse{200, body, kTextContentType, {}};
   }
 
   /** @brief A JSON body with an explicit status code. */
   [[nodiscard]] static HttpResponse json(int status_code,
                                          const std::string &body) {
-    return HttpResponse{status_code, body, kJsonContentType};
+    return HttpResponse{status_code, body, kJsonContentType, {}};
   }
 
   /** @brief The standard error envelope: {"error":"<escaped message>"}. */
   [[nodiscard]] static HttpResponse json_error(int status_code,
                                                const std::string &message) {
     return json(status_code, "{\"error\":\"" + json_escape(message) + "\"}");
+  }
+
+  /**
+   * @brief 401 with the Basic challenge attached.
+   *
+   * 401 means "you presented no usable credential"; 403 means "the credential
+   * you presented was rejected, or does not permit this". Only the first is an
+   * invitation to try again, so only the first carries a challenge — the same
+   * split the management API makes (go-sidecar/internal/management/auth.go).
+   */
+  [[nodiscard]] static HttpResponse unauthorized(const std::string &message) {
+    HttpResponse response = json_error(401, message);
+    response.extra_headers.emplace_back("WWW-Authenticate", kBasicChallenge);
+    return response;
   }
 };
 
@@ -213,9 +265,13 @@ public:
    * @brief Construct the handler with dependencies.
    * @param raft_client Client for proposing commands to Raft
    * @param store Reference to the key-value store for reads
+   * @param auth Authenticator. Injected behind IAuthEngine like the other two
+   *             dependencies, so the handler's routing and status codes can be
+   *             tested without a store or a cluster.
    */
-  KVHttpHandler(IRaftClient &raft_client, const IKVStore &store)
-      : raft_client_(raft_client), store_(store) {}
+  KVHttpHandler(IRaftClient &raft_client, const IKVStore &store,
+                const auth::IAuthEngine &auth)
+      : raft_client_(raft_client), store_(store), auth_(auth) {}
 
   /**
    * @brief Handle an HTTP request and return a response.
@@ -260,8 +316,12 @@ private:
     if (request.path.rfind(kKvPathPrefix, 0) == 0) {
       return request.method + " /kv/{key}";
     }
-    if (request.path == "/insert-val" || request.path == "/get-val" ||
-        request.path == "/metrics") {
+    // Same reasoning as /kv/{key}: the user name must not become a label.
+    if (request.path.rfind(kAuthUsersPrefix, 0) == 0) {
+      return request.method + " /auth/users/{name}";
+    }
+    if (request.path == kWhoamiPath || request.path == "/insert-val" ||
+        request.path == "/get-val" || request.path == "/metrics") {
       return request.method + " " + request.path;
     }
     return "other";
@@ -286,10 +346,37 @@ public:
       return response;
     }
 
+    // AUTHENTICATE ONCE, here, for every route below. Doing it per-handler is
+    // how a new route ends up unauthenticated by omission.
+    //
+    // /metrics above is deliberately outside this gate: the secure profile's
+    // Caddy proxy health-checks it, so requiring a credential there would drop
+    // every node out of the load-balancer rotation. It exposes counters and
+    // latencies, never keys or values.
+    auth::AuthContext identity = auth::AuthContext::unrestricted();
+    if (auth_.enabled()) {
+      const auth::AuthOutcome outcome = auth_.authenticate(
+          request.header(auth::kAuthorizationHeader), identity);
+      if (outcome == auth::AuthOutcome::kNoCredentials) {
+        return HttpResponse::unauthorized("authentication required");
+      }
+      if (outcome != auth::AuthOutcome::kOk) {
+        // One message for unknown user, disabled user and wrong password: see
+        // AuthOutcome. Distinguishing them enumerates accounts.
+        return HttpResponse::json_error(403, "invalid credentials");
+      }
+    }
+
+    // The user-management surface. Before /kv/ — the prefixes cannot collide,
+    // but keeping the admin API first makes the order of checks obvious.
+    if (request.path.rfind(kAuthPathPrefix, 0) == 0) {
+      return handle_auth(request, identity);
+    }
+
     // R4.6: the REST surface. Checked before the legacy routes because it is
     // the one clients should be using.
     if (request.path.rfind(kKvPathPrefix, 0) == 0) {
-      return handle_kv(request);
+      return handle_kv(request, identity);
     }
 
     // R4.8: deprecated aliases, kept for one release so existing clients and
@@ -304,10 +391,10 @@ public:
     // containing a literal '%' or '+' would move), and they are scheduled for
     // removal anyway. New clients should use /kv/{key}.
     if (request.method == "POST" && request.path == "/insert-val") {
-      return handle_insert(request);
+      return handle_insert(request, identity);
     }
     if (request.method == "GET" && request.path == "/get-val") {
-      return handle_get(request);
+      return handle_get(request, identity);
     }
     return HttpResponse::json_error(404, "not found");
   }
@@ -315,9 +402,60 @@ public:
 private:
   IRaftClient &raft_client_;
   const IKVStore &store_;
+  const auth::IAuthEngine &auth_;
 
   /** @brief Prefix of the REST surface; everything after it is the key. */
   static constexpr const char *kKvPathPrefix = "/kv/";
+
+  /** @brief Prefix of the user-management surface. */
+  static constexpr const char *kAuthPathPrefix = "/auth/";
+
+  /** @brief Prefix of the user CRUD routes; everything after it is the name. */
+  static constexpr const char *kAuthUsersPrefix = "/auth/users/";
+
+  /** @brief "Who am I, and what may I do?" */
+  static constexpr const char *kWhoamiPath = "/auth/whoami";
+
+  /**
+   * @brief Refuse a data-route key that belongs to the reserved key space.
+   *
+   * UNCONDITIONAL — enforced whether or not auth is enabled, and enforced
+   * against the bootstrap admin too. Two reasons, both concrete:
+   *   - READS are covered as well as writes, because a local read of
+   *     `__sys:user:alice` would hand out her salt and password hash to anyone
+   *     holding the read class;
+   *   - user records are reachable only through /auth/*, which never serializes
+   *     a hash, so there is no legitimate caller for this and no exemption
+   * worth having.
+   *
+   * @return A 403 response when @p key is reserved, otherwise nullopt.
+   */
+  [[nodiscard]] static std::optional<HttpResponse>
+  reject_reserved_key(const std::string &key) {
+    if (!auth::is_reserved_key(key)) {
+      return std::nullopt;
+    }
+    return HttpResponse::json_error(
+        403, std::string("keys under \"") + auth::kSysPrefix +
+                 "\" are reserved; use /auth/users/{name}");
+  }
+
+  /**
+   * @brief Check a class and a key pattern, returning a 403 when either fails.
+   *
+   * Both halves are needed and neither implies the other: the class says what
+   * kind of operation is permitted, the pattern says on which keys. One message
+   * covers both, because telling a caller which of the two it failed tells it
+   * about an ACL it is not entitled to know.
+   */
+  [[nodiscard]] static std::optional<HttpResponse>
+  authorize(const auth::AuthContext &identity, auth::CommandClass cls,
+            const std::string &key) {
+    if (identity.has_class(cls) && identity.key_allowed(key)) {
+      return std::nullopt;
+    }
+    return HttpResponse::json_error(403, "permission denied");
+  }
 
   /**
    * @brief Route and serve PUT/GET/DELETE /kv/{key} (R4.6).
@@ -327,7 +465,9 @@ private:
    * for a nested path. A malformed escape is a 400 rather than a guess — see
    * url_decode.
    */
-  [[nodiscard]] HttpResponse handle_kv(const HttpRequest &request) const {
+  [[nodiscard]] HttpResponse
+  handle_kv(const HttpRequest &request,
+            const auth::AuthContext &identity) const {
     const std::string raw_key =
         request.path.substr(std::string(kKvPathPrefix).size());
 
@@ -342,14 +482,31 @@ private:
     if (key->empty()) {
       return HttpResponse::json_error(400, "key must not be empty");
     }
+    // AFTER decoding, so /kv/__sys%3Auser%3Aadmin cannot slip past by spelling
+    // the prefix in escapes.
+    if (std::optional<HttpResponse> refusal = reject_reserved_key(*key)) {
+      return *refusal;
+    }
 
     if (request.method == "PUT") {
+      if (std::optional<HttpResponse> denied =
+              authorize(identity, auth::CommandClass::kWrite, *key)) {
+        return *denied;
+      }
       return handle_kv_put(request, *key);
     }
     if (request.method == "GET") {
+      if (std::optional<HttpResponse> denied =
+              authorize(identity, auth::CommandClass::kRead, *key)) {
+        return *denied;
+      }
       return handle_kv_get(request, *key);
     }
     if (request.method == "DELETE") {
+      if (std::optional<HttpResponse> denied =
+              authorize(identity, auth::CommandClass::kWrite, *key)) {
+        return *denied;
+      }
       return handle_kv_delete(*key);
     }
     return HttpResponse::json_error(
@@ -446,7 +603,9 @@ private:
    * read means the request itself is malformed (400), and there is no point
    * arguing about its media type.
    */
-  [[nodiscard]] HttpResponse handle_insert(const HttpRequest &request) const {
+  [[nodiscard]] HttpResponse
+  handle_insert(const HttpRequest &request,
+                const auth::AuthContext &identity) const {
     if (request.bad_content_length) {
       return HttpResponse::json_error(400, "malformed Content-Length");
     }
@@ -459,6 +618,50 @@ private:
     }
     if (request.body.empty()) {
       return HttpResponse::json_error(400, "empty request body");
+    }
+
+    // THIS ROUTE NOW LOOKS INSIDE THE BODY, which it never used to. The body is
+    // a msgpack KVCommand that was previously forwarded opaquely and parsed for
+    // the first time at apply time; but a key ACL cannot be enforced without
+    // knowing which key is being written, so it is decoded here as well.
+    //
+    // Cost: one extra decode per legacy write, under the same bounded limits.
+    // Benefit: /insert-val is not a hole straight through the ACLs.
+    std::optional<KVCommand> command;
+    try {
+      command =
+          KVCommand::from_msgpack(request.body.data(), request.body.size());
+    } catch (const std::exception &) {
+      command = std::nullopt;
+    }
+
+    if (command.has_value()) {
+      // Refused for EVERYONE, auth on or off: the user-management operations
+      // exist to be reachable only through /auth/users/{name}, where the admin
+      // class is checked. Accepting one here would let any caller holding the
+      // write class mint an administrator.
+      if (is_user_operation(command->operation_type())) {
+        return HttpResponse::json_error(
+            400, "user-management operations are not accepted on /insert-val; "
+                 "use /auth/users/{name}");
+      }
+      if (std::optional<HttpResponse> refusal =
+              reject_reserved_key(command->key)) {
+        return *refusal;
+      }
+      if (std::optional<HttpResponse> denied =
+              authorize(identity, auth::CommandClass::kWrite, command->key)) {
+        return *denied;
+      }
+    } else if (auth_.enabled()) {
+      // A body that will not decode names no key, so there is nothing to check
+      // an ACL against. With auth on that has to be a refusal — forwarding it
+      // would be an unauthorized write to an unknown key. With auth OFF it is
+      // still forwarded (below) and still rejected at apply time with a 502,
+      // which is the documented "validation happens after commit" behaviour and
+      // is pinned by the e2e suite.
+      return HttpResponse::json_error(400, "request body is not a decodable "
+                                           "command");
     }
 
     const ProposeResult result = raft_client_.propose(request.body);
@@ -474,12 +677,23 @@ private:
   /**
    * @brief GET /get-val?key=... - served from the local store, no consensus.
    */
-  [[nodiscard]] HttpResponse handle_get(const HttpRequest &request) const {
+  [[nodiscard]] HttpResponse
+  handle_get(const HttpRequest &request,
+             const auth::AuthContext &identity) const {
     const std::map<std::string, std::string> params = request.query_params();
     const auto it = params.find("key");
     if (it == params.end()) {
       const std::string message = "missing required query parameter: key";
       return HttpResponse::json_error(400, message);
+    }
+    // This route does NOT percent-decode (see the note in route_request), so
+    // the key is the literal query text — which is also what is checked here.
+    if (std::optional<HttpResponse> refusal = reject_reserved_key(it->second)) {
+      return *refusal;
+    }
+    if (std::optional<HttpResponse> denied =
+            authorize(identity, auth::CommandClass::kRead, it->second)) {
+      return *denied;
     }
 
     // R4.4: consistency=local (default) | linearizable.
@@ -505,6 +719,217 @@ private:
       return HttpResponse::json_error(404, "key not found");
     }
     return HttpResponse::ok(*value);
+  }
+
+  /**
+   * @brief Render a list of strings as a JSON array.
+   *
+   * No JSON library is linked into this binary, so every structured body is
+   * hand-built; each element goes through json_escape because pattern text is
+   * operator-supplied and a bare quote would produce a body no client can
+   * parse.
+   */
+  [[nodiscard]] static std::string
+  json_string_array(const std::vector<std::string> &values) {
+    std::string out = "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+      if (i != 0) {
+        out += ",";
+      }
+      out += "\"" + json_escape(values[i]) + "\"";
+    }
+    out += "]";
+    return out;
+  }
+
+  /**
+   * @brief Route the /auth/* surface: user CRUD and whoami.
+   *
+   * DEFAULT-CLOSED. With no admin password configured this whole surface
+   * answers 403 rather than being open, exactly like the management API's /join
+   * with no token. An unconfigured security feature must never read as "no
+   * restriction".
+   */
+  [[nodiscard]] HttpResponse
+  handle_auth(const HttpRequest &request,
+              const auth::AuthContext &identity) const {
+    if (!auth_.enabled()) {
+      return HttpResponse::json_error(
+          403, "user management is disabled; set RAFTKV_ADMIN_PASSWORD to "
+               "enable authentication");
+    }
+
+    if (request.path == kWhoamiPath) {
+      if (request.method != "GET") {
+        return HttpResponse::json_error(405,
+                                        "method not allowed on /auth/whoami: "
+                                        "use GET");
+      }
+      // Any authenticated caller may ask about ITSELF — it learns nothing it
+      // did not already prove — so this one needs no class.
+      std::string body = "{\"name\":\"" + json_escape(identity.name) + "\"";
+      body += ",\"classes\":" + json_string_array(held_classes(identity));
+      body += ",\"patterns\":" + json_string_array(identity.patterns) + "}";
+      return HttpResponse::json(200, body);
+    }
+
+    if (request.path.rfind(kAuthUsersPrefix, 0) != 0) {
+      return HttpResponse::json_error(404, "not found");
+    }
+    if (std::optional<HttpResponse> denied = authorize_admin(identity)) {
+      return *denied;
+    }
+
+    const std::optional<std::string> name = url_decode(
+        request.path.substr(std::string(kAuthUsersPrefix).size()), false);
+    if (!name.has_value()) {
+      return HttpResponse::json_error(
+          400, "malformed percent-encoding in the request path");
+    }
+    if (const std::optional<std::string> bad = auth::username_error(*name)) {
+      return HttpResponse::json_error(400, *bad);
+    }
+    // The bootstrap admin is defined by configuration, not by a record, and is
+    // checked before the store — so a record under that name would be dead
+    // weight that looks like a live account. Refuse to create the confusion.
+    if (*name == auth::kBootstrapAdminName) {
+      return HttpResponse::json_error(
+          400, std::string("\"") + auth::kBootstrapAdminName +
+                   "\" is defined by RAFTKV_ADMIN_PASSWORD and cannot be "
+                   "managed through this API");
+    }
+
+    if (request.method == "PUT") {
+      return handle_user_put(request, *name);
+    }
+    if (request.method == "DELETE") {
+      return propose_and_map(KVCommand::encode_user_del(*name));
+    }
+    if (request.method == "GET") {
+      return handle_user_get(*name);
+    }
+    return HttpResponse::json_error(
+        405,
+        "method not allowed on /auth/users/{name}: use PUT, GET or DELETE");
+  }
+
+  /** @brief The classes @p identity holds, for a response body. */
+  [[nodiscard]] static std::vector<std::string>
+  held_classes(const auth::AuthContext &identity) {
+    std::vector<std::string> classes;
+    if (identity.read) {
+      classes.emplace_back(auth::kClassRead);
+    }
+    if (identity.write) {
+      classes.emplace_back(auth::kClassWrite);
+    }
+    if (identity.admin) {
+      classes.emplace_back(auth::kClassAdmin);
+    }
+    return classes;
+  }
+
+  /** @brief 403 unless @p identity holds the admin class. */
+  [[nodiscard]] static std::optional<HttpResponse>
+  authorize_admin(const auth::AuthContext &identity) {
+    if (identity.has_class(auth::CommandClass::kAdmin)) {
+      return std::nullopt;
+    }
+    return HttpResponse::json_error(403, "permission denied");
+  }
+
+  /**
+   * @brief PUT /auth/users/{name} — create or replace a user.
+   *
+   * A BLIND FULL-RECORD WRITE, never a read-modify-write. Writes are
+   * at-least-once under failure (a 503 does not mean nothing was applied), so a
+   * "change only the password" operation built on read-then-write would have no
+   * safe retry. Replacing the whole record is idempotent: the same request
+   * applied twice leaves the same user, bar the salt.
+   *
+   * The salt and hash are computed HERE, on the node serving the request, and
+   * travel inside the committed entry — so every replica stores identical
+   * bytes. Generating them during Apply would give each replica a different
+   * record.
+   */
+  [[nodiscard]] HttpResponse handle_user_put(const HttpRequest &request,
+                                             const std::string &name) const {
+    if (request.bad_content_length) {
+      return HttpResponse::json_error(400, "malformed Content-Length");
+    }
+    if (!request.is_msgpack) {
+      std::string body = "{\"error\":\"unsupported media type\",";
+      body += "\"expected\":\"";
+      body += kMsgpackContentType;
+      body += "\"}";
+      return HttpResponse::json(415, body);
+    }
+    if (request.body.empty()) {
+      return HttpResponse::json_error(400, "empty request body");
+    }
+
+    auth::UserUpsertRequest upsert;
+    try {
+      upsert = auth::UserUpsertRequest::from_msgpack(request.body.data(),
+                                                     request.body.size());
+    } catch (const std::exception &) {
+      return HttpResponse::json_error(
+          400, "body must be a msgpack map of {password, enabled, classes, "
+               "patterns}");
+    }
+    if (const std::optional<std::string> bad = upsert.validation_error()) {
+      return HttpResponse::json_error(400, *bad);
+    }
+
+    auth::UserRecord record;
+    try {
+      record = upsert.to_record(name);
+    } catch (const std::exception &e) {
+      // No randomness available. Refusing is the only safe answer: a
+      // predictable salt is no salt, and this must never fall back to one.
+      log::error(log::kComponentHttp, "cannot generate a password salt",
+                 {log::field("error", e.what())});
+      return HttpResponse::json_error(500, "cannot generate a password salt");
+    }
+
+    return propose_and_map(
+        KVCommand::encode_user_set(name, record.to_msgpack()));
+  }
+
+  /**
+   * @brief GET /auth/users/{name} — the user's ACL, never its secret.
+   *
+   * The salt and the password hash are DELIBERATELY not serialized. They are
+   * the only things worth stealing here, an administrator has no use for them,
+   * and an endpoint that returns them turns one compromised admin credential
+   * into an offline attack on every user's password.
+   *
+   * Served from the local store, so on a follower it may lag the leader by the
+   * replication delay — the same staleness a local GET has.
+   */
+  [[nodiscard]] HttpResponse handle_user_get(const std::string &name) const {
+    const std::optional<std::string> stored =
+        store_.get(auth::user_storage_key(name));
+    if (!stored.has_value()) {
+      return HttpResponse::json_error(404, "user not found");
+    }
+
+    auth::UserRecord record;
+    try {
+      record = auth::UserRecord::from_msgpack(stored->data(), stored->size());
+    } catch (const std::exception &) {
+      // Apply validates before storing, so this means the bytes were corrupted
+      // after the fact. Reporting it as a server error is honest; reporting 404
+      // would hide a real problem.
+      return HttpResponse::json_error(500, "stored user record is unreadable");
+    }
+
+    std::string body = "{\"name\":\"" + json_escape(record.name) + "\"";
+    body += ",\"enabled\":";
+    body += record.enabled ? "true" : "false";
+    body += ",\"classes\":" + json_string_array(record.classes);
+    body += ",\"patterns\":" + json_string_array(record.patterns) + "}";
+    return HttpResponse::json(200, body);
   }
 
   /**

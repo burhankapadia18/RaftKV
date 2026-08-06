@@ -1,0 +1,38 @@
+# Client authentication overlay: layer this on the base compose file to bring the
+# cluster up with Redis-style user ACLs enforced on the client HTTP API.
+#
+#     export RAFTKV_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+#     docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+#     curl -u "admin:$RAFTKV_ADMIN_PASSWORD" http://localhost:8080/auth/whoami
+#
+# WHY AN OVERLAY RATHER THAN THE DEFAULT. Same reasoning as
+# docker-compose.secure.yml: the base profile is deliberately open so that a
+# first-time `docker compose up -d` works with no setup and the whole e2e suite
+# runs against it unchanged. Enabling auth by default would mean every demo,
+# every test and every README command had to carry a credential.
+#
+# RAFTKV_ADMIN_PASSWORD is the single knob — setting it IS enabling auth, so
+# there is no enable flag that can disagree with the password. It is
+# interpolated from the environment with a dev-only fallback so this file works
+# out of the box; the fallback is a KNOWN CONSTANT and must not be used anywhere
+# real. It defines a virtual `admin` user that exists on every node before any
+# user record does, which is what makes the first `PUT /auth/users/{name}`
+# possible at all (creating a user needs an admin).
+#
+# THIS PROFILE IS STILL PLAINTEXT HTTP. A Basic credential is base64, not
+# encryption, so on this profile every password crosses the wire in the clear.
+# Compose it with docker-compose.secure.yml for a deployment, and read the
+# Security section of the README before doing so — even there, TLS is terminated
+# at the proxy and the proxy-to-node hop is plaintext.
+services:
+  node1:
+    environment:
+      - RAFTKV_ADMIN_PASSWORD=${RAFTKV_ADMIN_PASSWORD:-dev-only-insecure-password}
+
+  node2:
+    environment:
+      - RAFTKV_ADMIN_PASSWORD=${RAFTKV_ADMIN_PASSWORD:-dev-only-insecure-password}
+
+  node3:
+    environment:
+      - RAFTKV_ADMIN_PASSWORD=${RAFTKV_ADMIN_PASSWORD:-dev-only-insecure-password}

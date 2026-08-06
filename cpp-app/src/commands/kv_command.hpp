@@ -8,8 +8,16 @@ namespace kvdb {
 
 /**
  * @brief Operation types supported by the KV store.
+ *
+ * USER_SET / USER_DEL are the ONLY commands permitted to write the reserved
+ * `__sys:` key space. Keeping them as distinct operations rather than letting
+ * an ordinary SET address those keys is what makes the guard in
+ * StateMachineService::Apply expressible at all: a peer talking to the
+ * unauthenticated sidecar port can still propose any command it likes, but a
+ * plain SET under `__sys:` is refused, so it cannot rewrite the user table
+ * without going through the admin API's authorization.
  */
-enum class Operation { SET, DELETE, UNKNOWN };
+enum class Operation { SET, DELETE, USER_SET, USER_DEL, UNKNOWN };
 
 /**
  * @brief Parse operation string to enum.
@@ -19,7 +27,16 @@ inline Operation parse_operation(const std::string &op) {
     return Operation::SET;
   if (op == "DELETE")
     return Operation::DELETE;
+  if (op == "USER_SET")
+    return Operation::USER_SET;
+  if (op == "USER_DEL")
+    return Operation::USER_DEL;
   return Operation::UNKNOWN;
+}
+
+/** @brief True for the two user-management operations. */
+inline bool is_user_operation(Operation op) {
+  return op == Operation::USER_SET || op == Operation::USER_DEL;
 }
 
 /**
@@ -50,6 +67,14 @@ struct KVCommand {
    * together here so that StateMachineService::Apply can put the reason on
    * the wire (ApplyResponse.error) without restating them.
    *
+   * DELIBERATELY DOES NOT CHECK THE RESERVED `__sys:` PREFIX, and that is not
+   * an omission. PersistentKVStore calls is_valid() on every record it replays
+   * and TRUNCATES THE WAL at the first invalid one, while the store re-encodes
+   * a committed user write as a plain SET of a `__sys:user:...` key. A prefix
+   * rejection here would therefore discard every write after the first user
+   * record on restart. The guard belongs in StateMachineService::Apply, which
+   * sees commands as they are proposed rather than as they are replayed.
+   *
    * @return std::nullopt when the command is valid, otherwise a short
    *         description naming the offending field.
    */
@@ -58,6 +83,8 @@ struct KVCommand {
       return "unknown operation: \"" + op + "\"";
     }
     if (key.empty()) {
+      // For USER_SET/USER_DEL the key is the user name; the full name charset
+      // is checked in Apply, where auth::username_error lives.
       return "empty key for operation \"" + op + "\"";
     }
     return std::nullopt;
@@ -108,6 +135,32 @@ struct KVCommand {
     KVCommand cmd;
     cmd.op = "DELETE";
     cmd.key = key;
+    return cmd.to_msgpack();
+  }
+
+  /**
+   * @brief Build an encoded USER_SET payload.
+   *
+   * @param name   The BARE user name, not a storage key. Apply derives the key
+   *               as auth::user_storage_key(name), which makes a name/key
+   *               mismatch unrepresentable rather than something to validate.
+   * @param record The msgpack auth::UserRecord bytes to store.
+   */
+  [[nodiscard]] static std::string encode_user_set(const std::string &name,
+                                                   const std::string &record) {
+    KVCommand cmd;
+    cmd.op = "USER_SET";
+    cmd.key = name;
+    cmd.value = record;
+    return cmd.to_msgpack();
+  }
+
+  /** @brief Build an encoded USER_DEL payload. @param name The bare user name.
+   */
+  [[nodiscard]] static std::string encode_user_del(const std::string &name) {
+    KVCommand cmd;
+    cmd.op = "USER_DEL";
+    cmd.key = name;
     return cmd.to_msgpack();
   }
 

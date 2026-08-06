@@ -14,6 +14,7 @@
 #include "consensus.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
 
+#include "../auth/user_record.hpp"
 #include "../commands/kv_command.hpp"
 #include "../common/log.hpp"
 #include "../common/metrics.hpp"
@@ -215,6 +216,32 @@ public:
         return grpc::Status::OK;
       }
 
+      // THE RESERVED KEY SPACE GUARD. An ordinary SET or DELETE may never
+      // address `__sys:`; only USER_SET/USER_DEL below write there.
+      //
+      // This is what makes the user table safe from the one hole the design
+      // leaves open: the sidecar's RaftNode port (50052) is peer-reachable and
+      // unauthenticated, so anyone inside the network can propose a command
+      // without a credential. They can still write ordinary keys — that gap is
+      // documented — but they cannot overwrite a user record with a SET and so
+      // cannot grant themselves an ACL or disable the admin.
+      //
+      // UNCONDITIONAL, never gated on whether auth is enabled. A config-
+      // dependent verdict would make two replicas answer differently for the
+      // same committed entry, which is precisely the divergence Apply must not
+      // produce. It is a deterministic rejection: the answer is a pure function
+      // of the entry's bytes.
+      if (!is_user_operation(cmd.operation_type()) &&
+          auth::is_reserved_key(cmd.key)) {
+        log::warn(log::kComponentStateMachine,
+                  "rejected write to the reserved key space",
+                  {log::field("op", cmd.op), log::field("key", cmd.key)});
+        reply->set_success(false);
+        reply->set_error("key uses the reserved prefix \"" +
+                         std::string(auth::kSysPrefix) + "\"");
+        return grpc::Status::OK;
+      }
+
       log::debug(log::kComponentStateMachine, "applied",
                  {log::field("op", cmd.op), log::field("key", cmd.key)});
 
@@ -226,6 +253,37 @@ public:
       case Operation::DELETE:
         store_.remove(cmd.key);
         break;
+      case Operation::USER_SET: {
+        // cmd.key is the BARE user name and cmd.value is the encoded record.
+        // Everything below is a pure function of those bytes, so every replica
+        // reaches the same verdict; nothing is generated here (the salt was
+        // generated once, by the node that served the admin request, and is
+        // part of the committed entry).
+        const std::optional<std::string> rejection = validate_user_set(cmd);
+        if (rejection.has_value()) {
+          log::warn(
+              log::kComponentStateMachine, "rejected user record",
+              {log::field("user", cmd.key), log::field("reason", *rejection)});
+          reply->set_success(false);
+          reply->set_error(*rejection);
+          return grpc::Status::OK;
+        }
+        store_.set(auth::user_storage_key(cmd.key), cmd.value);
+        break;
+      }
+      case Operation::USER_DEL: {
+        const std::optional<std::string> bad = auth::username_error(cmd.key);
+        if (bad.has_value()) {
+          reply->set_success(false);
+          reply->set_error(*bad);
+          return grpc::Status::OK;
+        }
+        // Deleting a user who is not there SUCCEEDS. Writes are at-least-once
+        // under failure, so a client that retries a delete must not be told the
+        // second attempt failed.
+        store_.remove(auth::user_storage_key(cmd.key));
+        break;
+      }
       case Operation::UNKNOWN:
         // Unreachable: validation_error() rejects UNKNOWN above. Kept so the
         // switch stays exhaustive for -Wswitch and can never fall through to
@@ -406,6 +464,42 @@ public:
   }
 
 private:
+  /**
+   * @brief Explain why a USER_SET command must not be applied.
+   *
+   * Decoding happens here rather than in KVCommand::validation_error because
+   * the record travels inside `value` as opaque bytes and because that function
+   * is also what PersistentKVStore uses to vet WAL records.
+   *
+   * The name/key agreement check is the interesting one: the storage key is
+   * derived from cmd.key, so a record whose own `name` said something else
+   * would be stored under one name while claiming another, and the
+   * authenticator reads `name` back out. Refusing the mismatch keeps the two
+   * from ever disagreeing.
+   */
+  [[nodiscard]] static std::optional<std::string>
+  validate_user_set(const KVCommand &cmd) {
+    if (const std::optional<std::string> bad = auth::username_error(cmd.key)) {
+      return *bad;
+    }
+
+    auth::UserRecord record;
+    try {
+      record =
+          auth::UserRecord::from_msgpack(cmd.value.data(), cmd.value.size());
+    } catch (const std::exception &e) {
+      return std::string("malformed user record: ") + e.what();
+    }
+
+    if (const std::optional<std::string> bad = record.validation_error()) {
+      return *bad;
+    }
+    if (record.name != cmd.key) {
+      return "user record name does not match the command key";
+    }
+    return std::nullopt;
+  }
+
   IKVStore &store_;
 };
 

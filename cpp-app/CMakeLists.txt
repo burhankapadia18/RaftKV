@@ -106,6 +106,11 @@ set(KVDB_HEADERS
     src/common/metrics.hpp
     src/config/config.hpp
     src/commands/kv_command.hpp
+    src/auth/sha256.hpp
+    src/auth/base64.hpp
+    src/auth/glob.hpp
+    src/auth/user_record.hpp
+    src/auth/auth_engine.hpp
     src/storage/format.hpp
     src/storage/atomic_file.hpp
     src/storage/wal.hpp
@@ -188,6 +193,9 @@ if(KVDB_BUILD_TESTS)
     # change to this list.
     add_executable(kvdb_tests
         tests/kv_command_test.cpp
+        tests/auth_primitives_test.cpp
+        tests/user_record_test.cpp
+        tests/auth_engine_test.cpp
         tests/kv_store_test.cpp
         tests/http_request_test.cpp
         tests/state_machine_test.cpp

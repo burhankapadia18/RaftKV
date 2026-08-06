@@ -7,7 +7,69 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+**Client authentication and user ACLs** — Redis-style, opt-in, and off unless a
+bootstrap admin password is configured.
+
+- `RAFTKV_ADMIN_PASSWORD` enables authentication on the client HTTP API. Setting
+  the password *is* the switch — there is no separate enable flag that could
+  disagree with it. Unset means the API behaves exactly as it did before.
+  `docker-compose.auth.yml` is the documented overlay, alongside
+  `docker-compose.secure.yml`.
+- Named users with a password, independent command classes (`read`, `write`,
+  `admin`) and glob key patterns (`*`, `?`). The classes are a set, not a rank:
+  `admin` manages users and grants no access to data. An empty pattern list denies
+  every key.
+- `PUT`/`GET`/`DELETE /auth/users/{name}` and `GET /auth/whoami`. `GET` of a user
+  returns its ACL and **never** its salt or password hash. The whole surface is
+  default-closed: with no admin password it answers 403 rather than being open.
+- User records are ordinary replicated entries under a reserved `__sys:` key
+  prefix, written through two new commands (`USER_SET`, `USER_DEL`), so the WAL,
+  snapshots, compaction and node joins carry them with no new machinery and the Go
+  sidecar was not touched.
+- `401` (no usable credential, with `WWW-Authenticate: Basic realm="raftkv"`) and
+  `403` (rejected or insufficient) are now distinct. Unknown user, disabled user
+  and wrong password produce the *same* 403, so the endpoint cannot enumerate
+  accounts.
+- Passwords are stored as salted SHA-256, with a per-user 128-bit salt from
+  `/dev/urandom`. Redis stores an unsalted digest; this is one step better and
+  still not a memory-hard KDF — see the README's Security section.
+- New CI job `e2e-auth` runs the profile end to end. Its headline assertion is
+  that a user created on the leader becomes usable on **all three** nodes.
+
+### Changed
+
+- **`HttpRequestParser` now populates `HttpRequest::headers`.** It previously
+  scanned header lines for `Content-Length` and `Content-Type` and dropped
+  everything else, which is why no credential header could reach the handler. Two
+  consequences beyond the new field: field **names** are now matched exactly
+  rather than as a substring of the whole line (a header merely *named*
+  `X-Content-Type` used to set the msgpack flag, and any `...-Content-Length` used
+  to set the body length), and header values are trimmed of the trailing `CR` they
+  used to carry.
+- **Two `Content-Length` headers are now rejected** as a malformed request
+  (400) instead of the last one silently winning. Disagreement about where a body
+  ends is the shape of a request-smuggling attempt; RFC 9110 says reject.
+
+### Fixed
+
+Three rules that now hold on **every** profile, including one with no admin
+password set. None is reachable by a client written against any earlier release —
+the `__sys:` prefix was never a documented key space, and `USER_SET`/`USER_DEL`
+were not operations — but each is a behaviour change and is listed for that reason.
+
+- Keys under `__sys:` are refused on every data route with 403, **reads
+  included**: user records live there, so a readable `__sys:user:alice` would hand
+  out her salt and password hash. Only the prefix is reserved; a key that merely
+  contains the marker is still an ordinary key.
+- `StateMachineService::Apply` refuses a plain `SET`/`DELETE` under `__sys:`
+  unconditionally. This is what stops the peer-reachable, unauthenticated sidecar
+  port (50052, a known and still-open gap for ordinary keys) from rewriting the
+  user table and granting itself an ACL.
+- `POST /insert-val` rejects `USER_SET`/`USER_DEL` with 400. That route forwards a
+  raw command, so accepting one would let any caller holding the write class mint
+  an administrator without passing the admin check.
 
 ## [1.0.0] — 2026-07-28
 

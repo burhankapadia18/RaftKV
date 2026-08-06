@@ -1,6 +1,6 @@
 # RaftKV end-to-end suite
 
-Asserting replacement for `test_client.py`. Four families of test:
+Asserting replacement for `test_client.py`. Five families of test:
 
 - **R0.1–R0.5** (Phase 0) — a write on the leader replicates to **all** nodes,
   DELETE round-trips, a missing key is reported as missing, and a write to a
@@ -15,6 +15,11 @@ Asserting replacement for `test_client.py`. Four families of test:
   snapshot plus the tail instead of all of history. Opt-in, and additionally
   needs a cluster started with `docker-compose.test.yml`; see
   [The snapshot scenarios](#the-snapshot-scenarios).
+- **Client auth** (`test_auth.py`) — Redis-style user ACLs: a user created on the
+  leader becomes usable on all three nodes, classes and key patterns are enforced,
+  and a refused escalation leaves nothing behind. Opt-in, and needs a cluster
+  started with `docker-compose.auth.yml`; see
+  [The client-auth module](#the-client-auth-module).
 
 ## The cluster must already be running
 
@@ -33,11 +38,14 @@ pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v                         # the default suite: never touches docker
 pytest tests/e2e -m requires_docker -v -rs  # crash + snapshot: kills, wipes, restarts
 pytest tests/e2e -m requires_secure -v -rs  # TLS profile: needs the secure cluster
+pytest tests/e2e -m requires_auth -v -rs    # client ACLs: needs the auth cluster
 ```
 
-`-rs` prints skip reasons. It matters for the opt-in run: the snapshot scenarios
-skip unless the cluster was started with the test override, and a skip nobody
-sees is an unverified requirement.
+`-rs` prints skip reasons. It matters for the opt-in runs: the snapshot scenarios
+skip unless the cluster was started with the test override, `test_auth.py` skips
+unless the cluster is actually enforcing authentication *and* the password in the
+environment is the one it was started with, and a skip nobody sees is an
+unverified requirement.
 
 Exit status is pytest's: non-zero on any failure. If no node accepts a write
 within the leader-discovery deadline, the suite fails with a message telling you
@@ -85,7 +93,7 @@ left 8080 open right next to 8443.
 
 ## The `requires_docker` split
 
-`pytest.ini` sets `addopts = -m "not requires_docker and not requires_secure"`,
+`pytest.ini` sets `addopts = -m "not requires_docker and not requires_secure and not requires_auth"`,
 so the default run excludes `test_crash.py`, `test_snapshot.py` and
 `test_secure_profile.py`. That is not a convenience — it
 is what keeps the rule above true.
@@ -310,6 +318,44 @@ The test sends `Content-Length: abc` to **every** node, asserts a
 because dropping the flag would fall through to the empty-body branch and still
 produce a 400 — then asserts the node still serves reads, and finally that a
 write on the leader still replicates everywhere.
+
+## The client-auth module
+
+`test_auth.py` carries the `requires_auth` marker. Unlike the other two markers
+this one is not merely a convenience: with client auth on, every unauthenticated
+request in the default suite is a 401, so the auth-on and auth-off profiles
+**cannot share a cluster** without one of them being tested dishonestly. It gets
+its own bring-up and its own CI job, exactly as the TLS profile does.
+
+```bash
+export RAFTKV_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+pytest tests/e2e -m requires_auth -v -rs
+```
+
+What is here because a unit test cannot reach it:
+
+- **Replication of the user table.** `test_a_created_user_authenticates_on_every_node`
+  is the load-bearing one: a user record is a raft entry, so the chain under test
+  is propose -> replicate -> apply -> the follower's own authenticator reading it
+  back, and every link of that is mocked out in the C++ unit tests. It polls
+  rather than sleeps, and it first asserts the same credential is refused
+  everywhere — so a pass cannot come from the cluster simply being open.
+- **That a refusal happens BEFORE the side effect.** Same argument as the refused
+  `/join` assertion above: `test_a_non_admin_cannot_manage_users` checks that the
+  escalation attempt created no user, because middleware returning 403 *after*
+  proposing would pass a status-code-only test and leave an admin account behind.
+  `test_a_read_only_user_cannot_write` likewise re-reads the key to prove the
+  refused write never landed.
+- **That the reserved key space is unreachable end to end**, including the read
+  direction and including the admin, which is what keeps password hashes off the
+  wire.
+
+The rules that hold with auth **off** are in `test_security.py` instead, so they
+run in the default suite against the default profile: the user API is closed
+rather than open, `__sys:` keys are refused, and `USER_SET`/`USER_DEL` are refused
+on `/insert-val`. Each of those skips if it finds a cluster that *is* enforcing
+auth, so both profiles can be run without editing anything.
 
 ## Still-pinned behavior
 

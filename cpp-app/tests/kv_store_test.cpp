@@ -565,6 +565,45 @@ TEST_F(PersistentKVStoreTest, InvalidCommandInWalStopsReplayToo) {
   EXPECT_FALSE(reloaded.contains("c"));
 }
 
+TEST_F(PersistentKVStoreTest, UserOpInWalStopsReplay) {
+  // A USER_SET/USER_DEL record is a *valid command* — is_valid() accepts both —
+  // but it is not one this store ever writes: set()/remove() re-encode every
+  // mutation as SET or DELETE, so a committed user write reaches the WAL as a
+  // plain SET of its `__sys:user:...` key. A USER_* record therefore means the
+  // file was not produced by this store, and replay stops exactly as it does
+  // for a record that will not decode. Skipping it would be worse: a USER_DEL
+  // that was silently ignored leaves a user who should have been removed.
+  append_wal_record(pack_command("SET", "a", "1"));
+  append_wal_record(pack_command("USER_SET", "alice", "record-bytes"));
+  append_wal_record(pack_command("SET", "c", "3"));
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  expect_value(reloaded, "a", "1");
+  EXPECT_FALSE(reloaded.contains("c"));
+  // Nothing was invented under either the bare name or the derived key.
+  EXPECT_FALSE(reloaded.contains("alice"));
+  EXPECT_FALSE(reloaded.contains("__sys:user:alice"));
+}
+
+TEST_F(PersistentKVStoreTest, AUserRecordSurvivesAsAnOrdinaryEntry) {
+  // The other half of the argument above: Apply stores a user record with
+  // store_.set(), so it must round-trip through the WAL and the base file like
+  // any other key. If it did not, every restart would drop the user table.
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("__sys:user:alice", std::string("record\0bytes", 12));
+    store.set("app:k", "v");
+  }
+
+  const PersistentKVStore reloaded(path(), fast_options());
+
+  ASSERT_TRUE(reloaded.get("__sys:user:alice").has_value());
+  EXPECT_EQ(*reloaded.get("__sys:user:alice"),
+            std::string("record\0bytes", 12));
+  expect_value(reloaded, "app:k", "v");
+}
+
 // --- Compaction (R2.6) ------------------------------------------------------
 
 TEST_F(PersistentKVStoreTest, RecordThresholdTriggersCompaction) {
