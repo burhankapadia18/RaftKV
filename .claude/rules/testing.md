@@ -46,6 +46,7 @@ docker compose up -d
 pip install -r tests/e2e/requirements.txt
 pytest tests/e2e -v
 pytest tests/e2e -m requires_docker -v   # Phase 2 crash test, opt-in
+pytest tests/e2e -m requires_auth -v -rs # client ACLs, opt-in (own cluster)
 docker compose down -v       # rm -rf vol-node* for a clean slate
 ```
 
@@ -112,8 +113,11 @@ existing tests rather than inventing a new style:
   dependency `RaftControl` exists to break.
 - **C++**: GoogleTest via CMake/CTest, wired as the separate `kvdb_tests` target
   behind `KVDB_BUILD_TESTS` so `kvdb_node` stays dependency-free. Add new
-  `cpp-app/tests/*.cpp` files there. `KVHttpHandler` (with fake
-  `IRaftClient`/`IKVStore`) is still an untested high-value target.
+  `cpp-app/tests/*.cpp` files there. `KVHttpHandler` is driven with fake
+  `IRaftClient`/`IKVStore`/`IAuthEngine` in `http_handler_test.cpp` — copy that
+  shape for anything new on the HTTP surface. The auth tests are the same idea one
+  layer down: `auth_engine_test.cpp` drives the real `AuthEngine` against a fake
+  store, so an authentication decision is testable without a cluster.
 - **Cluster behavior** (leader election, failover, restart replay) belongs in
   `tests/e2e/` or scripted docker compose scenarios, not unit tests.
 
@@ -141,6 +145,11 @@ and stringly `error` bodies (Phase 1), and the lossy `kv.db` line format
    (the C++ client has a 5s deadline). The non-leader case is pinned end-to-end
    by R0.4, but `GrpcRaftClient` itself is untested, and so are
    `internal/backend`, `internal/raftnode` and `internal/rpc` on the Go side.
-4. **Still open — `KVHttpHandler`** routing and response bodies with fake
-   `IRaftClient`/`IKVStore`. `HttpRequestParser` is covered; the handler above it
-   is not.
+4. ~~`KVHttpHandler` routing and response bodies~~ — **covered**
+   (`cpp-app/tests/http_handler_test.cpp`): the full status/body/Content-Type
+   contract per route, and the auth surface on top of it (401-vs-403, the
+   `WWW-Authenticate` challenge, class and key-pattern denials, the admin API, and
+   that auth-off behaviour is byte-identical to before).
+5. **Still open — the response side of content negotiation.** Header capture now
+   exists, so `Accept` is readable; what is missing is a second encoder, because
+   every body is hand-built JSON with no library linked in.

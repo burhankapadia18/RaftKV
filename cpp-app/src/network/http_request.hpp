@@ -69,6 +69,47 @@ url_decode(const std::string &in, bool decode_plus = false) {
 }
 
 /**
+ * @brief Lowercase an ASCII string, for case-insensitive header matching.
+ *
+ * The cast through unsigned char is not decoration: std::tolower takes an int
+ * that must be representable as unsigned char, and passing a negative value —
+ * which any byte >= 0x80 becomes on a platform with signed char — is undefined
+ * behaviour. Header values carry arbitrary bytes, and this build runs under
+ * UBSan in CI.
+ */
+[[nodiscard]] inline std::string ascii_lower(std::string text) {
+  std::transform(text.begin(), text.end(), text.begin(), [](char c) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  });
+  return text;
+}
+
+/**
+ * @brief Strip leading and trailing optional whitespace from a header value.
+ *
+ * RFC 9110 allows SP/HTAB around a field value. The trailing CR is stripped
+ * here too, because the parser splits header lines with std::getline on '\n'
+ * and every line therefore keeps its '\r'. Leaving it attached would corrupt
+ * any value used as bytes rather than parsed as a number — a base64
+ * Authorization credential with a trailing CR does not decode.
+ */
+[[nodiscard]] inline std::string trim_header_value(const std::string &value) {
+  const auto is_padding = [](char c) {
+    return c == ' ' || c == '\t' || c == '\r';
+  };
+
+  size_t begin = 0;
+  while (begin < value.size() && is_padding(value[begin])) {
+    ++begin;
+  }
+  size_t end = value.size();
+  while (end > begin && is_padding(value[end - 1])) {
+    --end;
+  }
+  return value.substr(begin, end - begin);
+}
+
+/**
  * @brief Parsed HTTP request structure.
  *
  * Immutable value object representing a parsed HTTP request.
@@ -77,6 +118,19 @@ struct HttpRequest {
   std::string method;
   std::string path;
   std::string query_string;
+
+  /**
+   * @brief Every header line, keyed by LOWERCASED field name.
+   *
+   * Values keep their original bytes and case — a base64 credential and a
+   * quoted ETag both mean different things after case folding. Match names
+   * against a lowercase literal, or go through header() below.
+   *
+   * Populated since the auth phase. It was declared but never filled in
+   * before, which is why response content negotiation and any credential
+   * header were impossible; @c is_msgpack and @c content_length are now
+   * derived from this map rather than scanned for independently.
+   */
   std::map<std::string, std::string> headers;
   std::string body;
   bool is_msgpack = false;
@@ -89,6 +143,15 @@ struct HttpRequest {
    * than guessing at a body length.
    */
   bool bad_content_length = false;
+
+  /**
+   * @brief One header value, or "" when absent.
+   * @param lowercase_name Field name in lowercase — the map's key form.
+   */
+  [[nodiscard]] std::string header(const std::string &lowercase_name) const {
+    const auto it = headers.find(lowercase_name);
+    return it == headers.end() ? std::string() : it->second;
+  }
 
   /**
    * @brief Parse query parameters from the query string.
@@ -159,50 +222,83 @@ public:
       request.path = full_path;
     }
 
-    // Parse headers
+    // Parse headers into request.headers, keyed by lowercased field name.
+    //
+    // Names are matched EXACTLY after lowercasing. The previous version asked
+    // whether the whole line contained "content-length:" anywhere, which also
+    // matched a header merely NAMED like one — `X-Content-Type:
+    // application/msgpack` flipped is_msgpack, and any `...-Content-Length:`
+    // set the body length. A field name is the text before the first colon and
+    // nothing else.
     std::string line;
     std::getline(header_stream, line); // Skip first line (already parsed)
 
-    while (std::getline(header_stream, line)) {
-      // Convert to lowercase for case-insensitive matching
-      std::string lower_line = line;
-      std::transform(lower_line.begin(), lower_line.end(), lower_line.begin(),
-                     ::tolower);
+    size_t content_length_count = 0;
 
-      if (lower_line.find("content-length:") != std::string::npos) {
-        size_t colon = line.find(':');
-        // std::stoi throws on garbage ("abc"), on an empty value and on
-        // anything wider than an int. parse() must stay total: an exception
-        // here would unwind out of the accept loop and take the process down,
-        // which makes a single unauthenticated header a remote kill switch.
-        try {
-          request.content_length = std::stoi(line.substr(colon + 1));
-        } catch (const std::invalid_argument &) {
-          request.bad_content_length = true;
-          request.content_length = 0;
-        } catch (const std::out_of_range &) {
-          request.bad_content_length = true;
-          request.content_length = 0;
-        }
-        // A NEGATIVE length parses fine — std::stoi("-1") just returns -1 — so
-        // catching exceptions alone is not enough. HttpServer compares
-        // body.size() against static_cast<size_t>(content_length), and
-        // (size_t)-1 is 18446744073709551615: the body top-up loop would never
-        // be satisfied and would block in recv() forever. Because the accept
-        // loop is single-threaded, one client holding that socket open wedges
-        // the node's entire HTTP surface while the container still reports
-        // healthy. Verified against a live cluster before this guard existed.
-        if (request.content_length < 0) {
-          request.bad_content_length = true;
-          request.content_length = 0;
-        }
+    while (std::getline(header_stream, line)) {
+      const size_t colon = line.find(':');
+      if (colon == std::string::npos) {
+        // Not a header line (a bare CR from the terminator, or a continuation
+        // line — obs-fold is deprecated and not supported). Nothing to store.
+        continue;
       }
 
-      if (lower_line.find("content-type:") != std::string::npos &&
-          lower_line.find("application/msgpack") != std::string::npos) {
-        request.is_msgpack = true;
+      const std::string name = ascii_lower(line.substr(0, colon));
+      if (name.empty()) {
+        continue;
+      }
+      const std::string value = trim_header_value(line.substr(colon + 1));
+
+      if (name == "content-length") {
+        ++content_length_count;
+      }
+      // Last occurrence wins, which is what the old scan effectively did too.
+      request.headers[name] = value;
+    }
+
+    // Content-Length: a header the server acts on, so it is derived here rather
+    // than left for each caller to re-parse.
+    const auto content_length = request.headers.find("content-length");
+    if (content_length != request.headers.end()) {
+      // std::stoi throws on garbage ("abc"), on an empty value and on
+      // anything wider than an int. parse() must stay total: an exception
+      // here would unwind out of the accept loop and take the process down,
+      // which makes a single unauthenticated header a remote kill switch.
+      try {
+        request.content_length = std::stoi(content_length->second);
+      } catch (const std::invalid_argument &) {
+        request.bad_content_length = true;
+        request.content_length = 0;
+      } catch (const std::out_of_range &) {
+        request.bad_content_length = true;
+        request.content_length = 0;
+      }
+      // A NEGATIVE length parses fine — std::stoi("-1") just returns -1 — so
+      // catching exceptions alone is not enough. HttpServer compares
+      // body.size() against static_cast<size_t>(content_length), and
+      // (size_t)-1 is 18446744073709551615: the body top-up loop would never
+      // be satisfied and would block in recv() forever. Because the accept
+      // loop is single-threaded, one client holding that socket open wedges
+      // the node's entire HTTP surface while the container still reports
+      // healthy. Verified against a live cluster before this guard existed.
+      if (request.content_length < 0) {
+        request.bad_content_length = true;
+        request.content_length = 0;
+      }
+      // Two Content-Length headers mean the sender and this server may not
+      // agree on where the body ends, which is the shape of a request
+      // smuggling attempt. RFC 9110 says reject; "last one wins" is exactly
+      // the guess that makes a proxy and an origin disagree.
+      if (content_length_count > 1) {
+        request.bad_content_length = true;
+        request.content_length = 0;
       }
     }
+
+    // The media type may carry parameters ("application/msgpack; charset=..."),
+    // so this stays a substring test — but only within the Content-Type VALUE.
+    request.is_msgpack = ascii_lower(request.header("content-type"))
+                             .find("application/msgpack") != std::string::npos;
 
     return request;
   }

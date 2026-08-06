@@ -697,5 +697,213 @@ TEST(SnapshotRoundTripTest, KeysThatBreakLineFormatsSurviveChunking) {
   }
 }
 
+// --- The reserved key space guard -----------------------------------------
+//
+// The security argument for these tests: the sidecar's RaftNode port (50052) is
+// peer-reachable and UNAUTHENTICATED, so anything inside the network can get a
+// command committed without presenting a credential. Apply is therefore the
+// only place that can stop such a caller from rewriting the user table, and the
+// HTTP-layer checks are irrelevant to it. If these tests fail, the ACL system
+// is bypassable by anyone who can open a TCP connection to a node.
+
+/** @brief Apply one command and return the reply, for the terser tests below.
+ */
+consensus::ApplyResponse apply_payload(FakeKVStore &store,
+                                       const std::string &payload) {
+  StateMachineService service(store);
+  const consensus::Command request = command_with_payload(payload);
+  consensus::ApplyResponse reply;
+  const grpc::Status status = service.Apply(nullptr, &request, &reply);
+  EXPECT_TRUE(status.ok()) << "Apply must report failures in the reply, not as "
+                              "a non-OK status (the Go FSM reads a transport "
+                              "error as possible divergence)";
+  return reply;
+}
+
+/** @brief A valid encoded record for @p name with password @p password. */
+std::string encoded_record(const std::string &name,
+                           const std::string &password) {
+  auth::UserUpsertRequest request;
+  request.password = password;
+  request.classes = {auth::kClassRead};
+  request.patterns = {"app:*"};
+  return request.to_record(name).to_msgpack();
+}
+
+TEST(StateMachineServiceTest, PlainSetIsRefusedOnTheReservedPrefix) {
+  FakeKVStore store;
+  const consensus::ApplyResponse reply =
+      apply_payload(store, pack_string_map({{"op", "SET"},
+                                            {"key", "__sys:user:admin"},
+                                            {"value", "forged"}}));
+
+  EXPECT_FALSE(reply.success());
+  EXPECT_NE(reply.error().find("reserved prefix"), std::string::npos);
+  // The store must be untouched — not merely unchanged in content.
+  EXPECT_EQ(store.writes, 0);
+  EXPECT_FALSE(store.contains("__sys:user:admin"));
+}
+
+TEST(StateMachineServiceTest, PlainDeleteIsRefusedOnTheReservedPrefix) {
+  // The delete direction matters as much as the write: being able to remove
+  // `__sys:user:alice` is being able to lock a user out, and removing every
+  // record is being able to empty the ACL table.
+  FakeKVStore store;
+  store.data["__sys:user:alice"] = encoded_record("alice", "s3cr3t-password");
+
+  const consensus::ApplyResponse reply = apply_payload(
+      store, pack_string_map({{"op", "DELETE"}, {"key", "__sys:user:alice"}}));
+
+  EXPECT_FALSE(reply.success());
+  EXPECT_NE(reply.error().find("reserved prefix"), std::string::npos);
+  EXPECT_EQ(store.writes, 0);
+  EXPECT_TRUE(store.contains("__sys:user:alice"));
+}
+
+TEST(StateMachineServiceTest,
+     TheGuardCoversTheWholeReservedPrefixNotJustUsers) {
+  // `__sys:` is reserved as a whole, so a future subtree cannot be squatted on
+  // by a client now and become someone else's state later.
+  FakeKVStore store;
+  for (const std::string &key :
+       {std::string("__sys:"), std::string("__sys:anything"),
+        std::string("__sys:user:"), std::string("__sys:x:y:z")}) {
+    const consensus::ApplyResponse reply = apply_payload(
+        store, pack_string_map({{"op", "SET"}, {"key", key}, {"value", "v"}}));
+    EXPECT_FALSE(reply.success()) << "accepted key " << key;
+  }
+  EXPECT_EQ(store.writes, 0);
+}
+
+TEST(StateMachineServiceTest, OrdinaryKeysThatMerelyContainTheMarkerStillWork) {
+  // Only a PREFIX is reserved. Refusing keys that merely contain "__sys:"
+  // would take names clients may already be using, and this store's keys are
+  // arbitrary bytes.
+  FakeKVStore store;
+  const consensus::ApplyResponse reply =
+      apply_payload(store, pack_string_map({{"op", "SET"},
+                                            {"key", "app:__sys:not-reserved"},
+                                            {"value", "v"}}));
+
+  EXPECT_TRUE(reply.success()) << reply.error();
+  EXPECT_EQ(store.writes, 1);
+}
+
+// --- USER_SET / USER_DEL --------------------------------------------------
+
+TEST(StateMachineServiceTest, UserSetStoresTheRecordUnderTheDerivedKey) {
+  FakeKVStore store;
+  const std::string record = encoded_record("alice", "s3cr3t-password");
+
+  const consensus::ApplyResponse reply = apply_payload(
+      store, pack_string_map(
+                 {{"op", "USER_SET"}, {"key", "alice"}, {"value", record}}));
+
+  EXPECT_TRUE(reply.success()) << reply.error();
+  EXPECT_EQ(reply.error(), "");
+  // The command carries the BARE name; Apply derives the storage key, which is
+  // what makes a name/key mismatch unrepresentable rather than a validation
+  // problem.
+  ASSERT_TRUE(store.get("__sys:user:alice").has_value());
+  EXPECT_EQ(*store.get("__sys:user:alice"), record)
+      << "the stored bytes must be the committed bytes, verbatim";
+  EXPECT_FALSE(store.contains("alice"));
+}
+
+TEST(StateMachineServiceTest, UserSetIsRejectedForAMismatchedName) {
+  // The authenticator reads `name` back out of the record, so a record stored
+  // under one name while claiming another is a record whose identity depends on
+  // which field you read. Refuse rather than pick.
+  FakeKVStore store;
+  const consensus::ApplyResponse reply = apply_payload(
+      store,
+      pack_string_map({{"op", "USER_SET"},
+                       {"key", "alice"},
+                       {"value", encoded_record("bob", "s3cr3t-pass")}}));
+
+  EXPECT_FALSE(reply.success());
+  EXPECT_NE(reply.error().find("does not match"), std::string::npos);
+  EXPECT_EQ(store.writes, 0);
+}
+
+TEST(StateMachineServiceTest, UserSetIsRejectedForBadNamesAndBadRecords) {
+  FakeKVStore store;
+
+  // An unusable user name.
+  EXPECT_FALSE(
+      apply_payload(
+          store,
+          pack_string_map({{"op", "USER_SET"},
+                           {"key", "has space"},
+                           {"value", encoded_record("has space", "pwpwpwpw")}}))
+          .success());
+  // A value that is not a record at all.
+  const consensus::ApplyResponse malformed =
+      apply_payload(store, pack_string_map({{"op", "USER_SET"},
+                                            {"key", "alice"},
+                                            {"value", "not msgpack"}}));
+  EXPECT_FALSE(malformed.success());
+  EXPECT_NE(malformed.error().find("malformed user record"), std::string::npos);
+  // An empty value.
+  EXPECT_FALSE(apply_payload(store, pack_string_map({{"op", "USER_SET"},
+                                                     {"key", "alice"},
+                                                     {"value", ""}}))
+                   .success());
+  // An empty key, caught by KVCommand::validation_error before any of this.
+  EXPECT_FALSE(apply_payload(store, pack_string_map({{"op", "USER_SET"},
+                                                     {"key", ""},
+                                                     {"value", "x"}}))
+                   .success());
+
+  EXPECT_EQ(store.writes, 0) << "no rejected record may reach the store";
+}
+
+TEST(StateMachineServiceTest,
+     UserSetRejectionIsDeterministicNotATransportError) {
+  // Every rejection above must arrive as success=false with Status::OK. A
+  // non-OK status sends the Go FSM down its "THIS REPLICA MAY NOW BE DIVERGED"
+  // branch, and none of these are divergence — the verdict is a pure function
+  // of the committed bytes, so all replicas reach it identically.
+  FakeKVStore store;
+  StateMachineService service(store);
+  const consensus::Command request = command_with_payload(pack_string_map(
+      {{"op", "USER_SET"}, {"key", "alice"}, {"value", "garbage"}}));
+  consensus::ApplyResponse reply;
+
+  const grpc::Status status = service.Apply(nullptr, &request, &reply);
+
+  EXPECT_TRUE(status.ok());
+  EXPECT_FALSE(reply.success());
+  EXPECT_NE(reply.error(), "");
+}
+
+TEST(StateMachineServiceTest, UserDelRemovesTheRecordAndIsIdempotent) {
+  FakeKVStore store;
+  store.data["__sys:user:alice"] = encoded_record("alice", "s3cr3t-password");
+
+  const consensus::ApplyResponse first = apply_payload(
+      store, pack_string_map({{"op", "USER_DEL"}, {"key", "alice"}}));
+
+  EXPECT_TRUE(first.success()) << first.error();
+  EXPECT_FALSE(store.contains("__sys:user:alice"));
+
+  // Deleting an absent user SUCCEEDS. Writes are at-least-once under failure,
+  // so a client retrying a delete it never saw acknowledged must not be told
+  // the retry failed.
+  const consensus::ApplyResponse second = apply_payload(
+      store, pack_string_map({{"op", "USER_DEL"}, {"key", "alice"}}));
+
+  EXPECT_TRUE(second.success()) << second.error();
+}
+
+TEST(StateMachineServiceTest, UserDelIsRejectedForAnUnusableName) {
+  FakeKVStore store;
+  const consensus::ApplyResponse reply = apply_payload(
+      store, pack_string_map({{"op", "USER_DEL"}, {"key", "__sys:user:x"}}));
+
+  EXPECT_FALSE(reply.success());
+  EXPECT_EQ(store.writes, 0);
+}
+
 } // namespace
 } // namespace kvdb

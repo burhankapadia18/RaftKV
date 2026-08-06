@@ -105,7 +105,11 @@ int main(int argc, char *argv[]) {
         {log::field("http_port", static_cast<long long>(config.http_port)),
          log::field("grpc_port", config.grpc_port),
          log::field("sidecar_port", config.sidecar_port),
-         log::field("db_file", config.db_file)});
+         log::field("db_file", config.db_file),
+         // A BOOLEAN, never the password. Same rule as the sidecar's
+         // MgmtToken: an operator needs to know whether auth is on, and a
+         // secret in a log line outlives the process that wrote it.
+         log::field("auth_enabled", config.auth.enabled ? "true" : "false")});
 
     // R5.4: store gauges, read at SCRAPE time rather than snapshotted, so a
     // dashboard cannot show a stale key count. Registered here because main
@@ -130,8 +134,14 @@ int main(int argc, char *argv[]) {
     // 4. Create the Raft client for proposing commands
     auto raft_client = GrpcRaftClient::connect(config.sidecar_address());
 
-    // 5. Create and run the HTTP server
-    KVHttpHandler handler(*raft_client, store);
+    // 5. Create and run the HTTP server.
+    //
+    // The engine is constructed here, before the listener exists, so that a
+    // configured-but-unusable auth setup (no randomness for the salt) throws
+    // out of main instead of leaving a node serving requests it cannot
+    // authenticate. Failing to start beats falling back to open.
+    auth::AuthEngine auth_engine(store, config.auth);
+    KVHttpHandler handler(*raft_client, store, auth_engine);
     HttpServer http_server(config.http_port, std::move(handler), config.limits);
 
     // 6. R5.9: hand shutdown to the waiter thread. Everything it touches —

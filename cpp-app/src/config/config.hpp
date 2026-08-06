@@ -42,6 +42,49 @@ struct RequestLimits {
   size_t max_header_bytes = 32u * 1024;
 };
 
+/**
+ * @brief Client authentication policy (the auth phase).
+ *
+ * OFF BY DEFAULT, and that is a deliberate product decision rather than a
+ * shortcut: the default compose profile is plaintext and unauthenticated so a
+ * demo needs no setup, exactly as docker-compose.secure.yml is the documented
+ * deployment for TLS. Auth switches on when an admin password is configured, so
+ * there is one knob rather than an enable flag that can disagree with it.
+ *
+ * The DEFAULT-CLOSED rule that applies to the management token applies here
+ * too, but at a different level: with no password configured the client API is
+ * open (unchanged behaviour), while the user-management API answers 403 for
+ * everyone. An empty password must never mean "let anybody administer users".
+ */
+struct AuthOptions {
+  /** @brief True when a bootstrap admin password was supplied. */
+  bool enabled = false;
+
+  /**
+   * @brief The bootstrap admin's password, in cleartext.
+   *
+   * From the environment only, NEVER an argv value: /proc/<pid>/cmdline is
+   * world-readable, so `kvdb_node --admin-password s3cr3t` publishes the
+   * password to every local user. The management token has the same rule for
+   * the same reason (go-sidecar/internal/config/config.go).
+   *
+   * Consumed once, by AuthEngine's constructor, which immediately derives a
+   * salted digest and does not retain this string.
+   */
+  std::string admin_password;
+
+  /** @brief Read RAFTKV_ADMIN_PASSWORD; empty means auth stays off. */
+  [[nodiscard]] static AuthOptions from_env() {
+    AuthOptions options;
+    const char *value = std::getenv("RAFTKV_ADMIN_PASSWORD");
+    if (value != nullptr && *value != '\0') {
+      options.admin_password = value;
+      options.enabled = true;
+    }
+    return options;
+  }
+};
+
 struct DurabilityOptions {
   /**
    * @brief fsync policy applied to every WAL append.
@@ -102,6 +145,16 @@ struct Config {
 
   /** @brief Inbound HTTP request bounds (R4.9). */
   RequestLimits limits{};
+
+  /**
+   * @brief Client authentication policy, from the environment.
+   *
+   * Like node_id and log_level, this is a default member initialiser reading an
+   * environment variable rather than a positional argument: the argv contract
+   * (http_port, grpc_port, sidecar_port, db_file) is unchanged, and a secret
+   * must not travel in argv at all.
+   */
+  AuthOptions auth = AuthOptions::from_env();
 
   /**
    * @brief Create config with default values.

@@ -199,7 +199,14 @@ export RAFTKV_MGMT_TOKEN="$(openssl rand -hex 32)"
 docker compose -f docker-compose.yml -f docker-compose.secure.yml up -d
 pytest tests/e2e -m requires_secure -v -rs
 
-# 6. Fuzzers — clang only, not part of the default build.
+# 6. Client auth — needs the cluster brought up with docker-compose.auth.yml and
+#    the SAME admin password exported. Skips (never fails) otherwise, so a
+#    misconfigured run says "not verified here" instead of reporting green.
+export RAFTKV_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+pytest tests/e2e -m requires_auth -v -rs
+
+# 7. Fuzzers — clang only, not part of the default build.
 cmake -S cpp-app -B cpp-app/fuzz-build -DKVDB_BUILD_FUZZERS=ON \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build cpp-app/fuzz-build -j4
@@ -222,6 +229,7 @@ push to `main` and every pull request, with independent jobs:
 | `cpp-tsan` | the same C++ tests under `-fsanitize=thread` |
 | `fuzz` | both libFuzzer targets, 60s each, crash inputs uploaded as artifacts |
 | `e2e` | `docker build`, `docker compose up -d`, bounded readiness poll, `pytest tests/e2e`, then the docker-gated tests, `docker compose down -v` |
+| `e2e-auth` | the same cluster under `docker-compose.auth.yml` with a generated admin password: the client-auth tests, whose headline assertion is that a user created on the leader becomes usable on **all three** nodes |
 | `e2e-secure` | the same cluster under `docker-compose.secure.yml`: TLS profile tests, plus a forced leader failover (the Phase 6 advertise-address bug only appears after an election) |
 
 ## API Reference
@@ -238,6 +246,24 @@ Every row below was verified against a running 3-node cluster; the same
 expectations are mirrored as constants in
 [`tests/e2e/contracts.py`](tests/e2e/contracts.py), so the handler, this table and
 the tests change together.
+
+**Authentication.** By default there is none and every request below works as
+written. When the cluster is started with an admin password
+(see [Client authentication](#client-authentication)), every route except
+`GET /metrics` additionally answers:
+
+| Outcome | Status | Body |
+|---|---|---|
+| No usable credential presented | `401 Unauthorized` + `WWW-Authenticate: Basic realm="raftkv"` | `{"error":"authentication required"}` |
+| Credential presented and rejected | `403 Forbidden` | `{"error":"invalid credentials"}` |
+| Authenticated, but not permitted | `403 Forbidden` | `{"error":"permission denied"}` |
+| Key under the reserved `__sys:` prefix | `403 Forbidden` | `{"error":"keys under \"__sys:\" are reserved; use /auth/users/{name}"}` |
+
+The 401/403 split is a contract, not a detail: 401 means *you sent nothing
+usable* and carries a challenge, so retrying with a credential may work. 403
+means *what you sent was refused*, and retrying will not help. Unknown user,
+disabled user and wrong password all produce the **same** 403 body on purpose —
+telling them apart would let anyone enumerate accounts.
 
 ### Write a key
 
@@ -389,6 +415,54 @@ Prometheus text format from the storage engine (`raftkv_apply_total`,
 and request duration histograms). The sidecar exposes its own on `:6000/metrics`,
 including raft gauges.
 
+### User management
+
+Only available when the cluster was started with an admin password; without one
+this whole surface answers `403 {"error":"user management is disabled; set
+RAFTKV_ADMIN_PASSWORD to enable authentication"}`. Default-closed, deliberately:
+an unconfigured security feature must never read as "no restriction".
+
+All three user routes require the **`admin`** class. The classes are independent,
+not a hierarchy — holding `read` and `write` does not let you manage users.
+
+```http
+PUT /auth/users/{name}
+Content-Type: application/msgpack
+
+{"password": "...", "enabled": true, "classes": ["read","write"], "patterns": ["app:*"]}
+```
+
+Creates or **replaces** a user. A full-record write rather than a partial update,
+because writes are at-least-once under failure and a read-modify-write has no safe
+retry here. The salt and hash are computed server-side and replicated through
+Raft, so the cleartext password never reaches the log.
+
+| Outcome | Status | Body |
+|---|---|---|
+| Committed | `200 OK` | `{"ok":true}` |
+| Password shorter than 8 bytes, unknown class, bad name, undecodable body | `400 Bad Request` | `{"error":"<reason>"}` |
+| Name is `admin` | `400 Bad Request` | `{"error":"\"admin\" is defined by RAFTKV_ADMIN_PASSWORD and cannot be managed through this API"}` |
+| `Content-Type` is not msgpack | `415 Unsupported Media Type` | `{"error":"unsupported media type","expected":"application/msgpack"}` |
+| Not the leader / propose failed | `503` / `502` | as for any other write |
+
+```http
+DELETE /auth/users/{name}
+GET    /auth/users/{name}
+GET    /auth/whoami
+```
+
+`DELETE` succeeds whether or not the user existed (idempotent, for the same
+at-least-once reason). `GET /auth/users/{name}` returns
+`{"name","enabled","classes","patterns"}` and **never** the salt or password hash
+— an administrator has no use for them, and returning them would turn one
+compromised admin credential into an offline attack on every user's password.
+`GET /auth/whoami` needs no class: any authenticated caller may ask about itself.
+
+Because a user record is replicated like any other write, a **follower's view can
+lag the leader by the replication delay** — so a user created or deleted a moment
+ago may not yet be in effect on every node. That is bounded by replication, and it
+is the same propagation delay any replicated ACL has.
+
 ### Anything else
 
 | Outcome | Status | Body |
@@ -438,14 +512,16 @@ leader, authenticating as itself.
 | `BOOTSTRAP` | Set to `true` for the initial leader | `false` |
 | `JOIN_ADDR` | Leader's management address for joining | - |
 | `RAFTKV_MGMT_TOKEN` | Cluster-admin bearer token for `/join` and `/remove`. Unset **disables** those endpoints | - |
+| `RAFTKV_ADMIN_PASSWORD` | Bootstrap admin's password. Setting it **enables client authentication**; unset means the client API is unauthenticated | - |
 | `RAFT_TLS_CERT` / `RAFT_TLS_KEY` / `RAFT_TLS_CA` | Mutual TLS for the Raft peer transport. Unset means plaintext | - |
 | `MGMT_TLS_CERT` / `MGMT_TLS_KEY` / `MGMT_TLS_CA` | TLS for the management API. Unset means HTTP | - |
 | `SNAPSHOT_INTERVAL` / `SNAPSHOT_THRESHOLD` / `TRAILING_LOGS` | Raft snapshot tunables. Unset uses HashiCorp Raft's defaults | - |
 
-The token is read from the environment rather than a flag on purpose: a
+Both secrets are read from the environment rather than a flag on purpose: a
 `-mgmt-token <secret>` would put it in the process's command line, where any
 local user can read it out of `ps`. TLS **paths** are passed as flags, because
-they are not secrets.
+they are not secrets. Neither secret is ever logged — the startup line reports
+`auth_enabled` as a boolean, not the password.
 
 ### Port Mapping
 
@@ -488,32 +564,95 @@ only takes three file paths.
 
 | Surface | Port | Default profile | Secure profile |
 |---|---|---|---|
-| Client HTTP API | 8080 / 8443 | Plaintext, unauthenticated | HTTPS via a reverse proxy, **still unauthenticated** |
+| Client HTTP API | 8080 / 8443 | Plaintext; unauthenticated unless an admin password is set | HTTPS via a reverse proxy; unauthenticated unless an admin password is set |
 | Management API | 6000 | HTTP; `/join`+`/remove` behind a bearer token | HTTPS + bearer token |
 | Raft peer transport | 8088 | Plaintext, **anyone who can reach it can append entries** | Mutual TLS against one cluster CA |
 | C++ StateMachine gRPC | 50051 | Plaintext on `127.0.0.1` | Same — see below |
 | Sidecar RaftNode gRPC | 50052 | Plaintext, peer-reachable | Same — see below |
+
+### Client authentication
+
+Off by default, and on when you give the cluster an admin password. Setting the
+password **is** the switch — there is no separate enable flag that could disagree
+with it.
+
+```bash
+export RAFTKV_ADMIN_PASSWORD="$(openssl rand -hex 16)"
+docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+
+# The bootstrap admin comes from that variable. It is not stored in the data it
+# administers, so there is no chicken-and-egg problem creating the first user.
+curl -u "admin:$RAFTKV_ADMIN_PASSWORD" http://localhost:8080/auth/whoami
+# {"name":"admin","classes":["read","write","admin"],"patterns":["*"]}
+
+# Create a scoped user: may read and write, but only keys matching app:*
+python3 -c 'import msgpack,sys; sys.stdout.buffer.write(msgpack.packb({
+    "password":"alice-password","enabled":True,
+    "classes":["read","write"],"patterns":["app:*"]}))' \
+  | curl -u "admin:$RAFTKV_ADMIN_PASSWORD" -X PUT \
+      -H 'Content-Type: application/msgpack' --data-binary @- \
+      http://localhost:8080/auth/users/alice
+
+curl -u alice:alice-password -X PUT --data-binary 'v' http://localhost:8080/kv/app:k   # 200
+curl -u alice:alice-password -X PUT --data-binary 'v' http://localhost:8080/kv/other:k # 403
+```
+
+The model is Redis' ACLs, scaled down: named users, each with a password, a set of
+**command classes** (`read`, `write`, `admin`) and a list of **glob key patterns**
+(`*` and `?`). The classes are independent rather than ranked — `admin` manages
+users and grants no access to data. An empty pattern list denies every key, which
+is the safe direction for a default.
+
+User records are replicated through Raft and stored under the reserved `__sys:`
+key prefix, so they survive restarts, snapshots and node joins with no extra
+machinery. That prefix is refused on every data route — **including reads**,
+because a readable `__sys:user:alice` would hand out her salt and password hash —
+and refused again at apply time, which is what stops the unauthenticated sidecar
+port (below) from rewriting the user table with an ordinary `SET`.
+
+Limits worth knowing before you rely on it:
+
+- **Passwords cross the wire in the clear on the default profile.** HTTP Basic is
+  base64, not encryption. Compose the auth overlay with
+  `docker-compose.secure.yml` for anything real — and note that even there TLS
+  stops at the proxy.
+- **Passwords are hashed with salted SHA-256, not a memory-hard KDF.** Redis
+  stores an unsalted SHA-256; this salts it, which defeats precomputed tables but
+  not a determined offline attacker with the store's bytes. Treat the data
+  directory as secret and use long passwords (8 bytes is the enforced floor, not a
+  recommendation).
+- **Authorization decisions on a follower can be stale** by the replication delay,
+  so a revoked user may keep working on one node for that long.
+- **There is no user listing.** The store is a flat map with no prefix scan, so
+  users are addressed by name, one at a time. Deliberate for 1.0.
+- **Anyone who can reach port 50052 bypasses all of this for ordinary keys** — see
+  the next section. The ACL boundary is the HTTP surface.
 
 ### What is deliberately not protected
 
 Stated plainly, because a security section that only lists wins is worse than
 none at all:
 
-- **There is no client authentication, in either profile.** Anyone who can reach
-  the client API can read and write every key. The bearer token guards cluster
-  *membership*, not data. Put the API behind something that authenticates.
+- **Client authentication is opt-in, so the default profile has none.** With no
+  admin password set, anyone who can reach the client API can read and write every
+  key. The management bearer token guards cluster *membership*, not data.
 - **The intra-node gRPC pair (50051/50052) is plaintext.** 50051 never leaves the
   container's loopback interface, so encrypting it would buy nothing. 50052 is
   reachable by peers, because Phase 4 forwarding made it so — a peer that can
   reach it can propose writes. It is inside the same trust boundary as the Raft
-  port, but unlike the Raft port it is not authenticated. This is a real gap.
+  port, but unlike the Raft port it is not authenticated. This is a real gap, and
+  enabling client authentication does not close it: such a peer can write ordinary
+  keys with no credential. It cannot touch the **user table**, because the apply
+  path refuses a plain `SET`/`DELETE` under `__sys:` unconditionally — so the ACLs
+  cannot be edited this way, only sidestepped for data.
 - **The proxy-to-node hop is plaintext** (see `deploy/caddy/Caddyfile`). It is
   acceptable only because both ends are in the same compose network; a proxy on a
   different host would give you encryption to the proxy and clear text for the
   rest of the way.
 - **Certificates do not rotate.** Restart a node to pick up a new one.
-- **There is no authorization model** — no per-key ACLs, no roles. One
-  cluster-admin credential, and that is all.
+- **Authorization is per-key-pattern only.** There are three command classes and
+  glob patterns; there is no per-operation granularity finer than read/write, no
+  key-space quota, and no audit log of who wrote what.
 
 ### Why TLS is terminated by a proxy (R6.5)
 

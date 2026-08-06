@@ -255,7 +255,7 @@ a CA before it prints anything is a demo nobody runs — and
 
 | Surface | Default | Secure profile |
 |---|---|---|
-| Client HTTP API | Plaintext, unauthenticated | HTTPS via a reverse proxy, **still unauthenticated** |
+| Client HTTP API | Plaintext; unauthenticated unless `RAFTKV_ADMIN_PASSWORD` is set | HTTPS via a reverse proxy; authentication is a separate overlay (`docker-compose.auth.yml`) |
 | Management API | HTTP; `/join`+`/remove` behind a bearer token | HTTPS + bearer token |
 | Raft peer transport | Plaintext — anyone who can reach it can append entries | Mutual TLS against one cluster CA |
 | C++ StateMachine gRPC | Plaintext on `127.0.0.1` | Same |
@@ -310,8 +310,12 @@ Stated here rather than left to be discovered:
   better — more followers to wait for. This is the fundamental scalability limit.
 - **The whole dataset lives in memory,** and a snapshot holds a second copy while
   it is being written. Dataset size is bounded by RAM.
-- **No client authentication or authorization.** Anyone who can reach the API can
-  read and write everything.
+- **Client authentication is opt-in, and off by default.** With no
+  `RAFTKV_ADMIN_PASSWORD`, anyone who can reach the API can read and write
+  everything. With one, users get command classes and glob key patterns — but
+  passwords are salted SHA-256 rather than a memory-hard KDF, there is no user
+  listing, and a follower's authorization view can lag the leader by the
+  replication delay.
 - **No client SDK.** Clients speak HTTP and MsgPack directly, and must implement
   their own retry policy around the 502/503 distinction.
 - **Reads are stale unless asked otherwise,** and there is no bounded-staleness

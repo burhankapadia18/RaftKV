@@ -20,6 +20,7 @@ import os
 import socket
 import time
 
+import msgpack
 import pytest
 import requests
 
@@ -378,3 +379,104 @@ def test_delete_of_a_missing_key_is_idempotent(nodes, unique_key):
         f"DELETE of an absent key returned {response.status_code}, want 200"
     )
     assert try_json(response.text) == contracts.WRITE_OK_BODY
+
+
+# ---------------------------------------------------------------------------
+# The rules that hold with client auth switched OFF
+#
+# These run in the DEFAULT suite, against the default (unauthenticated) profile,
+# and that is the point: three properties of the auth phase are unconditional and
+# must hold on a cluster with no admin password configured at all. The auth-on
+# surface is tests/e2e/test_auth.py, behind the `requires_auth` marker.
+#
+# Each is also a deliberate behaviour change to the auth-off profile, recorded in
+# the CHANGELOG. None is reachable by a client that existed before: the `__sys:`
+# prefix was never documented as usable, and USER_SET/USER_DEL were not
+# operations.
+# ---------------------------------------------------------------------------
+
+
+def _auth_is_off(base_url: str) -> bool:
+    """True when this cluster is not enforcing client auth."""
+    probe = requests.get(f"{base_url}/kv/probe", timeout=HTTP_TIMEOUT)
+    return probe.status_code != contracts.HTTP_UNAUTHORIZED
+
+
+def test_user_management_is_closed_when_no_admin_password_is_set(nodes):
+    """DEFAULT-CLOSED, exactly like /join with no management token.
+
+    An unconfigured security feature must never read as "no restriction". If this
+    ever returns 200 or 404, the user API became reachable on a cluster that
+    cannot authenticate an administrator.
+    """
+    if not _auth_is_off(nodes[0]):
+        pytest.skip("this cluster enforces client auth; see test_auth.py")
+
+    for method, path in [
+        ("GET", "/auth/users/anyone"),
+        ("PUT", "/auth/users/anyone"),
+        ("DELETE", "/auth/users/anyone"),
+        ("GET", "/auth/whoami"),
+    ]:
+        response = requests.request(
+            method, f"{nodes[0]}{path}", data=b"x", timeout=HTTP_TIMEOUT
+        )
+        assert response.status_code == contracts.HTTP_FORBIDDEN, (
+            f"{method} {path} answered {response.status_code} on an "
+            "unauthenticated cluster; the user API must be closed, not open"
+        )
+
+
+def test_the_reserved_key_space_is_refused_even_without_auth(nodes):
+    """`__sys:` is refused unconditionally, in both directions.
+
+    The read direction is the one that matters: user records live under this
+    prefix, so a readable `__sys:user:x` would hand out a salt and password hash
+    to anyone at all on this profile.
+    """
+    if not _auth_is_off(nodes[0]):
+        pytest.skip("this cluster enforces client auth; see test_auth.py")
+
+    reserved = f"{contracts.USER_KEY_PREFIX}someone"
+    for method, url in [
+        ("GET", f"{nodes[0]}/kv/{reserved}"),
+        ("PUT", f"{nodes[0]}/kv/{reserved}"),
+        ("DELETE", f"{nodes[0]}/kv/{reserved}"),
+        ("GET", f"{nodes[0]}/get-val?key={reserved}"),
+    ]:
+        response = requests.request(method, url, data=b"x", timeout=HTTP_TIMEOUT)
+        assert response.status_code == contracts.HTTP_FORBIDDEN, (
+            f"{method} {url} answered {response.status_code}, want 403"
+        )
+
+    # Only a PREFIX is reserved. A key that merely contains the marker is an
+    # ordinary key, because refusing more would take names clients may already be
+    # using — this store's keys are arbitrary bytes.
+    ordinary = requests.put(
+        f"{nodes[0]}/kv/app:__sys:not-reserved", data=b"v", timeout=HTTP_TIMEOUT
+    )
+    assert ordinary.status_code == contracts.HTTP_OK
+
+
+def test_user_operations_are_refused_on_insert_val_without_auth(nodes):
+    """Refused for everyone, on every profile.
+
+    /insert-val forwards a raw command, so accepting a USER_SET here would let any
+    caller mint an administrator without ever passing the admin check on
+    /auth/users/{name} — including on a cluster where auth is later switched on.
+    """
+    if not _auth_is_off(nodes[0]):
+        pytest.skip("this cluster enforces client auth; see test_auth.py")
+
+    for op in ["USER_SET", "USER_DEL"]:
+        response = requests.post(
+            f"{nodes[0]}/insert-val",
+            data=msgpack.packb({"op": op, "key": "smuggled", "value": "x"}),
+            headers={"Content-Type": contracts.MSGPACK_CONTENT_TYPE},
+            timeout=HTTP_TIMEOUT,
+        )
+        assert response.status_code == contracts.HTTP_BAD_REQUEST, (
+            f"op={op} answered {response.status_code}, want 400"
+        )
+        body = try_json(response.text)
+        assert body is not None and "user-management" in body.get("error", "")

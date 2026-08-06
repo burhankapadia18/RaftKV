@@ -9,8 +9,14 @@
  * "Key Not Found"), and a 404 that did go out went out as the malformed status
  * line "HTTP/1.1 404 OK".
  *
- * KVHttpHandler takes IRaftClient and IKVStore by reference, so the whole
- * surface is reachable with two small doubles - no sockets, no gRPC, no disk.
+ * KVHttpHandler takes IRaftClient, IKVStore and IAuthEngine by reference, so
+ * the whole surface is reachable with three small doubles - no sockets, no
+ * gRPC, no disk.
+ *
+ * The default fixture leaves auth DISABLED, which is the shipped default and
+ * lets every pre-auth expectation below stand unchanged - that those rows did
+ * not move is itself the assertion that enabling nothing changes nothing.
+ * AuthenticatedHandlerTest at the bottom covers the auth-on surface.
  */
 
 #include <gtest/gtest.h>
@@ -18,7 +24,11 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
+#include "auth/auth_engine.hpp"
+#include "auth/base64.hpp"
+#include "auth/user_record.hpp"
 #include "network/http_request.hpp"
 #include "network/http_server.hpp"
 #include "raft/raft_client.hpp"
@@ -116,12 +126,42 @@ HttpRequest get_request(const std::string &query_string) {
   return request;
 }
 
+/**
+ * @brief Scriptable IAuthEngine double.
+ *
+ * A test sets @c enabled_flag and @c identity (or @c outcome) and asserts on
+ * the status code, so the handler's routing and authorization checks are
+ * exercised without any hashing, any store, or any real credential.
+ */
+class FakeAuthEngine : public auth::IAuthEngine {
+public:
+  [[nodiscard]] bool enabled() const override { return enabled_flag; }
+
+  [[nodiscard]] auth::AuthOutcome
+  authenticate(const std::string &authorization,
+               auth::AuthContext &out) const override {
+    ++calls;
+    last_authorization = authorization;
+    if (outcome == auth::AuthOutcome::kOk) {
+      out = identity;
+    }
+    return outcome;
+  }
+
+  bool enabled_flag = false;
+  auth::AuthOutcome outcome = auth::AuthOutcome::kOk;
+  auth::AuthContext identity = auth::AuthContext::unrestricted();
+  mutable int calls = 0;
+  mutable std::string last_authorization;
+};
+
 class KVHttpHandlerTest : public ::testing::Test {
 protected:
-  KVHttpHandlerTest() : handler_(raft_, store_) {}
+  KVHttpHandlerTest() : handler_(raft_, store_, auth_) {}
 
   FakeRaftClient raft_;
   FakeKVStore store_;
+  FakeAuthEngine auth_;
   KVHttpHandler handler_;
 };
 
@@ -475,6 +515,552 @@ TEST_F(KVHttpHandlerTest, NotLeaderStillWinsOverUnavailable) {
 
   EXPECT_EQ(response.status_code, 503);
   EXPECT_NE(response.body.find("\"leader\":\"node2:8088\""), std::string::npos);
+}
+
+// --- Request builders for the auth surface --------------------------------
+
+namespace {
+
+HttpRequest request_for(const std::string &method, const std::string &path) {
+  HttpRequest request;
+  request.method = method;
+  request.path = path;
+  return request;
+}
+
+HttpRequest msgpack_request(const std::string &method, const std::string &path,
+                            const std::string &body) {
+  HttpRequest request = request_for(method, path);
+  request.is_msgpack = true;
+  request.body = body;
+  request.content_length = static_cast<int>(body.size());
+  return request;
+}
+
+/** @brief The msgpack body of a PUT /auth/users/{name}. */
+std::string upsert_body(const std::string &password,
+                        const std::vector<std::string> &classes,
+                        const std::vector<std::string> &patterns,
+                        bool enabled = true) {
+  auth::UserUpsertRequest request;
+  request.password = password;
+  request.enabled = enabled;
+  request.classes = classes;
+  request.patterns = patterns;
+  msgpack::sbuffer buffer;
+  msgpack::pack(buffer, request);
+  return std::string(buffer.data(), buffer.size());
+}
+
+auth::AuthContext identity_with(const std::string &name,
+                                const std::vector<std::string> &classes,
+                                const std::vector<std::string> &patterns) {
+  auth::AuthContext context;
+  context.name = name;
+  for (const std::string &cls : classes) {
+    context.read = context.read || cls == auth::kClassRead;
+    context.write = context.write || cls == auth::kClassWrite;
+    context.admin = context.admin || cls == auth::kClassAdmin;
+  }
+  context.patterns = patterns;
+  return context;
+}
+
+} // namespace
+
+// --- Auth DISABLED: the unconditional rules -------------------------------
+//
+// These three hold with no admin password configured, and each is a deliberate
+// behaviour change to the auth-off surface (recorded in the CHANGELOG). All are
+// unreachable by any client that existed before: the `__sys:` prefix was never
+// documented as usable, and USER_SET/USER_DEL were not operations.
+
+TEST_F(KVHttpHandlerTest, AuthRoutesAreClosedWhenAuthIsDisabled) {
+  // DEFAULT-CLOSED, like /join with no management token. An unconfigured
+  // security feature must not read as "no restriction".
+  for (const std::string &method :
+       {std::string("GET"), std::string("PUT"), std::string("DELETE")}) {
+    const HttpResponse response =
+        handler_.handle(request_for(method, "/auth/users/alice"));
+    EXPECT_EQ(response.status_code, 403) << "method " << method;
+    EXPECT_NE(response.body.find("disabled"), std::string::npos);
+  }
+  EXPECT_EQ(handler_.handle(request_for("GET", "/auth/whoami")).status_code,
+            403);
+  EXPECT_EQ(raft_.calls, 0) << "nothing may reach consensus";
+}
+
+TEST_F(KVHttpHandlerTest, ReservedKeysAreRefusedOnEveryDataRouteWithAuthOff) {
+  store_.set("__sys:user:alice", "secret-record-bytes");
+
+  // Writes.
+  EXPECT_EQ(
+      handler_.handle(request_for("PUT", "/kv/__sys:user:alice")).status_code,
+      403);
+  EXPECT_EQ(handler_.handle(request_for("DELETE", "/kv/__sys:user:alice"))
+                .status_code,
+            403);
+  // READS TOO — this is the one that matters. A local read of a user record
+  // would hand out the salt and the password hash.
+  const HttpResponse read =
+      handler_.handle(request_for("GET", "/kv/__sys:user:alice"));
+  EXPECT_EQ(read.status_code, 403);
+  EXPECT_EQ(read.body.find("secret-record-bytes"), std::string::npos);
+  EXPECT_EQ(handler_.handle(get_request("key=__sys:user:alice")).status_code,
+            403);
+
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(KVHttpHandlerTest, PercentEncodedReservedPrefixIsAlsoRefused) {
+  // The check runs AFTER url_decode, so the prefix cannot be smuggled in
+  // escapes. "__sys%3Auser%3Aadmin" decodes to "__sys:user:admin".
+  const HttpResponse response =
+      handler_.handle(request_for("PUT", "/kv/__sys%3Auser%3Aadmin"));
+
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(KVHttpHandlerTest, KeysMerelyContainingTheMarkerAreStillOrdinary) {
+  // Only a prefix is reserved; refusing more would take key names clients may
+  // already use.
+  EXPECT_EQ(handler_.handle(request_for("PUT", "/kv/app:__sys:ok")).status_code,
+            200);
+  EXPECT_EQ(raft_.calls, 1);
+}
+
+TEST_F(KVHttpHandlerTest, UserOpsOnInsertValAreRefusedEvenWithAuthOff) {
+  // Closes the smuggling route: /insert-val forwards a raw command, so without
+  // this check anyone able to POST could mint an administrator.
+  for (const std::string &payload :
+       {KVCommand::encode_user_set("evil", "record"),
+        KVCommand::encode_user_del("admin")}) {
+    const HttpResponse response = handler_.handle(insert_request(payload));
+    EXPECT_EQ(response.status_code, 400);
+    EXPECT_NE(response.body.find("user-management"), std::string::npos);
+  }
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(KVHttpHandlerTest, AnUndecodableBodyIsStillForwardedWhenAuthIsOff) {
+  // PINNED: "validation happens after commit" for a malformed body. It commits,
+  // Apply rejects it, and the client sees 502. Auth-on refuses it up front
+  // instead (see the authenticated fixture) — that asymmetry is deliberate and
+  // documented, because a body naming no key cannot be checked against an ACL.
+  raft_.result = ProposeResult::failure("malformed payload: bad msgpack");
+
+  const HttpResponse response = handler_.handle(insert_request("not msgpack"));
+
+  EXPECT_EQ(response.status_code, 502);
+  EXPECT_EQ(raft_.calls, 1) << "the body must still reach consensus";
+}
+
+TEST_F(KVHttpHandlerTest, TheAuthenticatorIsNotEvenConsultedWhenDisabled) {
+  handler_.handle(request_for("GET", "/kv/k"));
+  handler_.handle(insert_request(KVCommand::encode_set("k", "v")));
+
+  EXPECT_EQ(auth_.calls, 0);
+}
+
+// --- Auth ENABLED ---------------------------------------------------------
+
+class AuthenticatedHandlerTest : public ::testing::Test {
+protected:
+  AuthenticatedHandlerTest() : handler_(raft_, store_, auth_) {
+    auth_.enabled_flag = true;
+    // Default caller: a full-access non-admin, so a test that cares about the
+    // admin class has to grant it explicitly.
+    auth_.identity =
+        identity_with("alice", {auth::kClassRead, auth::kClassWrite}, {"*"});
+  }
+
+  FakeRaftClient raft_;
+  FakeKVStore store_;
+  FakeAuthEngine auth_;
+  KVHttpHandler handler_;
+};
+
+TEST_F(AuthenticatedHandlerTest, MissingCredentialIs401WithAChallenge) {
+  auth_.outcome = auth::AuthOutcome::kNoCredentials;
+
+  const HttpResponse response = handler_.handle(request_for("GET", "/kv/k"));
+
+  EXPECT_EQ(response.status_code, 401);
+  EXPECT_EQ(HttpResponse::reason_phrase(401), "Unauthorized");
+  // RFC 9110: a 401 without WWW-Authenticate tells a client to authenticate
+  // without telling it how.
+  ASSERT_EQ(response.extra_headers.size(), 1u);
+  EXPECT_EQ(response.extra_headers[0].first, "WWW-Authenticate");
+  EXPECT_EQ(response.extra_headers[0].second, "Basic realm=\"raftkv\"");
+  // ...and it must actually reach the wire.
+  EXPECT_NE(
+      response.to_string().find("WWW-Authenticate: Basic realm=\"raftkv\""),
+      std::string::npos);
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(AuthenticatedHandlerTest, RejectedCredentialIs403WithNoChallenge) {
+  auth_.outcome = auth::AuthOutcome::kBadCredentials;
+
+  const HttpResponse response = handler_.handle(request_for("GET", "/kv/k"));
+
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_EQ(HttpResponse::reason_phrase(403), "Forbidden");
+  // No challenge: 403 is not an invitation to retry, and the same body covers
+  // unknown user / disabled user / wrong password so the endpoint cannot be
+  // used to enumerate accounts.
+  EXPECT_TRUE(response.extra_headers.empty());
+  EXPECT_NE(response.body.find("invalid credentials"), std::string::npos);
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(AuthenticatedHandlerTest, TheAuthorizationHeaderIsWhatGetsChecked) {
+  HttpRequest request = request_for("GET", "/kv/k");
+  request.headers["authorization"] = "Basic YWxpY2U6cHc=";
+  store_.set("k", "v");
+
+  handler_.handle(request);
+
+  EXPECT_EQ(auth_.calls, 1);
+  EXPECT_EQ(auth_.last_authorization, "Basic YWxpY2U6cHc=");
+}
+
+TEST_F(AuthenticatedHandlerTest, MetricsStaysOpenAndIsNeverAuthenticated) {
+  // The secure profile's Caddy proxy health-checks /metrics. Requiring a
+  // credential here drops every node out of the load-balancer rotation, so this
+  // exemption is load-bearing rather than laziness. It exposes counters and
+  // latencies, never keys or values.
+  auth_.outcome = auth::AuthOutcome::kNoCredentials;
+
+  const HttpResponse response = handler_.handle(request_for("GET", "/metrics"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(auth_.calls, 0);
+}
+
+TEST_F(AuthenticatedHandlerTest, ReadOnlyUserMayReadButNotWrite) {
+  auth_.identity = identity_with("reader", {auth::kClassRead}, {"*"});
+  store_.set("k", "v");
+
+  EXPECT_EQ(handler_.handle(request_for("GET", "/kv/k")).status_code, 200);
+  EXPECT_EQ(handler_.handle(get_request("key=k")).status_code, 200);
+
+  const HttpResponse denied = handler_.handle(request_for("PUT", "/kv/k"));
+  EXPECT_EQ(denied.status_code, 403);
+  EXPECT_NE(denied.body.find("permission denied"), std::string::npos);
+  EXPECT_EQ(handler_.handle(request_for("DELETE", "/kv/k")).status_code, 403);
+  EXPECT_EQ(handler_.handle(insert_request(KVCommand::encode_set("k", "v")))
+                .status_code,
+            403);
+  EXPECT_EQ(raft_.calls, 0) << "a denied write must not reach consensus";
+}
+
+TEST_F(AuthenticatedHandlerTest, WriteOnlyUserMayNotRead) {
+  auth_.identity = identity_with("writer", {auth::kClassWrite}, {"*"});
+  store_.set("k", "v");
+
+  EXPECT_EQ(handler_.handle(request_for("PUT", "/kv/k")).status_code, 200);
+  EXPECT_EQ(handler_.handle(request_for("GET", "/kv/k")).status_code, 403);
+  EXPECT_EQ(handler_.handle(get_request("key=k")).status_code, 403);
+}
+
+TEST_F(AuthenticatedHandlerTest, KeyPatternsAreEnforcedOnEveryDataRoute) {
+  auth_.identity =
+      identity_with("scoped", {auth::kClassRead, auth::kClassWrite}, {"app:*"});
+  store_.set("app:1", "in-scope");
+  store_.set("other:1", "out-of-scope");
+
+  EXPECT_EQ(handler_.handle(request_for("PUT", "/kv/app:1")).status_code, 200);
+  EXPECT_EQ(handler_.handle(request_for("GET", "/kv/app:1")).status_code, 200);
+
+  const HttpResponse denied =
+      handler_.handle(request_for("GET", "/kv/other:1"));
+  EXPECT_EQ(denied.status_code, 403);
+  // The out-of-scope value must not leak in the refusal body.
+  EXPECT_EQ(denied.body.find("out-of-scope"), std::string::npos);
+  EXPECT_EQ(handler_.handle(request_for("PUT", "/kv/other:1")).status_code,
+            403);
+  EXPECT_EQ(handler_.handle(request_for("DELETE", "/kv/other:1")).status_code,
+            403);
+  EXPECT_EQ(handler_.handle(get_request("key=other:1")).status_code, 403);
+}
+
+TEST_F(AuthenticatedHandlerTest, InsertValIsCheckedAgainstTheKeyInsideTheBody) {
+  // The legacy route forwards a raw command, so the ACL can only be applied by
+  // decoding the body. Without this the route is a hole straight through the
+  // key patterns.
+  auth_.identity = identity_with("scoped", {auth::kClassWrite}, {"app:*"});
+
+  EXPECT_EQ(handler_.handle(insert_request(KVCommand::encode_set("app:1", "v")))
+                .status_code,
+            200);
+  EXPECT_EQ(
+      handler_.handle(insert_request(KVCommand::encode_set("other:1", "v")))
+          .status_code,
+      403);
+  EXPECT_EQ(handler_.handle(insert_request(KVCommand::encode_delete("other:1")))
+                .status_code,
+            403);
+  EXPECT_EQ(raft_.calls, 1) << "only the in-scope write may be proposed";
+}
+
+TEST_F(AuthenticatedHandlerTest, AnUndecodableBodyIsRefusedWhenAuthIsOn) {
+  // A body naming no key cannot be checked against a key pattern, so forwarding
+  // it would be an unauthorized write to an unknown key. Auth-off keeps the old
+  // commit-then-502 behaviour; see the note on that test.
+  const HttpResponse response = handler_.handle(insert_request("not msgpack"));
+
+  EXPECT_EQ(response.status_code, 400);
+  EXPECT_NE(response.body.find("not a decodable command"), std::string::npos);
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(AuthenticatedHandlerTest, ReservedKeysAreRefusedEvenForAnAdmin) {
+  // No exemption for anyone: user records are reachable only through /auth/*,
+  // which never serializes a hash.
+  auth_.identity = identity_with(
+      "admin", {auth::kClassRead, auth::kClassWrite, auth::kClassAdmin}, {"*"});
+  store_.set("__sys:user:bob", "record");
+
+  EXPECT_EQ(
+      handler_.handle(request_for("GET", "/kv/__sys:user:bob")).status_code,
+      403);
+  EXPECT_EQ(
+      handler_.handle(request_for("PUT", "/kv/__sys:user:bob")).status_code,
+      403);
+}
+
+// --- The user-management API ----------------------------------------------
+
+class AdminHandlerTest : public AuthenticatedHandlerTest {
+protected:
+  AdminHandlerTest() {
+    auth_.identity = identity_with(
+        "admin", {auth::kClassRead, auth::kClassWrite, auth::kClassAdmin},
+        {"*"});
+  }
+};
+
+TEST_F(AuthenticatedHandlerTest, NonAdminIsRefusedTheUserManagementApi) {
+  // alice holds read+write but not admin. The classes are independent: a data
+  // account has no business creating accounts.
+  EXPECT_EQ(handler_.handle(request_for("GET", "/auth/users/bob")).status_code,
+            403);
+  EXPECT_EQ(handler_
+                .handle(msgpack_request(
+                    "PUT", "/auth/users/bob",
+                    upsert_body("bob-password", {auth::kClassRead}, {"*"})))
+                .status_code,
+            403);
+  EXPECT_EQ(
+      handler_.handle(request_for("DELETE", "/auth/users/bob")).status_code,
+      403);
+  EXPECT_EQ(raft_.calls, 0) << "a refused admin call must not reach consensus";
+}
+
+TEST_F(AuthenticatedHandlerTest, WhoamiNeedsNoClassAndReportsTheCallersAcl) {
+  auth_.identity = identity_with("scoped", {auth::kClassRead}, {"app:*"});
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/whoami"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.content_type, "application/json");
+  EXPECT_NE(response.body.find("\"name\":\"scoped\""), std::string::npos);
+  EXPECT_NE(response.body.find("\"classes\":[\"read\"]"), std::string::npos);
+  EXPECT_NE(response.body.find("\"patterns\":[\"app:*\"]"), std::string::npos);
+}
+
+TEST_F(AdminHandlerTest, PutUserProposesAUserSetCarryingAUsableRecord) {
+  const HttpResponse response = handler_.handle(msgpack_request(
+      "PUT", "/auth/users/bob",
+      upsert_body("bob-password", {auth::kClassRead}, {"app:*"})));
+
+  EXPECT_EQ(response.status_code, 200);
+  ASSERT_EQ(raft_.calls, 1);
+
+  // Decode what was actually proposed: the op, the bare name as the key, and a
+  // record whose stored hash verifies against the password that was sent.
+  const KVCommand proposed = KVCommand::from_msgpack(raft_.last_payload.data(),
+                                                     raft_.last_payload.size());
+  EXPECT_EQ(proposed.op, "USER_SET");
+  EXPECT_EQ(proposed.key, "bob");
+  const auth::UserRecord record = auth::UserRecord::from_msgpack(
+      proposed.value.data(), proposed.value.size());
+  EXPECT_EQ(record.name, "bob");
+  EXPECT_EQ(record.version, 1);
+  EXPECT_TRUE(record.enabled);
+  EXPECT_EQ(record.classes, std::vector<std::string>{auth::kClassRead});
+  EXPECT_EQ(record.patterns, std::vector<std::string>{"app:*"});
+  EXPECT_FALSE(record.validation_error().has_value());
+  EXPECT_EQ(record.pw_sha256_hex,
+            auth::hash_password(record.salt_hex, "bob-password"))
+      << "the stored hash must verify against the submitted password";
+}
+
+TEST_F(AdminHandlerTest, TheSubmittedPasswordNeverAppearsInTheProposedBytes) {
+  handler_.handle(msgpack_request("PUT", "/auth/users/bob",
+                                  upsert_body("uniquely-identifiable-password",
+                                              {auth::kClassRead}, {"*"})));
+
+  ASSERT_EQ(raft_.calls, 1);
+  // The cleartext must not reach the raft log — it is replicated to every node
+  // and written to every WAL, and log entries outlive the request by design.
+  EXPECT_EQ(raft_.last_payload.find("uniquely-identifiable-password"),
+            std::string::npos);
+}
+
+TEST_F(AdminHandlerTest, PutUserRequiresMsgpackAndAValidBody) {
+  HttpRequest not_msgpack = request_for("PUT", "/auth/users/bob");
+  not_msgpack.body = "{}";
+  EXPECT_EQ(handler_.handle(not_msgpack).status_code, 415);
+
+  EXPECT_EQ(handler_.handle(msgpack_request("PUT", "/auth/users/bob", ""))
+                .status_code,
+            400);
+  EXPECT_EQ(
+      handler_.handle(msgpack_request("PUT", "/auth/users/bob", "not msgpack"))
+          .status_code,
+      400);
+
+  // A password too short to survive an offline attack on the stored digest.
+  const HttpResponse short_password = handler_.handle(
+      msgpack_request("PUT", "/auth/users/bob",
+                      upsert_body("short", {auth::kClassRead}, {"*"})));
+  EXPECT_EQ(short_password.status_code, 400);
+  EXPECT_NE(short_password.body.find("8 bytes"), std::string::npos);
+
+  // An unknown class is a typo that would otherwise silently grant nothing.
+  EXPECT_EQ(handler_
+                .handle(msgpack_request(
+                    "PUT", "/auth/users/bob",
+                    upsert_body("bob-password", {"superuser"}, {"*"})))
+                .status_code,
+            400);
+
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(AdminHandlerTest, TheBootstrapAdminCannotBeManagedThroughTheApi) {
+  // It is defined by RAFTKV_ADMIN_PASSWORD and checked before the store, so a
+  // record under that name would be dead weight that looks like a live account.
+  const HttpResponse put = handler_.handle(msgpack_request(
+      "PUT", "/auth/users/admin",
+      upsert_body("new-admin-password", {auth::kClassAdmin}, {"*"})));
+
+  EXPECT_EQ(put.status_code, 400);
+  EXPECT_NE(put.body.find("RAFTKV_ADMIN_PASSWORD"), std::string::npos);
+  EXPECT_EQ(
+      handler_.handle(request_for("DELETE", "/auth/users/admin")).status_code,
+      400);
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(AdminHandlerTest, AnUnusableUserNameIsRejectedBeforeConsensus) {
+  for (const std::string &path :
+       {std::string("/auth/users/has%20space"),
+        std::string("/auth/users/star*"), std::string("/auth/users/")}) {
+    const HttpResponse response = handler_.handle(msgpack_request(
+        "PUT", path, upsert_body("some-password", {auth::kClassRead}, {"*"})));
+    EXPECT_EQ(response.status_code, 400) << "path " << path;
+  }
+  EXPECT_EQ(raft_.calls, 0);
+}
+
+TEST_F(AdminHandlerTest, DeleteUserProposesAUserDel) {
+  const HttpResponse response =
+      handler_.handle(request_for("DELETE", "/auth/users/bob"));
+
+  EXPECT_EQ(response.status_code, 200);
+  ASSERT_EQ(raft_.calls, 1);
+  const KVCommand proposed = KVCommand::from_msgpack(raft_.last_payload.data(),
+                                                     raft_.last_payload.size());
+  EXPECT_EQ(proposed.op, "USER_DEL");
+  EXPECT_EQ(proposed.key, "bob");
+}
+
+TEST_F(AdminHandlerTest, GetUserReturnsTheAclAndNeverTheSecret) {
+  auth::UserUpsertRequest upsert;
+  upsert.password = "bob-password";
+  upsert.classes = {auth::kClassRead};
+  upsert.patterns = {"app:*"};
+  const auth::UserRecord stored = upsert.to_record("bob");
+  store_.set(auth::user_storage_key("bob"), stored.to_msgpack());
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users/bob"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_NE(response.body.find("\"name\":\"bob\""), std::string::npos);
+  EXPECT_NE(response.body.find("\"enabled\":true"), std::string::npos);
+  EXPECT_NE(response.body.find("\"classes\":[\"read\"]"), std::string::npos);
+  EXPECT_NE(response.body.find("\"patterns\":[\"app:*\"]"), std::string::npos);
+  // THE LOAD-BEARING ASSERTION. An endpoint that returned these turns one
+  // compromised admin credential into an offline attack on every password.
+  EXPECT_EQ(response.body.find(stored.salt_hex), std::string::npos);
+  EXPECT_EQ(response.body.find(stored.pw_sha256_hex), std::string::npos);
+  EXPECT_EQ(response.body.find("salt"), std::string::npos);
+}
+
+TEST_F(AdminHandlerTest, GetUserIs404WhenThereIsNoSuchUser) {
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users/nobody"));
+
+  EXPECT_EQ(response.status_code, 404);
+  EXPECT_NE(response.body.find("user not found"), std::string::npos);
+}
+
+TEST_F(AdminHandlerTest, PatternsWithQuotesAreEscapedInTheResponse) {
+  // Pattern text is operator-supplied and reaches a hand-built JSON body; an
+  // unescaped quote produces a body no client can parse.
+  auth::UserUpsertRequest upsert;
+  upsert.password = "bob-password";
+  upsert.patterns = {"a\"b"};
+  store_.set(auth::user_storage_key("bob"),
+             upsert.to_record("bob").to_msgpack());
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users/bob"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_NE(response.body.find("a\\\"b"), std::string::npos);
+}
+
+TEST_F(AdminHandlerTest, UserRoutesUseAWrongMethodAndUnknownPathCorrectly) {
+  EXPECT_EQ(handler_.handle(request_for("POST", "/auth/users/bob")).status_code,
+            405);
+  EXPECT_EQ(handler_.handle(request_for("POST", "/auth/whoami")).status_code,
+            405);
+  EXPECT_EQ(handler_.handle(request_for("GET", "/auth/nonsense")).status_code,
+            404);
+}
+
+TEST_F(AdminHandlerTest, AdminWritesInheritTheStandardFailureVocabulary) {
+  // The admin API proposes through the same path as a data write, so a follower
+  // answers 503 naming the leader rather than inventing a new error shape.
+  raft_.result =
+      ProposeResult::failure(std::string(kNotLeaderPrefix) + "node1:8088");
+
+  const HttpResponse response = handler_.handle(
+      msgpack_request("PUT", "/auth/users/bob",
+                      upsert_body("bob-password", {auth::kClassRead}, {"*"})));
+
+  EXPECT_EQ(response.status_code, 503);
+  EXPECT_NE(response.body.find("\"leader\":\"node1:8088\""), std::string::npos);
+}
+
+// --- Metric labels --------------------------------------------------------
+
+TEST_F(AdminHandlerTest, TheUserNameNeverBecomesAMetricLabel) {
+  // Labelling by path would create one time series per user name — the same
+  // unbounded-cardinality mistake /kv/{key} avoids. Asserted through the
+  // rendered exposition, which is where it would actually show up.
+  handler_.handle(request_for("GET", "/auth/users/some-unique-user-name"));
+
+  const std::string exposition = metrics::Registry::global().render();
+  EXPECT_EQ(exposition.find("some-unique-user-name"), std::string::npos);
+  EXPECT_NE(exposition.find("/auth/users/{name}"), std::string::npos);
 }
 
 } // namespace

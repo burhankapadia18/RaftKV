@@ -20,8 +20,11 @@
 # rotation story.
 #
 # What is still NOT protected, so nobody has to discover it the hard way:
-#   - There is no client authentication. Anyone who can reach :8443 can read and
-#     write every key. The bearer token guards cluster MEMBERSHIP, not data.
+#   - Client authentication is a SEPARATE, opt-in overlay. This file gives you
+#     encryption, not identity: without docker-compose.auth.yml (and a
+#     RAFTKV_ADMIN_PASSWORD), anyone who can reach :8443 can read and write every
+#     key. The bearer token guards cluster MEMBERSHIP, not data. Compose the two
+#     overlays together for a deployment that has both.
 #   - The proxy-to-node hop is plaintext (see deploy/caddy/Caddyfile).
 #   - Certificates do not rotate. Restart a node to pick up a new one.
 
