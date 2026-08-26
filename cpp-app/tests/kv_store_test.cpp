@@ -1106,5 +1106,104 @@ TEST_F(PersistentKVStoreTest, SnapshotStateIsConsistentUnderConcurrentWrites) {
             static_cast<size_t>(kWriters) * kWritesPerWriter);
 }
 
+// --- Ordered key index (console phase) -------------------------------------
+//
+// The index holds string_views into store_'s own key strings. These tests exist
+// because a dangling view does not crash reliably -- it reads as a corrupted
+// key -- so every path that can create or destroy a map node is exercised here.
+//
+// Written against the file's existing fixture rather than a TempDir helper:
+// PersistentKVStoreTest already owns a per-test base/WAL path pair and cleans
+// both up, which is exactly what these need.
+
+TEST_F(PersistentKVStoreTest, IndexTracksInsertUpdateAndErase) {
+  PersistentKVStore store(path(), fast_options());
+
+  store.set("b", "1");
+  store.set("a", "1");
+  store.set("c", "1");
+  EXPECT_EQ(store.ordered_keys_for_test(),
+            (std::vector<std::string>{"a", "b", "c"}));
+
+  // An update must NOT double-register: insert_or_assign reuses the node.
+  store.set("b", "2");
+  EXPECT_EQ(store.ordered_keys_for_test(),
+            (std::vector<std::string>{"a", "b", "c"}));
+
+  EXPECT_TRUE(store.remove("b"));
+  EXPECT_EQ(store.ordered_keys_for_test(),
+            (std::vector<std::string>{"a", "c"}));
+
+  // Removing a key that was never there must not touch the index.
+  EXPECT_FALSE(store.remove("zz"));
+  EXPECT_EQ(store.ordered_keys_for_test(),
+            (std::vector<std::string>{"a", "c"}));
+}
+
+TEST_F(PersistentKVStoreTest, IndexIsByteTransparentlyOrdered) {
+  PersistentKVStore store(path(), fast_options());
+
+  // Keys with '=', newlines and NUL bytes round-trip and order exactly. The
+  // NUL case is the one a naive exclusive cursor would get wrong.
+  const std::string with_nul("a\0b", 3);
+  store.set("a=b", "1");
+  store.set("a\nb", "1");
+  store.set(with_nul, "1");
+  store.set("a", "1");
+
+  // Byte order: "a" < "a\0b" < "a\nb" < "a=b"  (0x00 < 0x0a < 0x3d)
+  EXPECT_EQ(store.ordered_keys_for_test(),
+            (std::vector<std::string>{"a", with_nul, "a\nb", "a=b"}));
+}
+
+TEST_F(PersistentKVStoreTest, IndexSurvivesRestoreState) {
+  PersistentKVStore store(path(), fast_options());
+  store.set("gone", "1");
+
+  StateMap replacement;
+  replacement["x"] = "1";
+  replacement["y"] = "1";
+  store.restore_state(std::move(replacement));
+
+  // A whole-map replace kills every old node, so every old view must be gone.
+  EXPECT_EQ(store.ordered_keys_for_test(),
+            (std::vector<std::string>{"x", "y"}));
+}
+
+TEST_F(PersistentKVStoreTest, IndexRebuiltFromDiskOnReopen) {
+  {
+    PersistentKVStore store(path(), fast_options());
+    store.set("k2", "1");
+    store.set("k1", "1");
+    store.set("k3", "1");
+    EXPECT_TRUE(store.remove("k2"));
+  }
+  // Reopen: base-file load plus WAL replay must both feed the index.
+  PersistentKVStore reopened(path(), fast_options());
+  EXPECT_EQ(reopened.ordered_keys_for_test(),
+            (std::vector<std::string>{"k1", "k3"}));
+}
+
+TEST_F(PersistentKVStoreTest, IndexSurvivesCompaction) {
+  DurabilityOptions options = fast_options();
+  options.wal_max_records = 4; // force several compactions
+  PersistentKVStore store(path(), options);
+
+  for (int i = 0; i < 40; ++i) {
+    store.set("k" + std::to_string(i % 7), std::to_string(i));
+  }
+  // Compaction rewrites the base file from store_ but never touches the map,
+  // so no view may move. A no-op today; pinned so it stays one.
+  EXPECT_EQ(store.ordered_keys_for_test().size(), 7u);
+}
+
+TEST_F(PersistentKVStoreTest, IndexRebuiltFromLegacyBaseFile) {
+  write_db_file("b=2\na=1\nc=3\n");
+
+  PersistentKVStore store(path(), fast_options());
+  EXPECT_EQ(store.ordered_keys_for_test(),
+            (std::vector<std::string>{"a", "b", "c"}));
+}
+
 } // namespace
 } // namespace kvdb

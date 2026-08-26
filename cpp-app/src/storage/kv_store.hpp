@@ -6,11 +6,14 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 
@@ -272,7 +275,7 @@ public:
   void set(const std::string &key, const std::string &value) override {
     std::lock_guard<std::mutex> lock(mutex_);
     wal_.append(encode_command(kOpSet, key, value));
-    store_[key] = value;
+    put_unlocked(key, value);
     maybe_compact_unlocked();
   }
 
@@ -304,7 +307,7 @@ public:
       return false;
     }
     wal_.append(encode_command(kOpDelete, key, std::string()));
-    store_.erase(key);
+    erase_unlocked(key);
     maybe_compact_unlocked();
     return true;
   }
@@ -326,6 +329,22 @@ public:
   [[nodiscard]] size_t wal_size_bytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return wal_.size_bytes();
+  }
+
+  /**
+   * @brief The index's contents, in order, as owned strings (tests only).
+   *
+   * Exists so the string_view invariant is observable. Deliberately NOT on
+   * IKVStore and deliberately O(n): production code pages through scan_keys.
+   */
+  [[nodiscard]] std::vector<std::string> ordered_keys_for_test() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> keys;
+    keys.reserve(index_.size());
+    for (const std::string_view key : index_) {
+      keys.emplace_back(key);
+    }
+    return keys;
   }
 
   /**
@@ -396,7 +415,7 @@ public:
     const std::string image = serialize_state(state);
     reset_wal_unlocked();
     write_base_unlocked(image);
-    store_ = std::move(state);
+    replace_all_unlocked(std::move(state));
   }
 
 private:
@@ -409,7 +428,88 @@ private:
   DurabilityOptions options_;
   Wal wal_;
   StateMap store_;
+
+  /**
+   * @brief Lexicographically ordered view of every key in @c store_.
+   *
+   * Holds std::string_view into the KEY STRINGS OWNED BY store_'s own nodes,
+   * so no key bytes are copied: an unordered_map node keeps its address across
+   * a rehash, which is what makes the views stable. Cost is one RB-tree node
+   * per key (48-64 bytes, independent of key length).
+   *
+   * INVARIANT, and it is a use-after-free if broken: every view in here points
+   * at a live node of store_. Exactly three helpers may mutate store_ --
+   * put_unlocked, erase_unlocked and replace_all_unlocked -- and every one of
+   * them maintains this set. Nothing else in this file may touch store_
+   * directly.
+   *
+   * Declared AFTER store_ so it is destroyed FIRST: a set of views must not
+   * outlive the strings it points at, even during teardown.
+   *
+   * Byte-transparent, like the store: std::less<std::string_view> compares via
+   * char_traits::compare, so keys containing '=', newlines or NUL bytes order
+   * exactly.
+   */
+  std::set<std::string_view> index_;
+
   mutable std::mutex mutex_;
+
+  /**
+   * @brief Insert or update one entry, keeping @c index_ in step.
+   *
+   * The view is taken from the MAP NODE'S key (@c result.first->first), never
+   * from @p key. A view of the caller's argument dangles the moment that
+   * string dies -- and would appear to work, because the bytes are usually
+   * still there.
+   *
+   * Caller must hold @c mutex_.
+   */
+  void put_unlocked(const std::string &key, const std::string &value) {
+    const auto result = store_.insert_or_assign(key, value);
+    if (result.second) {
+      // A new node was created. An update reuses the existing node, whose key
+      // is already registered, so re-inserting would be wasted work.
+      index_.insert(std::string_view(result.first->first));
+    }
+  }
+
+  /**
+   * @brief Erase one entry, keeping @c index_ in step.
+   * @return true if the key existed.
+   *
+   * The view is removed BEFORE the node dies. The reverse order leaves a
+   * dangling view in the set for as long as it takes to erase it, and the
+   * erase itself compares against it.
+   *
+   * Caller must hold @c mutex_.
+   */
+  bool erase_unlocked(const std::string &key) {
+    const auto it = store_.find(key);
+    if (it == store_.end()) {
+      return false;
+    }
+    index_.erase(std::string_view(it->first));
+    store_.erase(it);
+    return true;
+  }
+
+  /**
+   * @brief Replace the whole map, rebuilding @c index_ from scratch.
+   *
+   * Every pre-existing view is dead and every new node is unregistered, so
+   * this is a clear-and-rebuild rather than a diff. O(n log n), and it only
+   * runs on a snapshot install or a start-up load.
+   *
+   * Caller must hold @c mutex_ (the constructor's calls are the documented
+   * exception: nothing can observe the object yet).
+   */
+  void replace_all_unlocked(StateMap state) {
+    index_.clear();
+    store_ = std::move(state);
+    for (const auto &entry : store_) {
+      index_.insert(std::string_view(entry.first));
+    }
+  }
 
   /**
    * @brief Rebuild in-memory state from disk (R2.3 / R2.5).
@@ -455,7 +555,7 @@ private:
       // file whose first line happens to begin with "KVB1" - resolves the same
       // way: it fails loudly rather than loading wrong data.
       try {
-        store_ = deserialize_state(*contents);
+        replace_all_unlocked(deserialize_state(*contents));
       } catch (const std::runtime_error &error) {
         // The decoder is shared with the snapshot path and knows nothing about
         // where its bytes came from, so the path is attached here - an
@@ -491,7 +591,7 @@ private:
       if (eq_pos == std::string::npos) {
         continue;
       }
-      store_[line.substr(0, eq_pos)] = line.substr(eq_pos + 1);
+      put_unlocked(line.substr(0, eq_pos), line.substr(eq_pos + 1));
     }
   }
 
@@ -554,10 +654,12 @@ private:
 
     switch (cmd.operation_type()) {
     case Operation::SET:
-      store_[cmd.key] = cmd.value;
+      put_unlocked(cmd.key, cmd.value);
       return true;
     case Operation::DELETE:
-      store_.erase(cmd.key);
+      // The bool is discarded on purpose: replay does not care whether the key
+      // was present, and erase_unlocked is deliberately not [[nodiscard]].
+      erase_unlocked(cmd.key);
       return true;
     case Operation::USER_SET:
     case Operation::USER_DEL:
