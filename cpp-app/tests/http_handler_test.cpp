@@ -1393,5 +1393,87 @@ TEST_F(AuthenticatedHandlerTest, ClusterStatusRequiresTheReadClassOnly) {
             401);
 }
 
+// --- GET /auth/users -------------------------------------------------------
+
+TEST_F(AdminHandlerTest, UsersListReturnsNamesInOrder) {
+  // Records are planted directly in the store: this route reads key NAMES, so
+  // it must work without going anywhere near a propose.
+  store_.set(auth::user_storage_key("carol"), "record");
+  store_.set(auth::user_storage_key("alice"), "record");
+  store_.set(auth::user_storage_key("bob"), "record");
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.content_type, kJsonContentType);
+  // Names only. Usernames are charset-restricted to [A-Za-z0-9_.-] by
+  // auth::username_error, so unlike data keys they are safe raw in JSON.
+  EXPECT_EQ(response.body, "{\"users\":[\"alice\",\"bob\",\"carol\"]}");
+}
+
+TEST_F(AdminHandlerTest, UsersListNeverLeaksASaltOrAHash) {
+  // A real serialized record, so the assertion is not vacuous.
+  auth::UserUpsertRequest request;
+  request.password = "s3cret";
+  request.enabled = true;
+  request.classes = {auth::kClassRead};
+  request.patterns = {"*"};
+  store_.set(auth::user_storage_key("alice"),
+             request.to_record("alice").to_msgpack());
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body, "{\"users\":[\"alice\"]}");
+  EXPECT_EQ(response.body.find("s3cret"), std::string::npos);
+  EXPECT_EQ(response.body.find("salt"), std::string::npos);
+  EXPECT_EQ(response.body.find("hash"), std::string::npos);
+  // The route must never deserialize a UserRecord into the response at all.
+  EXPECT_EQ(response.body.find("classes"), std::string::npos);
+}
+
+TEST_F(AdminHandlerTest, UsersListOmitsTheBootstrapAdmin) {
+  // The configured admin is not a record, and PUT /auth/users/admin is already
+  // refused, so listing it would advertise an account this API cannot manage.
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body, "{\"users\":[]}");
+}
+
+TEST_F(AdminHandlerTest, UsersListIgnoresNonUserReservedKeys) {
+  // Only the user prefix is listed, not the whole reserved space: a future
+  // "__sys:" key of another kind must not turn up as a phantom account.
+  store_.set(auth::user_storage_key("alice"), "record");
+  store_.set("__sys:something-else", "value");
+
+  EXPECT_EQ(handler_.handle(request_for("GET", "/auth/users")).body,
+            "{\"users\":[\"alice\"]}");
+}
+
+TEST_F(AuthenticatedHandlerTest, UsersListRequiresTheAdminClass) {
+  auth_.identity = identity_with("reader", {auth::kClassRead}, {"*"});
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_EQ(response.body, "{\"error\":\"permission denied\"}");
+}
+
+TEST_F(AdminHandlerTest, UsersListRejectsANonGetMethod) {
+  EXPECT_EQ(handler_.handle(request_for("DELETE", "/auth/users")).status_code,
+            405);
+}
+
+TEST_F(KVHttpHandlerTest, UsersListIsClosedWhenAuthIsDisabled) {
+  // Default-closed, exactly like the rest of /auth/*: with no admin password
+  // there is no way to authenticate an administrator.
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_NE(response.body.find("RAFTKV_ADMIN_PASSWORD"), std::string::npos);
+}
+
 } // namespace
 } // namespace kvdb

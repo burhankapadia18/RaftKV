@@ -326,6 +326,9 @@ private:
     if (request.path.rfind(kKvPathPrefix, 0) == 0) {
       return request.method + " /kv/{key}";
     }
+    if (request.path == kAuthUsersPath) {
+      return request.method + " /auth/users";
+    }
     // Same reasoning as /kv/{key}: the user name must not become a label.
     if (request.path.rfind(kAuthUsersPrefix, 0) == 0) {
       return request.method + " /auth/users/{name}";
@@ -435,6 +438,9 @@ private:
 
   /** @brief Prefix of the user CRUD routes; everything after it is the name. */
   static constexpr const char *kAuthUsersPrefix = "/auth/users/";
+
+  /** @brief The user-collection route (no trailing slash). */
+  static constexpr const char *kAuthUsersPath = "/auth/users";
 
   /** @brief "Who am I, and what may I do?" */
   static constexpr const char *kWhoamiPath = "/auth/whoami";
@@ -1143,6 +1149,10 @@ private:
       return HttpResponse::json(200, body);
     }
 
+    if (request.path == kAuthUsersPath) {
+      return handle_users_list(request, identity);
+    }
+
     if (request.path.rfind(kAuthUsersPrefix, 0) != 0) {
       return HttpResponse::json_error(404, "not found");
     }
@@ -1181,6 +1191,56 @@ private:
     return HttpResponse::json_error(
         405,
         "method not allowed on /auth/users/{name}: use PUT, GET or DELETE");
+  }
+
+  /**
+   * @brief GET /auth/users — the names of every stored user.
+   *
+   * Names ONLY. This route must never deserialize a UserRecord into its
+   * response: a record carries the salt and the password hash, and the whole
+   * reason `__sys:` is unreadable through data routes is to keep those two out
+   * of any response body.
+   *
+   * The bootstrap admin is absent because it is defined by configuration rather
+   * than by a record — PUT /auth/users/admin is already refused, so listing it
+   * would advertise an account this API cannot manage.
+   *
+   * Scanning the reserved prefix is legitimate here in a way it is not on a
+   * data route: /auth/* IS the user surface, and this reads only the key names.
+   */
+  [[nodiscard]] HttpResponse
+  handle_users_list(const HttpRequest &request,
+                    const auth::AuthContext &identity) const {
+    if (request.method != "GET") {
+      return HttpResponse::json_error(
+          405, "method not allowed on /auth/users: use GET");
+    }
+    if (std::optional<HttpResponse> denied = authorize_admin(identity)) {
+      return *denied;
+    }
+
+    const std::string prefix(auth::kUserKeyPrefix);
+    std::vector<std::string> names;
+    std::string position;
+
+    // The store has no iteration API beyond scan_keys, so page through it. The
+    // page size bounds the store lock, not the response: every user is
+    // returned, because there is no cursor on this route and an admin listing
+    // that silently stopped at 500 users would be a lie.
+    for (;;) {
+      const IKVStore::KeyPage page =
+          store_.scan_keys(prefix, position, kKeyScanChunk);
+      for (const std::string &key : page.keys) {
+        position = next_position(key);
+        names.push_back(key.substr(prefix.size()));
+      }
+      if (page.reached_end) {
+        break;
+      }
+    }
+
+    return HttpResponse::json(200,
+                              "{\"users\":" + json_string_array(names) + "}");
   }
 
   /** @brief The classes @p identity holds, for a response body. */
