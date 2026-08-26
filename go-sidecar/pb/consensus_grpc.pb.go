@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	RaftNode_Propose_FullMethodName = "/consensus.RaftNode/Propose"
 	RaftNode_Read_FullMethodName    = "/consensus.RaftNode/Read"
+	RaftNode_Status_FullMethodName  = "/consensus.RaftNode/Status"
 )
 
 // RaftNodeClient is the client API for RaftNode service.
@@ -33,6 +34,12 @@ type RaftNodeClient interface {
 	// what makes the answer linearizable rather than merely recent. A follower
 	// forwards exactly once (see ReadRequest.forwarded).
 	Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error)
+	// The console phase -- this node's own view of the cluster, for the operator
+	// console's overview page. Read-only: it touches no log and needs no leader,
+	// so EVERY node answers for itself, including its own belief about who leads.
+	// That is deliberate: the page polls all three and shows three independent
+	// views, and a disagreement between them is the information.
+	Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 }
 
 type raftNodeClient struct {
@@ -63,6 +70,16 @@ func (c *raftNodeClient) Read(ctx context.Context, in *ReadRequest, opts ...grpc
 	return out, nil
 }
 
+func (c *raftNodeClient) Status(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StatusResponse)
+	err := c.cc.Invoke(ctx, RaftNode_Status_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RaftNodeServer is the server API for RaftNode service.
 // All implementations must embed UnimplementedRaftNodeServer
 // for forward compatibility.
@@ -73,6 +90,12 @@ type RaftNodeServer interface {
 	// what makes the answer linearizable rather than merely recent. A follower
 	// forwards exactly once (see ReadRequest.forwarded).
 	Read(context.Context, *ReadRequest) (*ReadResponse, error)
+	// The console phase -- this node's own view of the cluster, for the operator
+	// console's overview page. Read-only: it touches no log and needs no leader,
+	// so EVERY node answers for itself, including its own belief about who leads.
+	// That is deliberate: the page polls all three and shows three independent
+	// views, and a disagreement between them is the information.
+	Status(context.Context, *StatusRequest) (*StatusResponse, error)
 	mustEmbedUnimplementedRaftNodeServer()
 }
 
@@ -88,6 +111,9 @@ func (UnimplementedRaftNodeServer) Propose(context.Context, *Command) (*ProposeR
 }
 func (UnimplementedRaftNodeServer) Read(context.Context, *ReadRequest) (*ReadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Read not implemented")
+}
+func (UnimplementedRaftNodeServer) Status(context.Context, *StatusRequest) (*StatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Status not implemented")
 }
 func (UnimplementedRaftNodeServer) mustEmbedUnimplementedRaftNodeServer() {}
 func (UnimplementedRaftNodeServer) testEmbeddedByValue()                  {}
@@ -146,6 +172,24 @@ func _RaftNode_Read_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RaftNode_Status_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RaftNodeServer).Status(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RaftNode_Status_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RaftNodeServer).Status(ctx, req.(*StatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RaftNode_ServiceDesc is the grpc.ServiceDesc for RaftNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -160,6 +204,10 @@ var RaftNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Read",
 			Handler:    _RaftNode_Read_Handler,
+		},
+		{
+			MethodName: "Status",
+			Handler:    _RaftNode_Status_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -345,3 +345,33 @@ func (n *Node) FirstLogIndex() (uint64, error) {
 	}
 	return index, nil
 }
+
+// ID returns this node's raft server ID.
+//
+// Read from the stored config rather than from raft: raft has no accessor for
+// its own ID, and the config is the thing that decided it.
+func (n *Node) ID() string {
+	return n.config.NodeID
+}
+
+// LeaderWithID returns the current leader's raft address and server ID.
+//
+// LeaderAddr() already returns the address alone and is kept for the callers
+// that only need it; the console's overview page names the leader, so it needs
+// the ID too. Both are empty while no leader is known.
+func (n *Node) LeaderWithID() (string, string) {
+	addr, id := n.Raft.LeaderWithID()
+	return string(addr), string(id)
+}
+
+// Configuration returns the servers in the committed raft configuration.
+//
+// This is what lets the console draw every member of the cluster from a single
+// node's answer, rather than needing one reachable node per member.
+func (n *Node) Configuration() ([]raft.Server, error) {
+	future := n.Raft.GetConfiguration()
+	if err := future.Error(); err != nil {
+		return nil, fmt.Errorf("failed to read raft configuration: %w", err)
+	}
+	return future.Configuration().Servers, nil
+}

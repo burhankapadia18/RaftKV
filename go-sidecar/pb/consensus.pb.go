@@ -563,6 +563,243 @@ func (x *ApplyResponse) GetError() string {
 	return ""
 }
 
+// One member of the committed raft configuration.
+type Peer struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Id      string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Address string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	// "Voter", "Nonvoter" or "Staging", as raft spells it.
+	Suffrage      string `protobuf:"bytes,3,opt,name=suffrage,proto3" json:"suffrage,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Peer) Reset() {
+	*x = Peer{}
+	mi := &file_consensus_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Peer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Peer) ProtoMessage() {}
+
+func (x *Peer) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Peer.ProtoReflect.Descriptor instead.
+func (*Peer) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *Peer) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Peer) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *Peer) GetSuffrage() string {
+	if x != nil {
+		return x.Suffrage
+	}
+	return ""
+}
+
+// Empty today; exists so the request can gain fields without changing the
+// method signature.
+type StatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusRequest) Reset() {
+	*x = StatusRequest{}
+	mi := &file_consensus_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusRequest) ProtoMessage() {}
+
+func (x *StatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
+func (*StatusRequest) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{11}
+}
+
+type StatusResponse struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	NodeId string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	// "Leader", "Follower", "Candidate", "Shutdown" -- raft's own spelling.
+	State             string  `protobuf:"bytes,2,opt,name=state,proto3" json:"state,omitempty"`
+	Term              uint64  `protobuf:"varint,3,opt,name=term,proto3" json:"term,omitempty"`
+	LeaderId          string  `protobuf:"bytes,4,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	LeaderAddr        string  `protobuf:"bytes,5,opt,name=leader_addr,json=leaderAddr,proto3" json:"leader_addr,omitempty"`
+	Peers             []*Peer `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
+	FirstLogIndex     uint64  `protobuf:"varint,7,opt,name=first_log_index,json=firstLogIndex,proto3" json:"first_log_index,omitempty"`
+	LastLogIndex      uint64  `protobuf:"varint,8,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	AppliedIndex      uint64  `protobuf:"varint,9,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	CommitIndex       uint64  `protobuf:"varint,10,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	LastSnapshotIndex uint64  `protobuf:"varint,11,opt,name=last_snapshot_index,json=lastSnapshotIndex,proto3" json:"last_snapshot_index,omitempty"`
+	// A PARTIAL failure: the response is otherwise usable but one field could not
+	// be read (a failed log-store read, or an unreadable configuration). Empty
+	// when everything was read. A total failure is a non-OK gRPC status instead,
+	// because there is then nothing truthful to put in the fields.
+	Error         string `protobuf:"bytes,12,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusResponse) Reset() {
+	*x = StatusResponse{}
+	mi := &file_consensus_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusResponse) ProtoMessage() {}
+
+func (x *StatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_consensus_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
+func (*StatusResponse) Descriptor() ([]byte, []int) {
+	return file_consensus_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *StatusResponse) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetState() string {
+	if x != nil {
+		return x.State
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetLeaderAddr() string {
+	if x != nil {
+		return x.LeaderAddr
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetPeers() []*Peer {
+	if x != nil {
+		return x.Peers
+	}
+	return nil
+}
+
+func (x *StatusResponse) GetFirstLogIndex() uint64 {
+	if x != nil {
+		return x.FirstLogIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetLastLogIndex() uint64 {
+	if x != nil {
+		return x.LastLogIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetCommitIndex() uint64 {
+	if x != nil {
+		return x.CommitIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetLastSnapshotIndex() uint64 {
+	if x != nil {
+		return x.LastSnapshotIndex
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_consensus_proto protoreflect.FileDescriptor
 
 const file_consensus_proto_rawDesc = "" +
@@ -598,10 +835,31 @@ const file_consensus_proto_rawDesc = "" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"?\n" +
 	"\rApplyResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error2~\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"L\n" +
+	"\x04Peer\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
+	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1a\n" +
+	"\bsuffrage\x18\x03 \x01(\tR\bsuffrage\"\x0f\n" +
+	"\rStatusRequest\"\x94\x03\n" +
+	"\x0eStatusResponse\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x14\n" +
+	"\x05state\x18\x02 \x01(\tR\x05state\x12\x12\n" +
+	"\x04term\x18\x03 \x01(\x04R\x04term\x12\x1b\n" +
+	"\tleader_id\x18\x04 \x01(\tR\bleaderId\x12\x1f\n" +
+	"\vleader_addr\x18\x05 \x01(\tR\n" +
+	"leaderAddr\x12%\n" +
+	"\x05peers\x18\x06 \x03(\v2\x0f.consensus.PeerR\x05peers\x12&\n" +
+	"\x0ffirst_log_index\x18\a \x01(\x04R\rfirstLogIndex\x12$\n" +
+	"\x0elast_log_index\x18\b \x01(\x04R\flastLogIndex\x12#\n" +
+	"\rapplied_index\x18\t \x01(\x04R\fappliedIndex\x12!\n" +
+	"\fcommit_index\x18\n" +
+	" \x01(\x04R\vcommitIndex\x12.\n" +
+	"\x13last_snapshot_index\x18\v \x01(\x04R\x11lastSnapshotIndex\x12\x14\n" +
+	"\x05error\x18\f \x01(\tR\x05error2\xbd\x01\n" +
 	"\bRaftNode\x129\n" +
 	"\aPropose\x12\x12.consensus.Command\x1a\x1a.consensus.ProposeResponse\x127\n" +
-	"\x04Read\x12\x16.consensus.ReadRequest\x1a\x17.consensus.ReadResponse2\x8d\x02\n" +
+	"\x04Read\x12\x16.consensus.ReadRequest\x1a\x17.consensus.ReadResponse\x12=\n" +
+	"\x06Status\x12\x18.consensus.StatusRequest\x1a\x19.consensus.StatusResponse2\x8d\x02\n" +
 	"\fStateMachine\x125\n" +
 	"\x05Apply\x12\x12.consensus.Command\x1a\x18.consensus.ApplyResponse\x124\n" +
 	"\x03Get\x12\x15.consensus.GetRequest\x1a\x16.consensus.GetResponse\x12E\n" +
@@ -620,7 +878,7 @@ func file_consensus_proto_rawDescGZIP() []byte {
 	return file_consensus_proto_rawDescData
 }
 
-var file_consensus_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_consensus_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_consensus_proto_goTypes = []any{
 	(*SnapshotRequest)(nil), // 0: consensus.SnapshotRequest
 	(*SnapshotChunk)(nil),   // 1: consensus.SnapshotChunk
@@ -632,25 +890,31 @@ var file_consensus_proto_goTypes = []any{
 	(*GetResponse)(nil),     // 7: consensus.GetResponse
 	(*ProposeResponse)(nil), // 8: consensus.ProposeResponse
 	(*ApplyResponse)(nil),   // 9: consensus.ApplyResponse
+	(*Peer)(nil),            // 10: consensus.Peer
+	(*StatusRequest)(nil),   // 11: consensus.StatusRequest
+	(*StatusResponse)(nil),  // 12: consensus.StatusResponse
 }
 var file_consensus_proto_depIdxs = []int32{
-	3, // 0: consensus.RaftNode.Propose:input_type -> consensus.Command
-	4, // 1: consensus.RaftNode.Read:input_type -> consensus.ReadRequest
-	3, // 2: consensus.StateMachine.Apply:input_type -> consensus.Command
-	6, // 3: consensus.StateMachine.Get:input_type -> consensus.GetRequest
-	0, // 4: consensus.StateMachine.GetSnapshot:input_type -> consensus.SnapshotRequest
-	1, // 5: consensus.StateMachine.RestoreSnapshot:input_type -> consensus.SnapshotChunk
-	8, // 6: consensus.RaftNode.Propose:output_type -> consensus.ProposeResponse
-	5, // 7: consensus.RaftNode.Read:output_type -> consensus.ReadResponse
-	9, // 8: consensus.StateMachine.Apply:output_type -> consensus.ApplyResponse
-	7, // 9: consensus.StateMachine.Get:output_type -> consensus.GetResponse
-	1, // 10: consensus.StateMachine.GetSnapshot:output_type -> consensus.SnapshotChunk
-	2, // 11: consensus.StateMachine.RestoreSnapshot:output_type -> consensus.RestoreResponse
-	6, // [6:12] is the sub-list for method output_type
-	0, // [0:6] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	10, // 0: consensus.StatusResponse.peers:type_name -> consensus.Peer
+	3,  // 1: consensus.RaftNode.Propose:input_type -> consensus.Command
+	4,  // 2: consensus.RaftNode.Read:input_type -> consensus.ReadRequest
+	11, // 3: consensus.RaftNode.Status:input_type -> consensus.StatusRequest
+	3,  // 4: consensus.StateMachine.Apply:input_type -> consensus.Command
+	6,  // 5: consensus.StateMachine.Get:input_type -> consensus.GetRequest
+	0,  // 6: consensus.StateMachine.GetSnapshot:input_type -> consensus.SnapshotRequest
+	1,  // 7: consensus.StateMachine.RestoreSnapshot:input_type -> consensus.SnapshotChunk
+	8,  // 8: consensus.RaftNode.Propose:output_type -> consensus.ProposeResponse
+	5,  // 9: consensus.RaftNode.Read:output_type -> consensus.ReadResponse
+	12, // 10: consensus.RaftNode.Status:output_type -> consensus.StatusResponse
+	9,  // 11: consensus.StateMachine.Apply:output_type -> consensus.ApplyResponse
+	7,  // 12: consensus.StateMachine.Get:output_type -> consensus.GetResponse
+	1,  // 13: consensus.StateMachine.GetSnapshot:output_type -> consensus.SnapshotChunk
+	2,  // 14: consensus.StateMachine.RestoreSnapshot:output_type -> consensus.RestoreResponse
+	8,  // [8:15] is the sub-list for method output_type
+	1,  // [1:8] is the sub-list for method input_type
+	1,  // [1:1] is the sub-list for extension type_name
+	1,  // [1:1] is the sub-list for extension extendee
+	0,  // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_consensus_proto_init() }
@@ -664,7 +928,7 @@ func file_consensus_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_consensus_proto_rawDesc), len(file_consensus_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

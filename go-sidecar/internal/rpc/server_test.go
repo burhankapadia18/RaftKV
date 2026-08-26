@@ -16,7 +16,9 @@ import (
 
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"my-raft-sidecar/internal/fsm"
 	"my-raft-sidecar/internal/raftnode"
@@ -700,5 +702,183 @@ func TestReadWithNoLeaderKnown(t *testing.T) {
 	}
 	if fwd.callCount() != 0 {
 		t.Errorf("tried to forward to an empty address (%d calls)", fwd.callCount())
+	}
+}
+
+// --- Status ----------------------------------------------------------------
+
+// Compile-time proof that the real Raft node satisfies the status interface.
+//
+// Lives in the TEST file, like the RaftProposer check above and like
+// management's RaftControl check: putting it in raftnode would make raftnode
+// import rpc and invert the dependency RaftStatusReporter exists to break.
+var _ RaftStatusReporter = (*raftnode.Node)(nil)
+
+// fakeStatusReporter is a scriptable RaftStatusReporter.
+//
+// Every method is read-only and every test calls Status from the test
+// goroutine, so unlike fakeProposer this needs no lock.
+type fakeStatusReporter struct {
+	id       string
+	stats    map[string]string
+	addr     string
+	leaderID string
+	servers  []raft.Server
+	firstIdx uint64
+	firstErr error
+	confErr  error
+}
+
+func (f *fakeStatusReporter) ID() string { return f.id }
+
+func (f *fakeStatusReporter) Stats() map[string]string { return f.stats }
+
+func (f *fakeStatusReporter) LeaderWithID() (string, string) {
+	return f.addr, f.leaderID
+}
+
+func (f *fakeStatusReporter) Configuration() ([]raft.Server, error) {
+	return f.servers, f.confErr
+}
+
+func (f *fakeStatusReporter) FirstLogIndex() (uint64, error) {
+	return f.firstIdx, f.firstErr
+}
+
+// newStatusReporter is a healthy leader, so each test perturbs exactly one
+// thing rather than assembling a whole cluster state.
+func newStatusReporter() *fakeStatusReporter {
+	return &fakeStatusReporter{
+		id: "node1",
+		stats: map[string]string{
+			"state":               "Leader",
+			"term":                "4",
+			"last_log_index":      "118",
+			"applied_index":       "118",
+			"commit_index":        "118",
+			"last_snapshot_index": "0",
+		},
+		addr:     "node1:8088",
+		leaderID: "node1",
+		servers: []raft.Server{
+			{ID: "node1", Address: "node1:8088", Suffrage: raft.Voter},
+			{ID: "node2", Address: "node2:8088", Suffrage: raft.Voter},
+		},
+		firstIdx: 1,
+	}
+}
+
+func TestStatusReportsRaftState(t *testing.T) {
+	reporter := newStatusReporter()
+	server := NewServer(nil, nil).WithStatusReporter(reporter)
+
+	resp, err := server.Status(context.Background(), &pb.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status returned error: %v", err)
+	}
+
+	if resp.NodeId != "node1" || resp.State != "Leader" || resp.Term != 4 {
+		t.Errorf("identity/state wrong: %+v", resp)
+	}
+	if resp.LeaderId != "node1" || resp.LeaderAddr != "node1:8088" {
+		t.Errorf("leader wrong: %+v", resp)
+	}
+	if resp.FirstLogIndex != 1 || resp.LastLogIndex != 118 ||
+		resp.AppliedIndex != 118 || resp.CommitIndex != 118 {
+		t.Errorf("indices wrong: %+v", resp)
+	}
+	if len(resp.Peers) != 2 {
+		t.Fatalf("want 2 peers, got %d", len(resp.Peers))
+	}
+	if resp.Peers[1].Id != "node2" || resp.Peers[1].Address != "node2:8088" ||
+		resp.Peers[1].Suffrage != "Voter" {
+		t.Errorf("peer wrong: %+v", resp.Peers[1])
+	}
+	if resp.Error != "" {
+		t.Errorf("want no partial error, got %q", resp.Error)
+	}
+}
+
+func TestStatusSurvivesAFailedLogStoreRead(t *testing.T) {
+	reporter := newStatusReporter()
+	reporter.firstErr = errors.New("boltdb is unhappy")
+
+	server := NewServer(nil, nil).WithStatusReporter(reporter)
+	resp, err := server.Status(context.Background(), &pb.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status must keep answering when one field fails: %v", err)
+	}
+	// Partial failure is a FIELD, not a status: the console needs the rest of
+	// the response, and the same reasoning already governs /status's
+	// log_store_error.
+	if resp.FirstLogIndex != 0 {
+		t.Errorf("want first_log_index 0 on a failed read, got %d",
+			resp.FirstLogIndex)
+	}
+	if resp.Error == "" {
+		t.Error("want the partial failure reported in Error")
+	}
+	if resp.LastLogIndex != 118 {
+		t.Errorf("the readable fields must survive: %+v", resp)
+	}
+	// A failure in one field must not blank another that read fine.
+	if len(resp.Peers) != 2 {
+		t.Errorf("want the peer list intact, got %d peers", len(resp.Peers))
+	}
+}
+
+func TestStatusSurvivesAnUnreadableConfiguration(t *testing.T) {
+	reporter := newStatusReporter()
+	reporter.confErr = errors.New("configuration future failed")
+
+	server := NewServer(nil, nil).WithStatusReporter(reporter)
+	resp, err := server.Status(context.Background(), &pb.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status returned error: %v", err)
+	}
+	if len(resp.Peers) != 0 {
+		t.Errorf("want no peers when the configuration is unreadable, got %d",
+			len(resp.Peers))
+	}
+	if resp.Error == "" {
+		t.Error("want the partial failure reported in Error")
+	}
+	if resp.FirstLogIndex != 1 {
+		t.Errorf("the readable fields must survive: %+v", resp)
+	}
+}
+
+func TestStatusTreatsAnUnparseableCounterAsZero(t *testing.T) {
+	reporter := newStatusReporter()
+	// Raft reports counters as strings; a missing or junk one is not worth
+	// failing a whole status response over.
+	delete(reporter.stats, "commit_index")
+	reporter.stats["term"] = "not-a-number"
+
+	server := NewServer(nil, nil).WithStatusReporter(reporter)
+	resp, err := server.Status(context.Background(), &pb.StatusRequest{})
+	if err != nil {
+		t.Fatalf("Status returned error: %v", err)
+	}
+	if resp.Term != 0 || resp.CommitIndex != 0 {
+		t.Errorf("want 0 for unreadable counters, got %+v", resp)
+	}
+	if resp.LastLogIndex != 118 {
+		t.Errorf("the parseable counters must survive: %+v", resp)
+	}
+}
+
+func TestStatusWithoutAReporterIsUnimplemented(t *testing.T) {
+	server := NewServer(nil, nil)
+
+	_, err := server.Status(context.Background(), &pb.StatusRequest{})
+	if err == nil {
+		t.Fatal("want an error when no reporter was supplied")
+	}
+	// A total failure has nothing truthful to put in the fields, so it is a
+	// gRPC status rather than a zero-valued response that reads as a cluster
+	// which has lost quorum.
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("want Unimplemented, got %v", status.Code(err))
 	}
 }

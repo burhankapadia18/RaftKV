@@ -8,11 +8,14 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/raft"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"my-raft-sidecar/internal/metrics"
 	pb "my-raft-sidecar/pb"
@@ -130,6 +133,29 @@ type LocalReader interface {
 	Get(ctx context.Context, key string) (found bool, value []byte, err error)
 }
 
+// RaftStatusReporter exposes this node's own raft state for RaftNode.Status.
+//
+// Consumer-side, like RaftProposer and LocalReader, so internal/rpc still does
+// not import internal/raftnode. []raft.Server is a third-party type both
+// packages already depend on, not a project type, so using it here does not
+// invert the dependency this interface exists to keep pointing one way.
+type RaftStatusReporter interface {
+	// ID is this node's raft server ID.
+	ID() string
+	// Stats is raft's own counter map, keyed as hashicorp/raft keys it
+	// ("state", "term", "last_log_index", "applied_index", "commit_index",
+	// "last_snapshot_index").
+	Stats() map[string]string
+	// LeaderWithID returns the leader's raft address and server ID; both are
+	// empty while no leader is known.
+	LeaderWithID() (addr string, id string)
+	// Configuration returns the committed cluster membership.
+	Configuration() ([]raft.Server, error)
+	// FirstLogIndex is where the log now begins -- the only direct evidence
+	// that compaction happened.
+	FirstLogIndex() (uint64, error)
+}
+
 // ProposeForwarder relays a proposal to the leader on a follower's behalf.
 // *Forwarder satisfies it; kept as an interface so the handler can be tested
 // without a real peer.
@@ -140,11 +166,12 @@ type ProposeForwarder interface {
 // Server represents the gRPC server for Raft operations.
 type Server struct {
 	pb.UnimplementedRaftNodeServer
-	node       RaftProposer
-	forwarder  ProposeForwarder
-	reader     LocalReader
-	grpcServer *grpc.Server
-	listener   net.Listener
+	node           RaftProposer
+	forwarder      ProposeForwarder
+	reader         LocalReader
+	statusReporter RaftStatusReporter
+	grpcServer     *grpc.Server
+	listener       net.Listener
 }
 
 // NewServer creates a new gRPC server for the Raft node.
@@ -170,6 +197,89 @@ func NewServer(node RaftProposer, forwarder ProposeForwarder) *Server {
 func (s *Server) WithLocalReader(reader LocalReader) *Server {
 	s.reader = reader
 	return s
+}
+
+// WithStatusReporter supplies the raft state RaftNode.Status reports.
+//
+// Separate from NewServer for the same reason WithLocalReader is: Status is
+// optional, and without it the RPC answers Unimplemented rather than a
+// zero-valued response that would render as a cluster with no peers and no
+// leader. Propose -- the path every prior phase depends on -- is untouched.
+func (s *Server) WithStatusReporter(reporter RaftStatusReporter) *Server {
+	s.statusReporter = reporter
+	return s
+}
+
+// Status reports this node's own view of the cluster (console phase).
+//
+// Needs no leader and no log access, so every node answers for itself. A field
+// that cannot be read is reported in StatusResponse.error while the rest of the
+// response stands -- the same choice management's /status already makes for
+// log_store_error, and for the same reason: the readiness and dashboard callers
+// need the other fields more than they need a 500.
+func (s *Server) Status(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
+	if s.statusReporter == nil {
+		return nil, status.Error(codes.Unimplemented,
+			"this sidecar was built without a status reporter")
+	}
+
+	reporter := s.statusReporter
+	stats := reporter.Stats()
+	leaderAddr, leaderID := reporter.LeaderWithID()
+
+	resp := &pb.StatusResponse{
+		NodeId:            reporter.ID(),
+		State:             stats["state"],
+		Term:              parseRaftStat(stats, "term"),
+		LeaderId:          leaderID,
+		LeaderAddr:        leaderAddr,
+		LastLogIndex:      parseRaftStat(stats, "last_log_index"),
+		AppliedIndex:      parseRaftStat(stats, "applied_index"),
+		CommitIndex:       parseRaftStat(stats, "commit_index"),
+		LastSnapshotIndex: parseRaftStat(stats, "last_snapshot_index"),
+	}
+
+	// Partial failures accumulate into one field rather than short-circuiting:
+	// a console that can show the log indices but not the peer list is more
+	// useful than an error.
+	var partial []string
+
+	firstIndex, err := reporter.FirstLogIndex()
+	if err != nil {
+		partial = append(partial, err.Error())
+	} else {
+		resp.FirstLogIndex = firstIndex
+	}
+
+	servers, err := reporter.Configuration()
+	if err != nil {
+		partial = append(partial, err.Error())
+	} else {
+		resp.Peers = make([]*pb.Peer, 0, len(servers))
+		for _, server := range servers {
+			resp.Peers = append(resp.Peers, &pb.Peer{
+				Id:       string(server.ID),
+				Address:  string(server.Address),
+				Suffrage: server.Suffrage.String(),
+			})
+		}
+	}
+
+	resp.Error = strings.Join(partial, "; ")
+	return resp, nil
+}
+
+// parseRaftStat reads one decimal counter out of raft's Stats() map.
+//
+// Raft reports them as strings and a missing or unparseable entry is not worth
+// failing a whole status response over, so it reads as 0. The keys are raft's,
+// not ours; see RaftStatusReporter.Stats.
+func parseRaftStat(stats map[string]string, key string) uint64 {
+	value, err := strconv.ParseUint(stats[key], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return value
 }
 
 // Read serves a linearizable read (R4.5).

@@ -12,6 +12,13 @@ service RaftNode {
   // what makes the answer linearizable rather than merely recent. A follower
   // forwards exactly once (see ReadRequest.forwarded).
   rpc Read(ReadRequest) returns (ReadResponse);
+
+  // The console phase -- this node's own view of the cluster, for the operator
+  // console's overview page. Read-only: it touches no log and needs no leader,
+  // so EVERY node answers for itself, including its own belief about who leads.
+  // That is deliberate: the page polls all three and shows three independent
+  // views, and a disagreement between them is the information.
+  rpc Status(StatusRequest) returns (StatusResponse);
 }
 
 service StateMachine {
@@ -105,4 +112,38 @@ message ApplyResponse {
   // New tag — old binaries simply do not set it, and old raft log entries
   // replay unchanged (see .claude/rules/protobuf.md).
   string error = 2;
+}
+
+// One member of the committed raft configuration.
+message Peer {
+  string id = 1;
+  string address = 2;
+  // "Voter", "Nonvoter" or "Staging", as raft spells it.
+  string suffrage = 3;
+}
+
+// Empty today; exists so the request can gain fields without changing the
+// method signature.
+message StatusRequest {}
+
+message StatusResponse {
+  string node_id = 1;
+  // "Leader", "Follower", "Candidate", "Shutdown" -- raft's own spelling.
+  string state = 2;
+  uint64 term = 3;
+  string leader_id = 4;
+  string leader_addr = 5;
+  repeated Peer peers = 6;
+
+  uint64 first_log_index = 7;
+  uint64 last_log_index = 8;
+  uint64 applied_index = 9;
+  uint64 commit_index = 10;
+  uint64 last_snapshot_index = 11;
+
+  // A PARTIAL failure: the response is otherwise usable but one field could not
+  // be read (a failed log-store read, or an unreadable configuration). Empty
+  // when everything was read. A total failure is a non-OK gRPC status instead,
+  // because there is then nothing truthful to put in the fields.
+  string error = 12;
 }
