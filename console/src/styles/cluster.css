@@ -335,3 +335,31 @@
   clip-path: inset(50%);
   white-space: nowrap;
 }
+
+.row-actions {
+  display: flex;
+  gap: var(--space-hair);
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-hair);
+}
+
+.user-form {
+  max-width: 34rem;
+  margin-top: var(--space-section);
+}
+
+.user-form fieldset {
+  margin: 0 0 var(--space-snug);
+  padding: 0;
+  border: 0;
+}
+
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: var(--space-tight);
+}

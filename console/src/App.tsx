@@ -7,6 +7,7 @@ import { clearCredential, loadCredential } from './lib/auth';
 import type { ClusterStatus } from './lib/api';
 import { ClusterPage } from './pages/ClusterPage';
 import { KeysPage } from './pages/KeysPage';
+import { UsersPage } from './pages/UsersPage';
 import './styles/cluster.css';
 
 const ROUTES = [
@@ -89,7 +90,7 @@ export function App() {
         )}
         {route === 'keys' && <KeysPage onUnauthorized={onUnauthorized} />}
         {route === 'users' && (
-          <p class="page-note">User management arrives in the next task.</p>
+          <UsersPage authEnabled={authEnabled} onUnauthorized={onUnauthorized} />
         )}
       </main>
     </div>
