@@ -253,7 +253,7 @@ client reaches. Do not "harmonise" them.
 | Success | `200` | `{"keys":[…],"next_cursor":"…"}`, cursor absent at end of range |
 | `limit` absent | `200` | default 100 |
 | `limit` above 500 | `200` | clamped to 500, not rejected — a cap is not a client error |
-| `limit` not a non-negative integer | `400` | `{"error":"limit must be a non-negative integer"}` |
+| `limit` not an integer in `1..500` | `400` | `{"error":"limit must be an integer between 1 and 500"}` |
 | malformed percent-encoding in `prefix` or `cursor` | `400` | `{"error":"malformed percent-encoding in the query string"}` |
 | `prefix` under the reserved space | `403` | the existing `__sys:` reserved-prefix body |
 | `prefix` outside the caller's key patterns | `403` | `{"error":"prefix must fall within your permitted key patterns"}` |
