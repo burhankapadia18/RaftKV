@@ -141,7 +141,10 @@ int main(int argc, char *argv[]) {
     // out of main instead of leaving a node serving requests it cannot
     // authenticate. Failing to start beats falling back to open.
     auth::AuthEngine auth_engine(store, config.auth);
-    KVHttpHandler handler(*raft_client, store, auth_engine);
+    // `store` is passed twice on purpose: PersistentKVStore implements both
+    // IKVStore (storage) and IStoreStats (counters), and the handler holds each
+    // behind its own interface so a test can fake them independently.
+    KVHttpHandler handler(*raft_client, store, auth_engine, store);
     HttpServer http_server(config.http_port, std::move(handler), config.limits);
 
     // 6. R5.9: hand shutdown to the waiter thread. Everything it touches —

@@ -150,6 +150,30 @@ inline constexpr size_t kStateMinEntrySize = 8;
 }
 
 /**
+ * @brief Observability seam over a store: counters, not storage semantics.
+ *
+ * Deliberately SEPARATE from IKVStore. key_count() and wal_size_bytes() were
+ * kept off IKVStore on purpose -- widening the storage interface for
+ * observability forces every test fake to implement it -- and that decision
+ * still holds. What changed is that the HTTP handler is now a consumer of these
+ * counters (GET /cluster/status), and it holds interfaces, not the concrete
+ * store. So they get their own seam rather than moving.
+ *
+ * PersistentKVStore implements both interfaces; main.cpp holds the concrete
+ * type and injects it twice, once per interface.
+ */
+class IStoreStats {
+public:
+  virtual ~IStoreStats() = default;
+
+  /** @brief Keys currently held in the local store. */
+  [[nodiscard]] virtual std::size_t key_count() const = 0;
+
+  /** @brief Current size of the write-ahead log, in bytes. */
+  [[nodiscard]] virtual std::size_t wal_size_bytes() const = 0;
+};
+
+/**
  * @brief Abstract interface for key-value storage.
  *
  * Follows the Interface Segregation Principle - defines only
@@ -259,7 +283,7 @@ public:
  * The constructor calls the same helpers without the lock, which is safe
  * because no other thread can reach the object before construction returns.
  */
-class PersistentKVStore : public IKVStore {
+class PersistentKVStore : public IKVStore, public IStoreStats {
 public:
   /**
    * @brief Open the store at @p db_path and recover its contents.
@@ -350,16 +374,17 @@ public:
    *
    * Deliberately NOT on IKVStore: it exists for observability, and widening the
    * storage interface for it would force every test fake to implement it too.
-   * main.cpp holds the concrete type, which is all the metrics registration
-   * needs.
+   * It IS on IStoreStats, which is that same reasoning taken one step further
+   * -- a separate seam for the HTTP handler, which holds interfaces rather than
+   * the concrete store. main.cpp holds the concrete type and injects both.
    */
-  [[nodiscard]] size_t key_count() const {
+  [[nodiscard]] size_t key_count() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     return store_.size();
   }
 
   /** @brief Current WAL size in bytes (R5.4 gauge). */
-  [[nodiscard]] size_t wal_size_bytes() const {
+  [[nodiscard]] size_t wal_size_bytes() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     return wal_.size_bytes();
   }

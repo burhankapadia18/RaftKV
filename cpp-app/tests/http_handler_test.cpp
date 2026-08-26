@@ -63,9 +63,35 @@ public:
   std::string last_payload;
   int calls = 0;
 
+  /** @brief Scriptable cluster status (console phase). */
+  [[nodiscard]] StatusResult status() override {
+    ++status_calls;
+    return status_result;
+  }
+
   ReadResult read_result = ReadResult::miss();
   std::string last_read_key;
   int read_calls = 0;
+
+  StatusResult status_result;
+  int status_calls = 0;
+};
+
+/**
+ * @brief In-memory IStoreStats double.
+ *
+ * Separate from FakeKVStore on purpose: IStoreStats is its own seam, so a test
+ * can drive the counters without touching the storage fake at all.
+ */
+class FakeStoreStats : public IStoreStats {
+public:
+  std::size_t keys = 0;
+  std::size_t wal_bytes = 0;
+
+  [[nodiscard]] std::size_t key_count() const override { return keys; }
+  [[nodiscard]] std::size_t wal_size_bytes() const override {
+    return wal_bytes;
+  }
 };
 
 /** @brief In-memory IKVStore double - no file, no locking. */
@@ -186,11 +212,14 @@ public:
 
 class KVHttpHandlerTest : public ::testing::Test {
 protected:
-  KVHttpHandlerTest() : handler_(raft_, store_, auth_) {}
+  // `stats_` is a separate object from `store_` because IStoreStats is its own
+  // seam; in production PersistentKVStore is passed twice, once per interface.
+  KVHttpHandlerTest() : handler_(raft_, store_, auth_, stats_) {}
 
   FakeRaftClient raft_;
   FakeKVStore store_;
   FakeAuthEngine auth_;
+  FakeStoreStats stats_;
   KVHttpHandler handler_;
 };
 
@@ -696,7 +725,7 @@ TEST_F(KVHttpHandlerTest, TheAuthenticatorIsNotEvenConsultedWhenDisabled) {
 
 class AuthenticatedHandlerTest : public ::testing::Test {
 protected:
-  AuthenticatedHandlerTest() : handler_(raft_, store_, auth_) {
+  AuthenticatedHandlerTest() : handler_(raft_, store_, auth_, stats_) {
     auth_.enabled_flag = true;
     // Default caller: a full-access non-admin, so a test that cares about the
     // admin class has to grant it explicitly.
@@ -707,6 +736,7 @@ protected:
   FakeRaftClient raft_;
   FakeKVStore store_;
   FakeAuthEngine auth_;
+  FakeStoreStats stats_;
   KVHttpHandler handler_;
 };
 
@@ -1235,6 +1265,132 @@ TEST_F(AuthenticatedHandlerTest,
 
   // And an unrestricted scan is refused for the same reason.
   EXPECT_EQ(handler_.handle(list_request("")).status_code, 403);
+}
+
+// --- GET /cluster/status ---------------------------------------------------
+
+namespace {
+
+/** @brief A StatusResult the sidecar answered successfully. */
+StatusResult healthy_status() {
+  StatusResult status;
+  status.ok = true;
+  status.node_id = "node1";
+  status.state = "Leader";
+  return status;
+}
+
+} // namespace
+
+TEST_F(KVHttpHandlerTest, ClusterStatusRendersRaftAndLocalState) {
+  raft_.status_result = StatusResult{};
+  raft_.status_result.ok = true;
+  raft_.status_result.node_id = "node1";
+  raft_.status_result.state = "Leader";
+  raft_.status_result.term = 4;
+  raft_.status_result.leader_id = "node1";
+  raft_.status_result.leader_addr = "node1:8088";
+  raft_.status_result.first_log_index = 1;
+  raft_.status_result.last_log_index = 118;
+  raft_.status_result.applied_index = 117;
+  raft_.status_result.commit_index = 118;
+  raft_.status_result.last_snapshot_index = 0;
+  raft_.status_result.peers = {RaftPeer{"node1", "node1:8088", "Voter"},
+                               RaftPeer{"node2", "node2:8088", "Voter"}};
+  stats_.keys = 42;
+  stats_.wal_bytes = 9310;
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.content_type, kJsonContentType);
+  EXPECT_EQ(response.body,
+            "{\"node_id\":\"node1\",\"state\":\"Leader\",\"term\":4,"
+            "\"leader_id\":\"node1\",\"leader_addr\":\"node1:8088\","
+            "\"peers\":["
+            "{\"id\":\"node1\",\"address\":\"node1:8088\","
+            "\"suffrage\":\"Voter\"},"
+            "{\"id\":\"node2\",\"address\":\"node2:8088\","
+            "\"suffrage\":\"Voter\"}],"
+            "\"first_log_index\":1,\"last_log_index\":118,"
+            "\"applied_index\":117,\"commit_index\":118,"
+            "\"last_snapshot_index\":0,"
+            "\"key_count\":42,\"wal_bytes\":9310,"
+            "\"auth_enabled\":false}");
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusIs502WhenTheSidecarIsUnreachable) {
+  raft_.status_result = StatusResult::failure("sidecar unreachable");
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+
+  // 502, not 200-with-zeros. A dashboard rendering "term 0, no peers, not
+  // leader" for a node whose sidecar is merely unreachable looks exactly like
+  // a cluster that has lost quorum, which is worse than an error.
+  EXPECT_EQ(response.status_code, 502);
+  EXPECT_EQ(response.body, "{\"error\":\"sidecar unreachable\"}");
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusReportsAPartialFailure) {
+  raft_.status_result = healthy_status();
+  raft_.status_result.state = "Follower";
+  raft_.status_result.partial_error = "failed to read first log index";
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_NE(response.body.find("\"error\":\"failed to read first log index\""),
+            std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusOmitsTheErrorFieldWhenHealthy) {
+  raft_.status_result = healthy_status();
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body.find("\"error\""), std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusRejectsANonGetMethod) {
+  raft_.status_result = healthy_status();
+
+  const HttpResponse response =
+      handler_.handle(request_for("POST", "/cluster/status"));
+  EXPECT_EQ(response.status_code, 405);
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusReportsAuthEnabled) {
+  // The console shows an "unauthenticated" banner off this field, so it must
+  // reflect the engine's real configuration rather than the request.
+  raft_.status_result = healthy_status();
+  EXPECT_NE(handler_.handle(request_for("GET", "/cluster/status"))
+                .body.find("\"auth_enabled\":false"),
+            std::string::npos);
+}
+
+TEST_F(AuthenticatedHandlerTest, ClusterStatusRequiresTheReadClassOnly) {
+  // read-class, no key pattern check: it addresses no key, and requiring admin
+  // would hide the overview page from the users most likely to open it.
+  raft_.status_result = healthy_status();
+
+  auth_.identity = identity_with("reader", {auth::kClassRead}, {"nothing:*"});
+  EXPECT_EQ(handler_.handle(request_for("GET", "/cluster/status")).status_code,
+            200);
+  // ...and it reports auth as ON, unlike the fixture above.
+  EXPECT_NE(handler_.handle(request_for("GET", "/cluster/status"))
+                .body.find("\"auth_enabled\":true"),
+            std::string::npos);
+
+  auth_.identity = identity_with("writer", {auth::kClassWrite}, {"*"});
+  EXPECT_EQ(handler_.handle(request_for("GET", "/cluster/status")).status_code,
+            403);
+
+  auth_.outcome = auth::AuthOutcome::kNoCredentials;
+  EXPECT_EQ(handler_.handle(request_for("GET", "/cluster/status")).status_code,
+            401);
 }
 
 } // namespace

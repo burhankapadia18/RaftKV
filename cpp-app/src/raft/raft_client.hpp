@@ -1,9 +1,11 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "consensus.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
@@ -67,6 +69,51 @@ struct ReadResult {
   }
 };
 
+/** @brief One member of the committed raft configuration. */
+struct RaftPeer {
+  std::string id;
+  std::string address;
+  std::string suffrage;
+};
+
+/**
+ * @brief Outcome of a cluster-status query.
+ *
+ * @c ok distinguishes "the sidecar answered" from "it did not". The numeric
+ * fields are only meaningful when @c ok is true: a zero-valued status renders
+ * as a cluster with no peers and no leader, which is indistinguishable from a
+ * real loss of quorum, so a failed call must never be dressed up as one.
+ *
+ * @c partial_error is different: the sidecar answered, but one field inside it
+ * could not be read. The rest of the response stands.
+ */
+struct StatusResult {
+  bool ok = false;
+  std::string error;
+
+  std::string node_id;
+  std::string state;
+  std::string leader_id;
+  std::string leader_addr;
+  std::string partial_error;
+
+  std::uint64_t term = 0;
+  std::uint64_t first_log_index = 0;
+  std::uint64_t last_log_index = 0;
+  std::uint64_t applied_index = 0;
+  std::uint64_t commit_index = 0;
+  std::uint64_t last_snapshot_index = 0;
+
+  std::vector<RaftPeer> peers;
+
+  [[nodiscard]] static StatusResult failure(std::string reason) {
+    StatusResult result;
+    result.ok = false;
+    result.error = std::move(reason);
+    return result;
+  }
+};
+
 /**
  * @brief Abstract interface for Raft consensus client.
  *
@@ -94,6 +141,15 @@ public:
    * directly, which is what `consistency=local` does and may be stale.
    */
   virtual ReadResult read(const std::string &key) = 0;
+
+  /**
+   * @brief This node's own view of the cluster, for the operator console.
+   *
+   * Read-only and leader-free: the sidecar answers for itself and does not
+   * forward, so a follower's answer is its own state (including its own belief
+   * about who leads) rather than the leader's.
+   */
+  [[nodiscard]] virtual StatusResult status() = 0;
 };
 
 /**
@@ -193,6 +249,45 @@ public:
     return ReadResult::hit(reply.value());
   }
 
+  /**
+   * @brief Ask the sidecar for its own view of the cluster.
+   *
+   * No forwarding and no leader requirement: whichever node is asked answers
+   * for itself, which is what makes the console's overview honest.
+   */
+  [[nodiscard]] StatusResult status() override {
+    consensus::StatusRequest request;
+    consensus::StatusResponse reply;
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + kStatusTimeout);
+
+    const grpc::Status grpc_status = stub_->Status(&context, request, &reply);
+    if (!grpc_status.ok()) {
+      return StatusResult::failure(grpc_failure_reason(grpc_status));
+    }
+
+    StatusResult result;
+    result.ok = true;
+    result.node_id = reply.node_id();
+    result.state = reply.state();
+    result.leader_id = reply.leader_id();
+    result.leader_addr = reply.leader_addr();
+    result.partial_error = reply.error();
+    result.term = reply.term();
+    result.first_log_index = reply.first_log_index();
+    result.last_log_index = reply.last_log_index();
+    result.applied_index = reply.applied_index();
+    result.commit_index = reply.commit_index();
+    result.last_snapshot_index = reply.last_snapshot_index();
+    result.peers.reserve(static_cast<size_t>(reply.peers_size()));
+    for (const consensus::Peer &peer : reply.peers()) {
+      result.peers.push_back(
+          RaftPeer{peer.id(), peer.address(), peer.suffrage()});
+    }
+    return result;
+  }
+
 private:
   std::unique_ptr<consensus::RaftNode::Stub> stub_;
 
@@ -203,6 +298,15 @@ private:
   // no bound on the sidecar side, so DEADLINE_EXCEEDED here is still reachable
   // and ProposeResult carries it as such.
   static constexpr std::chrono::seconds kDefaultTimeout{5};
+
+  /**
+   * @brief Deadline for a status query.
+   *
+   * Shorter than the propose deadline on purpose: this backs an interactive
+   * page that polls, so a hung sidecar must surface as an error quickly rather
+   * than stacking requests up behind a five-second wait.
+   */
+  static constexpr std::chrono::seconds kStatusTimeout{2};
 
   /**
    * @brief Render a failed gRPC status as "<CODE_NAME>: <message>".

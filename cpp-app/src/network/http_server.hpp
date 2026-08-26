@@ -271,10 +271,14 @@ public:
    * @param auth Authenticator. Injected behind IAuthEngine like the other two
    *             dependencies, so the handler's routing and status codes can be
    *             tested without a store or a cluster.
+   * @param stats Local store counters, behind their own seam rather than on
+   *              IKVStore -- see IStoreStats. In production this is the SAME
+   *              object as @p store; the two interfaces are separate so a test
+   *              can fake them independently.
    */
   KVHttpHandler(IRaftClient &raft_client, const IKVStore &store,
-                const auth::IAuthEngine &auth)
-      : raft_client_(raft_client), store_(store), auth_(auth) {}
+                const auth::IAuthEngine &auth, const IStoreStats &stats)
+      : raft_client_(raft_client), store_(store), auth_(auth), stats_(stats) {}
 
   /**
    * @brief Handle an HTTP request and return a response.
@@ -326,8 +330,9 @@ private:
     if (request.path.rfind(kAuthUsersPrefix, 0) == 0) {
       return request.method + " /auth/users/{name}";
     }
-    if (request.path == kWhoamiPath || request.path == "/insert-val" ||
-        request.path == "/get-val" || request.path == "/metrics") {
+    if (request.path == kWhoamiPath || request.path == kClusterStatusPath ||
+        request.path == "/insert-val" || request.path == "/get-val" ||
+        request.path == "/metrics") {
       return request.method + " " + request.path;
     }
     return "other";
@@ -379,6 +384,10 @@ public:
       return handle_auth(request, identity);
     }
 
+    if (request.path == kClusterStatusPath) {
+      return handle_cluster_status(request, identity);
+    }
+
     // The list surface. Checked before /kv/{key}: the prefixes cannot collide
     // ("/kv" has no trailing slash, kKvPathPrefix does), but the order makes
     // that obvious rather than incidental.
@@ -416,6 +425,7 @@ private:
   IRaftClient &raft_client_;
   const IKVStore &store_;
   const auth::IAuthEngine &auth_;
+  const IStoreStats &stats_;
 
   /** @brief Prefix of the REST surface; everything after it is the key. */
   static constexpr const char *kKvPathPrefix = "/kv/";
@@ -431,6 +441,9 @@ private:
 
   /** @brief The key-listing route. No trailing slash — see kKvPathPrefix. */
   static constexpr const char *kKvListPath = "/kv";
+
+  /** @brief The cluster overview route. */
+  static constexpr const char *kClusterStatusPath = "/cluster/status";
 
   /** @brief Default page size for GET /kv. */
   static constexpr size_t kKeyListDefaultLimit = 100;
@@ -705,6 +718,69 @@ private:
     std::string body = "{\"keys\":" + json_percent_array(emitted);
     if (!exhausted) {
       body += ",\"next_cursor\":\"" + percent_encode(position) + "\"";
+    }
+    body += "}";
+    return HttpResponse::json(200, body);
+  }
+
+  /**
+   * @brief GET /cluster/status — this node's view of the cluster.
+   *
+   * Requires the READ class and applies NO key-pattern check, because it
+   * addresses no key. That is a judgment call: cluster topology is not user
+   * data, the management API on :6000 is separately token-gated, and requiring
+   * admin would hide the overview page from exactly the users most likely to
+   * open it.
+   *
+   * key_count / wal_bytes / auth_enabled are local to this process and cost no
+   * gRPC hop; everything else comes from the sidecar.
+   */
+  [[nodiscard]] HttpResponse
+  handle_cluster_status(const HttpRequest &request,
+                        const auth::AuthContext &identity) const {
+    if (request.method != "GET") {
+      return HttpResponse::json_error(
+          405, "method not allowed on /cluster/status: use GET");
+    }
+    if (!identity.has_class(auth::CommandClass::kRead)) {
+      return HttpResponse::json_error(403, "permission denied");
+    }
+
+    const StatusResult status = raft_client_.status();
+    if (!status.ok) {
+      // 502, never 200-with-zeros: see StatusResult's comment.
+      return HttpResponse::json_error(502, status.error);
+    }
+
+    std::string body = "{";
+    body += "\"node_id\":\"" + json_escape(status.node_id) + "\"";
+    body += ",\"state\":\"" + json_escape(status.state) + "\"";
+    body += ",\"term\":" + std::to_string(status.term);
+    body += ",\"leader_id\":\"" + json_escape(status.leader_id) + "\"";
+    body += ",\"leader_addr\":\"" + json_escape(status.leader_addr) + "\"";
+    body += ",\"peers\":[";
+    for (size_t i = 0; i < status.peers.size(); ++i) {
+      if (i != 0) {
+        body += ",";
+      }
+      const RaftPeer &peer = status.peers[i];
+      body += "{\"id\":\"" + json_escape(peer.id) + "\"";
+      body += ",\"address\":\"" + json_escape(peer.address) + "\"";
+      body += ",\"suffrage\":\"" + json_escape(peer.suffrage) + "\"}";
+    }
+    body += "]";
+    body += ",\"first_log_index\":" + std::to_string(status.first_log_index);
+    body += ",\"last_log_index\":" + std::to_string(status.last_log_index);
+    body += ",\"applied_index\":" + std::to_string(status.applied_index);
+    body += ",\"commit_index\":" + std::to_string(status.commit_index);
+    body += ",\"last_snapshot_index\":" +
+            std::to_string(status.last_snapshot_index);
+    body += ",\"key_count\":" + std::to_string(stats_.key_count());
+    body += ",\"wal_bytes\":" + std::to_string(stats_.wal_size_bytes());
+    body += ",\"auth_enabled\":";
+    body += auth_.enabled() ? "true" : "false";
+    if (!status.partial_error.empty()) {
+      body += ",\"error\":\"" + json_escape(status.partial_error) + "\"";
     }
     body += "}";
     return HttpResponse::json(200, body);
