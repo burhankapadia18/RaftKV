@@ -123,6 +123,32 @@ set(KVDB_HEADERS
     src/network/http_server.hpp
 )
 
+# --- 5b. Console assets (embedded at build time) ---
+#
+# Defaults to OFF until console/ exists; Task 9 flips it to ON. The header is
+# generated in BOTH configurations -- empty when off -- so the HTTP handler
+# needs no preprocessor branch and the test build compiles identically.
+
+option(KVDB_CONSOLE "Embed the built management console into kvdb_node" OFF)
+
+set(KVDB_CONSOLE_DIST "${CMAKE_CURRENT_SOURCE_DIR}/../console/dist"
+    CACHE PATH "Built console assets (Vite dist/) to embed")
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenerateConsoleAssets.cmake)
+
+set(KVDB_CONSOLE_HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/console")
+file(MAKE_DIRECTORY "${KVDB_CONSOLE_HEADER_DIR}")
+
+if(KVDB_CONSOLE)
+    kvdb_generate_console_assets(
+        "${KVDB_CONSOLE_HEADER_DIR}/console_assets_generated.hpp"
+        "${KVDB_CONSOLE_DIST}")
+else()
+    kvdb_generate_console_assets(
+        "${KVDB_CONSOLE_HEADER_DIR}/console_assets_generated.hpp"
+        "")
+endif()
+
 # --- 6. Build Executable ---
 
 add_executable(kvdb_node ${KVDB_SOURCES} ${KVDB_HEADERS})
@@ -130,6 +156,7 @@ add_executable(kvdb_node ${KVDB_SOURCES} ${KVDB_HEADERS})
 target_include_directories(kvdb_node PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${PROTO_BINARY_DIR}
+    ${KVDB_CONSOLE_HEADER_DIR}
 )
 
 target_link_libraries(kvdb_node PRIVATE
@@ -212,6 +239,7 @@ if(KVDB_BUILD_TESTS)
     target_include_directories(kvdb_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${PROTO_BINARY_DIR}
+        ${KVDB_CONSOLE_HEADER_DIR}
     )
 
     # Phase 1 links consensus_proto: StateMachineService::Apply and

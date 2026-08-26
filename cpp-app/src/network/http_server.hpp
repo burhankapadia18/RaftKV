@@ -24,7 +24,9 @@
 #include "../config/config.hpp"
 #include "../raft/raft_client.hpp"
 #include "../storage/kv_store.hpp"
+#include "console_assets_generated.hpp"
 #include "http_request.hpp"
+#include "static_assets.hpp"
 #include "thread_pool.hpp"
 
 namespace kvdb {
@@ -168,6 +170,10 @@ struct HttpResponse {
       return "OK";
     case 201:
       return "Created";
+    case 302:
+      return "Found";
+    case 304:
+      return "Not Modified";
     case 400:
       return "Bad Request";
     case 401:
@@ -320,6 +326,12 @@ private:
    * Unrecognized paths collapse to "other" for the same reason.
    */
   [[nodiscard]] static std::string route_label(const HttpRequest &request) {
+    // ONE label for every asset. Labelling per file would create a time series
+    // per asset -- the same unbounded-cardinality mistake that keeps the key
+    // out of /kv/{key}.
+    if (request.path.rfind(kConsolePathPrefix, 0) == 0) {
+      return request.method + " /console/*";
+    }
     if (request.path == kKvListPath) {
       return request.method + " /kv";
     }
@@ -358,6 +370,23 @@ public:
       // being explicit is what makes promtool happy.
       response.content_type = "text/plain; version=0.0.4; charset=utf-8";
       return response;
+    }
+
+    // The console's static bytes, OUTSIDE the authentication gate.
+    //
+    // A deliberate exception to authenticate-once-before-any-route, and the
+    // only one besides /metrics. It is safe for a narrow reason: these are
+    // compile-time constants containing no keys, no values and no
+    // configuration. Every API call the loaded page then makes goes through the
+    // gate normally -- and a page that needed a credential to LOAD could not
+    // render a login form.
+    if (request.path.rfind(kConsolePathPrefix, 0) == 0) {
+      return handle_console(request);
+    }
+    if (request.method == "GET" && request.path == "/") {
+      HttpResponse redirect = HttpResponse::json(302, "{\"ok\":true}");
+      redirect.extra_headers.emplace_back("Location", kConsoleIndexPath);
+      return redirect;
     }
 
     // AUTHENTICATE ONCE, here, for every route below. Doing it per-handler is
@@ -450,6 +479,68 @@ private:
 
   /** @brief The cluster overview route. */
   static constexpr const char *kClusterStatusPath = "/cluster/status";
+
+  /** @brief Prefix of the embedded console. */
+  static constexpr const char *kConsolePathPrefix = "/console/";
+
+  /** @brief Where "/" sends a browser. */
+  static constexpr const char *kConsoleIndexPath = "/console/";
+
+  /**
+   * @brief Serve one embedded console asset.
+   *
+   * Cache policy: index.html revalidates (its URL never changes, so a
+   * no-cache + ETag pair makes a revisit a 304 with no body), while
+   * content-hashed assets are immutable for a year.
+   *
+   * Every header value here is a compile-time constant or a build-time hash,
+   * which is what makes them safe in extra_headers -- that list is not
+   * validated for CRLF, so nothing attacker-influenced may go into one.
+   */
+  [[nodiscard]] static HttpResponse handle_console(const HttpRequest &request) {
+    if (request.method != "GET") {
+      return HttpResponse::json_error(
+          405, "method not allowed on /console/: use GET");
+    }
+
+    const StaticAsset *asset =
+        find_static_asset(kConsoleAssets, kConsoleAssetCount, request.path);
+    if (asset == nullptr) {
+      if (kConsoleAssetCount == 0) {
+        return HttpResponse::json_error(404,
+                                        "console not built into this binary");
+      }
+      return HttpResponse::json_error(404, "not found");
+    }
+
+    const StaticAssetPick pick =
+        pick_static_asset(*asset, request.header("accept-encoding"),
+                          request.header("if-none-match"));
+
+    HttpResponse response;
+    response.status_code = pick.not_modified ? 304 : 200;
+    response.content_type = asset->content_type;
+    if (!pick.not_modified) {
+      response.body.assign(reinterpret_cast<const char *>(pick.bytes),
+                           pick.size);
+      if (pick.gzipped) {
+        response.extra_headers.emplace_back("Content-Encoding", "gzip");
+      }
+    }
+
+    response.extra_headers.emplace_back("ETag", asset->etag);
+    response.extra_headers.emplace_back(
+        "Cache-Control", asset->immutable_cache
+                             ? "public, max-age=31536000, immutable"
+                             : "no-cache");
+    response.extra_headers.emplace_back("X-Content-Type-Options", "nosniff");
+    response.extra_headers.emplace_back("Referrer-Policy", "no-referrer");
+    response.extra_headers.emplace_back(
+        "Content-Security-Policy",
+        "default-src 'self'; object-src 'none'; base-uri 'none'; "
+        "frame-ancestors 'none'");
+    return response;
+  }
 
   /** @brief Default page size for GET /kv. */
   static constexpr size_t kKeyListDefaultLimit = 100;

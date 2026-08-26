@@ -1475,5 +1475,88 @@ TEST_F(KVHttpHandlerTest, UsersListIsClosedWhenAuthIsDisabled) {
   EXPECT_NE(response.body.find("RAFTKV_ADMIN_PASSWORD"), std::string::npos);
 }
 
+// --- Console static routes -------------------------------------------------
+//
+// The C++ test build has no Node, so the generated asset table is EMPTY here.
+// That is the KVDB_CONSOLE=OFF shape and it is a real deployment mode, so it
+// gets a real contract rather than being untested. The populated table is
+// exercised end-to-end instead (tests/e2e/test_console.py).
+
+namespace {
+
+/** @brief The value of one response header, or "" when absent. */
+std::string header_of(const HttpResponse &response, const std::string &name) {
+  for (const auto &header : response.extra_headers) {
+    if (header.first == name) {
+      return header.second;
+    }
+  }
+  return std::string();
+}
+
+} // namespace
+
+TEST_F(KVHttpHandlerTest, RootRedirectsToTheConsole) {
+  const HttpResponse response = handler_.handle(request_for("GET", "/"));
+
+  EXPECT_EQ(response.status_code, 302);
+  EXPECT_EQ(HttpResponse::reason_phrase(302), "Found");
+  EXPECT_EQ(header_of(response, "Location"), "/console/");
+  // ...and it must actually reach the wire.
+  EXPECT_NE(response.to_string().find("Location: /console/"),
+            std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, ConsolePathIs404WhenNotBuiltIn) {
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/console/"));
+  EXPECT_EQ(response.status_code, 404);
+  // An answer, not a mystery: an operator hitting this needs to know the
+  // binary was configured without the console, not that they mistyped.
+  EXPECT_EQ(response.body,
+            "{\"error\":\"console not built into this binary\"}");
+}
+
+TEST_F(KVHttpHandlerTest, ConsoleAssetPathIs404WhenNotBuiltIn) {
+  EXPECT_EQ(handler_.handle(request_for("GET", "/console/assets/app-abc123.js"))
+                .status_code,
+            404);
+}
+
+TEST_F(AuthenticatedHandlerTest, ConsoleRoutesSkipTheAuthenticationGate) {
+  // Deliberate exception to authenticate-once-before-any-route: these bytes
+  // are compile-time constants holding no cluster state, and a page that
+  // needed a credential to LOAD could not render a login form.
+  //
+  // With an empty table that is observable as 404-not-401.
+  auth_.outcome = auth::AuthOutcome::kNoCredentials;
+
+  EXPECT_EQ(handler_.handle(request_for("GET", "/console/")).status_code, 404);
+  // And the redirect must not demand a credential either.
+  EXPECT_EQ(handler_.handle(request_for("GET", "/")).status_code, 302);
+
+  // The engine never even consulted the authenticator for these two.
+  EXPECT_EQ(auth_.calls, 0);
+
+  // Contrast: an API route on the same server still demands one.
+  EXPECT_EQ(handler_.handle(request_for("GET", "/kv/k")).status_code, 401);
+}
+
+TEST_F(KVHttpHandlerTest, ConsoleRejectsANonGetMethod) {
+  EXPECT_EQ(handler_.handle(request_for("POST", "/console/")).status_code, 405);
+}
+
+TEST_F(KVHttpHandlerTest, ConsolePathsCollapseToOneMetricLabel) {
+  // ONE label for every asset. Labelling per file would create a time series
+  // per asset -- the same unbounded-cardinality mistake that keeps the key out
+  // of /kv/{key}. Asserted through the rendered exposition, which is where it
+  // would actually show up.
+  handler_.handle(request_for("GET", "/console/assets/app-unique-hash.js"));
+
+  const std::string exposition = metrics::Registry::global().render();
+  EXPECT_EQ(exposition.find("app-unique-hash"), std::string::npos);
+  EXPECT_NE(exposition.find("/console/*"), std::string::npos);
+}
+
 } // namespace
 } // namespace kvdb
