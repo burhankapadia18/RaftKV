@@ -1,0 +1,289 @@
+/* Layout is bento-ish rather than a uniform card grid: the node card is a wide
+   plane of figures, the member table is a dense list, and they are separated by
+   a rule instead of a shadow. */
+
+.page {
+  margin-top: var(--space-loose);
+}
+
+.page-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-snug);
+}
+
+.page-title {
+  margin: 0;
+  font-size: var(--text-title);
+  font-weight: 620;
+  letter-spacing: -0.015em;
+}
+
+.page-actions {
+  display: flex;
+  gap: var(--space-tight);
+  margin-left: auto;
+}
+
+.page-note {
+  margin: var(--space-hair) 0 var(--space-base);
+  color: var(--color-text-muted);
+  font-size: var(--text-label);
+}
+
+.section-title {
+  margin: var(--space-loose) 0 var(--space-tight);
+  padding-bottom: var(--space-hair);
+  border-bottom: 1px solid var(--color-rule);
+  font-size: var(--text-label);
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.node-grid {
+  display: grid;
+  gap: var(--space-base);
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+}
+
+.node-card {
+  padding: var(--space-snug) var(--space-base) var(--space-base);
+  border: 1px solid var(--color-rule);
+  /* The state colour enters as a left edge, not a fill: one semantic stripe
+     reads at a glance without turning the card into a status badge. */
+  border-left: 3px solid var(--color-rule-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+}
+
+.node-card.is-leader {
+  border-left-color: var(--color-leader);
+}
+.node-card.is-follower {
+  border-left-color: var(--color-follower);
+}
+.node-card.is-candidate {
+  border-left-color: var(--color-candidate);
+}
+.node-card.is-unreachable {
+  border-left-color: var(--color-danger);
+}
+
+.node-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-tight);
+  margin-bottom: var(--space-snug);
+}
+
+.node-card-title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+.state-chip {
+  padding: 0 var(--space-hair);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  font-size: var(--text-micro);
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.state-chip.is-leader {
+  background: color-mix(in oklab, var(--color-leader) 16%, transparent);
+  color: var(--color-leader);
+}
+.state-chip.is-follower {
+  background: color-mix(in oklab, var(--color-follower) 16%, transparent);
+  color: var(--color-follower);
+}
+.state-chip.is-candidate {
+  background: color-mix(in oklab, var(--color-candidate) 20%, transparent);
+  color: var(--color-candidate);
+}
+.state-chip.is-danger {
+  background: color-mix(in oklab, var(--color-danger) 16%, transparent);
+  color: var(--color-danger);
+}
+
+.stat-grid {
+  display: grid;
+  gap: var(--space-snug) var(--space-base);
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+}
+
+.stat-pair {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.stat-label {
+  color: var(--color-text-muted);
+  font-size: var(--text-micro);
+  font-weight: 620;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.stat-value {
+  font-size: var(--text-figure);
+  font-weight: 500;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.stat-value.is-danger {
+  color: var(--color-danger);
+}
+
+.stat-note {
+  color: var(--color-text-muted);
+  font-size: var(--text-micro);
+}
+
+.node-card-foot {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-tight);
+  margin-top: var(--space-base);
+  padding-top: var(--space-tight);
+  border-top: 1px solid var(--color-rule);
+}
+
+/* Wide content scrolls inside its own container; the page body never scrolls
+   horizontally. */
+.table-scroll {
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-body);
+}
+
+.data-table th {
+  padding: var(--space-hair) var(--space-tight);
+  border-bottom: 1px solid var(--color-rule-strong);
+  color: var(--color-text-muted);
+  font-size: var(--text-micro);
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: var(--space-tight);
+  border-bottom: 1px solid var(--color-rule);
+  vertical-align: top;
+}
+
+.data-table tbody tr {
+  transition: background-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.data-table tbody tr:hover {
+  background: var(--color-surface-sunken);
+}
+
+.button {
+  padding: var(--space-hair) var(--space-snug);
+  border: 1px solid var(--color-rule-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  font: inherit;
+  font-size: var(--text-label);
+  font-weight: 560;
+  cursor: pointer;
+  transition:
+    transform var(--duration-fast) var(--ease-out-expo),
+    background-color var(--duration-fast) var(--ease-out-expo),
+    border-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.button:hover {
+  background: var(--color-surface-sunken);
+  border-color: var(--color-text-muted);
+}
+
+/* Compositor-friendly only: transform, never a size or margin change. */
+.button:active {
+  transform: translateY(1px);
+}
+
+.button.is-primary {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-surface-raised);
+}
+
+.button.is-danger {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
+.button[aria-pressed='true'] {
+  border-color: var(--color-text);
+  background: var(--color-text);
+  color: var(--color-surface-raised);
+}
+
+.login {
+  max-width: 22rem;
+  margin: var(--space-section) auto;
+  padding: var(--space-base);
+  border: 1px solid var(--color-rule);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+}
+
+.login-title {
+  margin: 0 0 var(--space-snug);
+  font-size: var(--text-title);
+  font-weight: 620;
+}
+
+.field {
+  display: block;
+  margin-bottom: var(--space-snug);
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--color-text-muted);
+  font-size: var(--text-micro);
+  font-weight: 620;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.field-input,
+.field-textarea {
+  width: 100%;
+  padding: var(--space-hair) var(--space-tight);
+  border: 1px solid var(--color-rule-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+}
+
+.field-textarea {
+  min-height: 8rem;
+  resize: vertical;
+}
