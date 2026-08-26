@@ -82,11 +82,12 @@ Use `docker compose` (the CLI plugin), not the standalone `docker-compose` binar
 There are three test layers, all of which must stay green:
 
 1. **Go unit tests** (`go-sidecar/internal/*/*_test.go`) — `internal/fsm`, `internal/config`, `internal/cluster`, `internal/management`, `internal/backend`, `internal/rpc`, `internal/peers`, `internal/raftnode`, `internal/tlsconfig`, run with `go test -race ./...`. `cmd/sidecar`, `internal/logging` and `internal/metrics` have no tests. `internal/testcerts` is a **non-test package imported only by tests** — Go has no other way to share a cert generator across packages; it lives under `internal/` and nothing outside a `_test.go` imports it. It deliberately does not import `internal/tlsconfig`, because `tlsconfig`'s own in-package tests would then be an import cycle.
-2. **C++ unit tests** (`cpp-app/tests/*.cpp`, GoogleTest via CTest) — `KVCommand::from_msgpack`, `PersistentKVStore`, `HttpRequestParser`, `StateMachineService::Apply`, `KVHttpHandler`, and the auth layer (`auth_primitives_test` for SHA-256/base64/glob, `user_record_test`, `auth_engine_test`). Built only when `-DKVDB_BUILD_TESTS=ON`; uses the system GoogleTest when present, otherwise fetches it. Also run under `-fsanitize=address,undefined` in CI. Test sources are **listed explicitly** in `CMakeLists.txt`, not globbed — a new test file is a visible diff.
+2. **C++ unit tests** (`cpp-app/tests/*.cpp`, GoogleTest via CTest) — `KVCommand::from_msgpack`, `PersistentKVStore`, `HttpRequestParser`, `StateMachineService::Apply`, `KVHttpHandler`, and the auth layer (`auth_primitives_test` for SHA-256/base64/glob, `user_record_test`, `auth_engine_test`), plus `static_assets_test` for the embedded-console lookup. Built only when `-DKVDB_BUILD_TESTS=ON`; uses the system GoogleTest when present, otherwise fetches it. Also run under `-fsanitize=address,undefined` in CI. Test sources are **listed explicitly** in `CMakeLists.txt`, not globbed — a new test file is a visible diff.
 3. **End-to-end** (`tests/e2e/`, pytest) — asserts that a write on the leader is readable on **all three** nodes, DELETE round-trips, and the full HTTP status-code contract (404 on a miss, 503 naming the leader on a follower write, 415/400 on bad requests, and a regression test proving a malformed `Content-Length` no longer kills a node). Requires a live cluster; exits 1 with a "cluster does not look ready" message if there isn't one. These tests never start, stop or build anything with docker — the compose lifecycle belongs to CI and to the `cluster-smoke-test` skill.
    - `tests/e2e/test_security.py` (Phase 6) runs in the default suite: the request caps (413/431, plus a burst that proves the rejection path does not leak), and cluster-membership auth. Its load-bearing assertion is not a status code — it is that `last_log_index` does **not** move after a refused `/join`, because middleware that returned 403 *after* calling `AddVoter` would pass a status-code-only test and leave the cluster compromised.
    - `tests/e2e/test_secure_profile.py` (Phase 6) carries the `requires_secure` marker: it needs the cluster brought up with `docker-compose.secure.yml` and a CA in `./certs`, and skips otherwise. It checks the properties only a deployment has — plaintext refused on the raft port, a client certificate actually required there, HTTPS management, and that the plaintext client ports are **not** published (compose concatenates `ports` across files rather than replacing, so `!override` is required and was missed the first time).
    - `tests/e2e/test_auth.py` carries the `requires_auth` marker: it needs the cluster brought up with `docker-compose.auth.yml` and the **same** `RAFTKV_ADMIN_PASSWORD` exported, and skips otherwise. Its headline assertion is that a user created through the leader becomes usable on **all three** nodes (polled, not slept) — a user record is a raft entry, so that is the only check covering propose -> replicate -> apply -> the follower's own authenticator reading it back. It also asserts what a status code alone would miss: that a refused privilege escalation created no user, and that a refused write left the old value in place. The auth-OFF rules that hold unconditionally live in `test_security.py` instead, so they run in the default suite.
+   - `tests/e2e/test_console.py` runs in the default suite. Its load-bearing assertion is that a key written on the leader appears in `GET /kv` on **all three** nodes (polled, not slept) — the only check covering propose -> replicate -> apply -> the follower's own ordered index reading it back; a unit test can only prove `scan_keys` walks a `std::set`. It also pins the embedded-asset contract (ETag/304, gzip negotiation, immutable hashed assets, a real 404 for an unknown path). The asset cases *skip* when the binary was built with `-DKVDB_CONSOLE=OFF`, whose 404 contract the C++ unit tests pin instead.
    - `tests/e2e/test_crash.py` is the deliberate exception (Phase 2): it SIGKILLs a follower, restarts it, and asserts the acknowledged writes were already on that node's disk *while it was dead* — the only way to tell durability from raft log replay, since restarts replay the whole log. It carries the `requires_docker` marker and is deselected by `addopts` so the default run stays docker-free; it *skips* (never fails) when docker, the compose project or a local cluster is unavailable.
 
 `test_client.py` is retained only as a manual one-shot demo — it asserts nothing and checks a single node. Use `pytest tests/e2e` for verification. If you add tests, follow [.claude/rules/testing.md](.claude/rules/testing.md).
@@ -120,6 +121,43 @@ Important consequences:
 - The exact HTTP status/body for every path is tabulated in [README.md](README.md#api-reference) and mirrored as constants in `tests/e2e/contracts.py`. Change the handler and both of those in the same commit.
 - Startup order matters: the C++ app must be up before the sidecar connects. `entrypoint.sh` probes `/dev/tcp/127.0.0.1/50051` in a bounded loop (`APP_WAIT_TIMEOUT`, default 30s) before launching the sidecar, and `backend.Connect` additionally waits for the gRPC channel to reach `Ready` with its own retry budget. See `entrypoint.sh` for launch order and the CLI args of both binaries.
 
+**Console surface.** Three JSON routes back the browser console: `GET /kv`
+(paginated key names, `read` class), `GET /cluster/status` (this node's own raft
+view via the unary `RaftNode.Status` RPC, `read` class, no key-pattern check),
+and `GET /auth/users` (names only, `admin` class). Four rules that are auth or
+correctness boundaries rather than details:
+
+- **Listed keys and cursors are percent-encoded.** Keys are arbitrary bytes; a
+  JSON string is Unicode text. `json_escape()` does not save this — it passes
+  bytes >= 0x20 through, which is right for UTF-8 and wrong for arbitrary bytes.
+- **`scan_keys` takes an INCLUSIVE start position.** An exclusive cursor cannot
+  express "resume past a whole range", which is how the reserved `__sys:` space
+  is skipped in one `lower_bound` so a reserved key is never examined and can
+  never surface in a listing or a cursor. Do not "simplify" it to an exclusive
+  after-key.
+- **The `/kv` page is cut AFTER filtering**, so the returned position always
+  derives from an emitted key. A caller whose patterns are not `*` must scan
+  inside its own allowance (403 otherwise) — that rule is what stops a
+  filtered-out key name reaching the cursor.
+- **`std::set<std::string_view> index_` holds views into `store_`'s own key
+  strings.** Exactly three helpers — `put_unlocked`, `erase_unlocked`,
+  `replace_all_unlocked` — may touch `store_`, and each maintains the index. An
+  insert registers a view of the *map node's* key, never of the caller's
+  argument; a view of the argument dangles and still appears to work. Nothing
+  else in `kv_store.hpp` may mutate `store_` directly.
+
+The console's static bytes are served **outside** the authenticate-once gate —
+the only exception besides `/metrics`. Safe because they are compile-time
+constants holding no cluster state, and necessary because a page needing a
+credential to load cannot render a login form.
+
+`PUT /auth/users/{name}` takes **msgpack**, not JSON, and always requires a
+password of at least 8 bytes: an upsert mints a fresh salt and hash every time,
+so there is no partial update and no "leave the password alone" request. The
+console's `putUser` encodes that map with a small hand-rolled encoder
+(`console/src/lib/msgpack.ts`) rather than adding a dependency whose bytes would
+land in `.rodata`.
+
 ### Storage on disk (Phase 2)
 
 `PersistentKVStore` keeps two files in `DATA_DIR`, and the split is the durability argument:
@@ -141,7 +179,7 @@ Consequences worth knowing before touching this code:
 | Concern | C++ (`cpp-app/src/`) | Go (`go-sidecar/internal/`) |
 |---|---|---|
 | Config / CLI args | `config/config.hpp` (positional args) | `config/config.go` (flags) |
-| Client-facing API | `network/http_server.hpp` (hand-rolled HTTP over sockets) | `management/server.go` (`/join`, `/status`, `/health` on :6000) |
+| Client-facing API | `network/http_server.hpp` (hand-rolled HTTP over sockets), `network/static_assets.hpp` + the generated `console_assets_generated.hpp` (embedded console at `/console/`) | `management/server.go` (`/join`, `/status`, `/health` on :6000) |
 | Consensus glue | `raft/raft_client.hpp` (propose), `raft/state_machine.hpp` (apply) | `rpc/server.go` (propose), `fsm/fsm.go` (apply) |
 | Storage | `storage/kv_store.hpp` (map + recovery), `storage/wal.hpp` (append/replay/heal), `storage/atomic_file.hpp` (fsync + rename), `storage/format.hpp` (length-prefix + CRC32) | `raftnode/node.go` (BoltDB raft log in `DATA_DIR/logs.dat`) |
 | Cluster membership | — | `cluster/joiner.go` (retry-join via leader's mgmt API) |
@@ -208,4 +246,5 @@ Phase 0 removed none of these — it **pinned** them with tests that assert the 
 - **Writes are at-least-once under failure**: a 503 does not mean the write did not happen. `rpc.Server.Propose` returns `unavailable:` (→ 503) when *forwarding* to the leader fails as a transport matter, and the leader may already have committed the entry. There are no idempotency tokens and no compare-and-set, so a retrying client gets at-least-once. Safe for the idempotent PUT/DELETE surface; not safe as a base for read-modify-write. Found by the chaos harness assuming the opposite — see the `UNKNOWN_OUTCOME_STATUSES` comment in `tests/chaos/load.py`. Do not "tighten" the 503 documentation back to "nothing was lost".
 - **No client SDK**: clients speak HTTP and MsgPack directly and must implement their own retry policy around the 502/503 distinction. The distinction is documented and stable; the retrying is not done for them.
 - **No bounded-staleness read**: the only choices are a local read (unbounded staleness) and a full barrier + quorum check. There is nothing in between, such as "no older than 100ms".
+- **The console shows one node's view, not a fanned-out cluster view**: it polls the node that served it, which answers `/cluster/status` locally and includes the committed peer list. It cannot poll sibling nodes directly, because a served page cannot know their browser-reachable URLs (published host ports are a compose detail, and the secure profile puts one proxy address in front of all three). Open the console on each node to compare views.
 - **Client TLS is proxy-terminated**, so the proxy-to-node hop is plaintext and the proxy belongs on the same host as the node. Native TLS in the C++ server was considered and rejected for 1.0; see [docs/architecture.md](docs/architecture.md#security-model).
