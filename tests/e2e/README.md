@@ -20,6 +20,17 @@ Asserting replacement for `test_client.py`. Five families of test:
   and a refused escalation leaves nothing behind. Opt-in, and needs a cluster
   started with `docker-compose.auth.yml`; see
   [The client-auth module](#the-client-auth-module).
+- **Console** (`test_console.py`) — the management console and the three routes
+  behind it. Runs in the **default** suite. It is the only layer that can prove
+  three things at once: that the assets CMake embedded are really reachable over
+  HTTP (with their ETag, gzip and cache-control contract), that the real
+  `RaftNode.Status` RPC answers on every node, and — the load-bearing one — that
+  a key written on the leader appears in `GET /kv` on **all three** nodes. That
+  last assertion is the only check covering propose → replicate → apply → the
+  follower's own ordered index reading it back; a unit test can only prove that
+  `scan_keys` walks a `std::set`. The asset cases *skip* (never fail) when the
+  binary was built with `-DKVDB_CONSOLE=OFF`, which is a real deployment mode
+  whose 404 contract the C++ unit tests pin instead.
 
 ## The cluster must already be running
 

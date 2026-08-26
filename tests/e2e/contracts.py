@@ -172,3 +172,40 @@ MAX_HEADER_BYTES = 32 * 1024
 #: emphatically *not* the node's HTTP base URL, and it is empty while no leader
 #: is known, which is why the tests match a shape instead of a literal.
 RAFT_ADDRESS_RE = re.compile(r"^[^\s:]+:[0-9]+$")
+
+# Console surface -----------------------------------------------------------
+#
+# Copied from cpp-app/src/network/http_server.hpp. The handler, the README
+# tables and this file change in the same commit -- that is a standing rule in
+# this repository, not a nicety.
+
+#: Where "/" redirects, and where the console's index.html is served.
+CONSOLE_INDEX_PATH = "/console/"
+
+#: index.html's Content-Type. Hashed assets carry their own types.
+CONSOLE_HTML_CONTENT_TYPE = "text/html; charset=utf-8"
+
+#: Answered when the binary was configured with -DKVDB_CONSOLE=OFF. An answer
+#: rather than a mystery: the operator needs to know it was a build choice.
+CONSOLE_NOT_BUILT_ERROR = "console not built into this binary"
+
+#: Paginated key listing. NOTE the absent trailing slash -- "/kv/" is still the
+#: single-key route and still answers 400 for an empty key.
+KV_LIST_PATH = "/kv"
+
+#: This node's own view of the cluster.
+CLUSTER_STATUS_PATH = "/cluster/status"
+
+#: User names, admin only.
+AUTH_USERS_PATH = "/auth/users"
+
+#: `limit` is clamped upward but rejected at 0 -- a page of nothing cannot
+#: advance a cursor, so it would leave a client unable to make progress.
+KEY_LIST_LIMIT_ERROR = "limit must be an integer between 1 and 500"
+
+#: A caller whose patterns are not "*" must scan inside its own allowance. That
+#: is what keeps a filtered-out key name out of the returned cursor.
+PREFIX_NOT_COVERED_ERROR = "prefix must fall within your permitted key patterns"
+
+#: Largest page GET /kv will serve.
+KEY_LIST_MAX_LIMIT = 500

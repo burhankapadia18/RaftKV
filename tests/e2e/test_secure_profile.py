@@ -253,3 +253,34 @@ def _in_network(network: str, image: str, argv: list, mount_certs: bool = False)
     return subprocess.run(
         command, capture_output=True, text=True, timeout=120, check=False, stdin=subprocess.DEVNULL
     )
+
+
+def test_console_loads_through_the_proxy(secure_cluster):
+    """The proxy round-robins all three nodes, so all three serve the assets.
+
+    Worth its own case: each node holds its OWN copy of the embedded bytes, and
+    a build that embedded them into only one node would pass every single-node
+    test. Six requests is comfortably more than three round-robin slots.
+    """
+    seen_ok = 0
+    for _ in range(6):
+        response = requests.get(
+            f"{PROXY_URL}/console/", verify=secure_cluster, timeout=TIMEOUT
+        )
+        if response.status_code == 404 and "not built into this binary" in response.text:
+            pytest.skip("this image was built with -DKVDB_CONSOLE=OFF")
+        assert response.status_code == 200
+        assert '<div id="root">' in response.text
+        seen_ok += 1
+    assert seen_ok == 6
+
+
+def test_console_api_routes_work_through_the_proxy(secure_cluster):
+    """The console's own calls must survive TLS termination at the proxy."""
+    response = requests.get(
+        f"{PROXY_URL}/cluster/status", verify=secure_cluster, timeout=TIMEOUT
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["leader_id"] != ""
+    assert len(payload["peers"]) == 3
