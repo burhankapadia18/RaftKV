@@ -1,11 +1,14 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -313,6 +316,9 @@ private:
    * Unrecognized paths collapse to "other" for the same reason.
    */
   [[nodiscard]] static std::string route_label(const HttpRequest &request) {
+    if (request.path == kKvListPath) {
+      return request.method + " /kv";
+    }
     if (request.path.rfind(kKvPathPrefix, 0) == 0) {
       return request.method + " /kv/{key}";
     }
@@ -373,6 +379,13 @@ public:
       return handle_auth(request, identity);
     }
 
+    // The list surface. Checked before /kv/{key}: the prefixes cannot collide
+    // ("/kv" has no trailing slash, kKvPathPrefix does), but the order makes
+    // that obvious rather than incidental.
+    if (request.path == kKvListPath) {
+      return handle_kv_list(request, identity);
+    }
+
     // R4.6: the REST surface. Checked before the legacy routes because it is
     // the one clients should be using.
     if (request.path.rfind(kKvPathPrefix, 0) == 0) {
@@ -415,6 +428,287 @@ private:
 
   /** @brief "Who am I, and what may I do?" */
   static constexpr const char *kWhoamiPath = "/auth/whoami";
+
+  /** @brief The key-listing route. No trailing slash — see kKvPathPrefix. */
+  static constexpr const char *kKvListPath = "/kv";
+
+  /** @brief Default page size for GET /kv. */
+  static constexpr size_t kKeyListDefaultLimit = 100;
+
+  /** @brief Largest page GET /kv will serve. Clamped to, not rejected. */
+  static constexpr size_t kKeyListMaxLimit = 500;
+
+  /** @brief Keys pulled from the store per scan_keys call. */
+  static constexpr size_t kKeyScanChunk = 256;
+
+  /**
+   * @brief Percent-encode arbitrary bytes (RFC 3986 unreserved set only).
+   *
+   * Every key in a JSON body goes through this. Keys are arbitrary bytes and a
+   * JSON string is Unicode text: a key holding a raw 0x80 would produce a body
+   * no parser accepts, and json_escape() cannot help — it passes bytes >= 0x20
+   * through untouched, which is right for UTF-8 payloads and wrong for
+   * arbitrary ones. Encoding to the unreserved set also means the output can be
+   * pasted straight back into a query string or into /kv/{key}, which decodes.
+   */
+  [[nodiscard]] static std::string percent_encode(const std::string &raw) {
+    static constexpr char kHexDigits[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(raw.size());
+    for (const char c : raw) {
+      const auto byte = static_cast<unsigned char>(c);
+      const bool unreserved = (byte >= 'A' && byte <= 'Z') ||
+                              (byte >= 'a' && byte <= 'z') ||
+                              (byte >= '0' && byte <= '9') || byte == '-' ||
+                              byte == '_' || byte == '.' || byte == '~';
+      if (unreserved) {
+        out.push_back(static_cast<char>(byte));
+        continue;
+      }
+      out.push_back('%');
+      out.push_back(kHexDigits[(byte >> 4) & 0x0F]);
+      out.push_back(kHexDigits[byte & 0x0F]);
+    }
+    return out;
+  }
+
+  /** @brief Render keys as a JSON array of percent-encoded strings. */
+  [[nodiscard]] static std::string
+  json_percent_array(const std::vector<std::string> &keys) {
+    std::vector<std::string> encoded;
+    encoded.reserve(keys.size());
+    for (const std::string &key : keys) {
+      encoded.push_back(percent_encode(key));
+    }
+    return json_string_array(encoded);
+  }
+
+  /**
+   * @brief The first scan position strictly after @p key.
+   *
+   * Any key greater than @p key either extends it — and so is >= key + '\0' —
+   * or diverges at an earlier byte and is greater than that too. Works even
+   * when @p key itself contains NUL bytes, because the comparison is by length
+   * and bytes, not by terminator.
+   */
+  [[nodiscard]] static std::string next_position(const std::string &key) {
+    std::string next = key;
+    next.push_back('\0');
+    return next;
+  }
+
+  /**
+   * @brief The first scan position past every reserved (`__sys:`) key.
+   *
+   * The reserved prefix ends in ':', so incrementing that last byte gives
+   * "__sys;" — which sorts after every "__sys:..." key and before anything
+   * that merely starts with "__sys;". Lets the whole reserved range be skipped
+   * in ONE lower_bound, so a reserved key is never examined and therefore can
+   * never surface in a listing or a cursor.
+   */
+  [[nodiscard]] static std::string reserved_range_end() {
+    std::string past(auth::kSysPrefix);
+    past.back() = static_cast<char>(past.back() + 1);
+    return past;
+  }
+
+  /**
+   * @brief True when every key carrying @p prefix matches @p pattern.
+   *
+   * Only a trailing-'*' literal glob can cover an entire prefix range: a '?' or
+   * an interior '*' constrains keys further along, so some key with the prefix
+   * would not match, and an exact pattern (no wildcard) covers at most one key.
+   *
+   * Used to require that a caller with restricted patterns scans INSIDE its own
+   * allowance. With that rule, nothing is filtered out mid-scan, so the
+   * returned position is always derived from a key the caller was allowed to
+   * see.
+   */
+  [[nodiscard]] static bool pattern_covers_prefix(const std::string &pattern,
+                                                  const std::string &prefix) {
+    if (pattern.find('?') != std::string::npos) {
+      return false;
+    }
+    const size_t star = pattern.find('*');
+    if (star == std::string::npos || star != pattern.size() - 1) {
+      return false;
+    }
+    const std::string literal = pattern.substr(0, star);
+    return prefix.size() >= literal.size() &&
+           prefix.compare(0, literal.size(), literal) == 0;
+  }
+
+  /** @brief True when some held pattern covers every key under @p prefix. */
+  [[nodiscard]] static bool prefix_is_covered(const auth::AuthContext &identity,
+                                              const std::string &prefix) {
+    for (const std::string &pattern : identity.patterns) {
+      if (pattern_covers_prefix(pattern, prefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * @brief Parse and clamp the `limit` query parameter.
+   * @return nullopt when it is not an integer in 1..kKeyListMaxLimit.
+   *
+   * An over-large value is CLAMPED, not rejected: a server-side cap is not a
+   * client error. Zero is rejected, because a page of nothing cannot advance a
+   * cursor and would leave a client unable to make progress.
+   */
+  [[nodiscard]] static std::optional<size_t>
+  parse_list_limit(const std::string &raw) {
+    if (raw.empty()) {
+      return std::nullopt;
+    }
+    for (const char c : raw) {
+      if (c < '0' || c > '9') {
+        return std::nullopt; // Covers "-1" and "abc" alike.
+      }
+    }
+    unsigned long long value = 0;
+    try {
+      value = std::stoull(raw);
+    } catch (const std::exception &) {
+      return std::nullopt; // Absurdly long digit strings.
+    }
+    if (value == 0) {
+      return std::nullopt;
+    }
+    return std::min<size_t>(static_cast<size_t>(value), kKeyListMaxLimit);
+  }
+
+  /**
+   * @brief GET /kv?prefix=&cursor=&limit= — one page of key NAMES.
+   *
+   * Names only: a page of 500 values could be hundreds of megabytes, and the
+   * console fetches a value only when a key is clicked.
+   *
+   * The page is cut AFTER filtering, not before, which is what keeps the
+   * returned position safe: because a page ends on an EMITTED key, the position
+   * never names a key the caller could not see. The examine budget bounds the
+   * work when filtering is heavy; combined with the covered-prefix rule below,
+   * a restricted caller cannot reach it by filtering alone.
+   */
+  [[nodiscard]] HttpResponse
+  handle_kv_list(const HttpRequest &request,
+                 const auth::AuthContext &identity) const {
+    if (request.method != "GET") {
+      return HttpResponse::json_error(405,
+                                      "method not allowed on /kv: use GET");
+    }
+
+    const std::map<std::string, std::string> params = request.query_params();
+
+    // decode_plus = true: these are QUERY parameters, where '+' means space
+    // (see the note on url_decode). query_params() returns values UNDECODED,
+    // so this cannot be skipped.
+    bool malformed = false;
+    const auto decode_param = [&params, &malformed](const char *name) {
+      const auto it = params.find(name);
+      if (it == params.end()) {
+        return std::string();
+      }
+      const std::optional<std::string> decoded = url_decode(it->second, true);
+      if (!decoded.has_value()) {
+        malformed = true;
+        return std::string();
+      }
+      return *decoded;
+    };
+
+    const std::string prefix = decode_param("prefix");
+    const std::string cursor = decode_param("cursor");
+    if (malformed) {
+      return HttpResponse::json_error(
+          400, "malformed percent-encoding in the query string");
+    }
+
+    size_t limit = kKeyListDefaultLimit;
+    const auto limit_param = params.find("limit");
+    if (limit_param != params.end()) {
+      const std::optional<size_t> parsed =
+          parse_list_limit(limit_param->second);
+      if (!parsed.has_value()) {
+        return HttpResponse::json_error(
+            400, "limit must be an integer between 1 and 500");
+      }
+      limit = *parsed;
+    }
+
+    // Reserved space is not addressable through a data route in EITHER
+    // direction, listing included.
+    if (std::optional<HttpResponse> refusal = reject_reserved_key(prefix)) {
+      return *refusal;
+    }
+    if (!identity.has_class(auth::CommandClass::kRead)) {
+      return HttpResponse::json_error(403, "permission denied");
+    }
+    if (!prefix_is_covered(identity, prefix)) {
+      return HttpResponse::json_error(
+          403, "prefix must fall within your permitted key patterns");
+    }
+
+    const std::string reserved_end = reserved_range_end();
+    const size_t budget = std::max<size_t>(1000, limit * 10);
+
+    std::vector<std::string> emitted;
+    std::string position = cursor;
+    size_t examined = 0;
+    bool exhausted = false;
+
+    while (emitted.size() < limit && examined < budget) {
+      const size_t chunk = std::min(kKeyScanChunk, budget - examined);
+      const IKVStore::KeyPage page = store_.scan_keys(prefix, position, chunk);
+      if (page.keys.empty()) {
+        // chunk is always >= 1 here, so an empty page means the range ended.
+        exhausted = page.reached_end;
+        break;
+      }
+
+      bool jumped = false;
+      // Whether every key the store handed back was looked at. Filling the
+      // response on a page's LAST key still exhausts the range, so this is
+      // tracked rather than inferred from emitted.size() < limit — otherwise a
+      // listing that ends exactly on a page boundary hands back a cursor that
+      // is guaranteed to return nothing.
+      bool consumed_whole_page = true;
+      for (size_t i = 0; i < page.keys.size(); ++i) {
+        const std::string &key = page.keys[i];
+        ++examined;
+        if (auth::is_reserved_key(key)) {
+          // Jump the WHOLE reserved range rather than filtering key by key, so
+          // no reserved key can ever become the returned position.
+          position = reserved_end;
+          jumped = true;
+          consumed_whole_page = false;
+          break;
+        }
+        position = next_position(key);
+        if (!identity.key_allowed(key)) {
+          continue;
+        }
+        emitted.push_back(key);
+        if (emitted.size() == limit) {
+          consumed_whole_page = (i + 1 == page.keys.size());
+          break;
+        }
+      }
+
+      if (!jumped && page.reached_end && consumed_whole_page) {
+        exhausted = true;
+        break;
+      }
+    }
+
+    std::string body = "{\"keys\":" + json_percent_array(emitted);
+    if (!exhausted) {
+      body += ",\"next_cursor\":\"" + percent_encode(position) + "\"";
+    }
+    body += "}";
+    return HttpResponse::json(200, body);
+  }
 
   /**
    * @brief Refuse a data-route key that belongs to the reserved key space.

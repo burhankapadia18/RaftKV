@@ -1092,5 +1092,150 @@ TEST_F(AdminHandlerTest, TheUserNameNeverBecomesAMetricLabel) {
   EXPECT_NE(exposition.find("/auth/users/{name}"), std::string::npos);
 }
 
+// --- GET /kv (list) --------------------------------------------------------
+//
+// Every key in the body is PERCENT-ENCODED. Keys are arbitrary bytes; a JSON
+// string is Unicode text, so a key holding a raw 0x80 would produce a body no
+// parser accepts -- and json_escape() would not save it, because it passes
+// bytes >= 0x20 straight through (correct for UTF-8, wrong for arbitrary).
+
+namespace {
+
+/** @brief GET /kv with the given raw (undecoded) query string. */
+HttpRequest list_request(const std::string &query_string) {
+  HttpRequest request;
+  request.method = "GET";
+  request.path = "/kv";
+  request.query_string = query_string;
+  return request;
+}
+
+} // namespace
+
+TEST_F(KVHttpHandlerTest, KvListReturnsPercentEncodedKeysInOrder) {
+  store_.set("app:b", "2");
+  store_.set("app:a", "1");
+  store_.set("other", "3");
+
+  const HttpResponse response = handler_.handle(list_request("prefix=app%3A"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.content_type, kJsonContentType);
+  EXPECT_EQ(response.body, "{\"keys\":[\"app%3Aa\",\"app%3Ab\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListOmitsCursorAtTheEndOfTheRange) {
+  store_.set("k1", "v");
+  const HttpResponse response = handler_.handle(list_request("prefix=k"));
+  // No next_cursor: a client pages until the field is ABSENT, never by
+  // comparing the returned count against limit.
+  EXPECT_EQ(response.body, "{\"keys\":[\"k1\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListPaginatesWithAnOpaquePosition) {
+  for (const char *key : {"k1", "k2", "k3"}) {
+    store_.set(key, "v");
+  }
+
+  const HttpResponse first = handler_.handle(list_request("prefix=k&limit=2"));
+  EXPECT_EQ(first.status_code, 200);
+  // The position is the last emitted key plus a NUL, so it reveals only a key
+  // the caller has already been shown.
+  EXPECT_EQ(first.body, "{\"keys\":[\"k1\",\"k2\"],\"next_cursor\":\"k2%00\"}");
+
+  const HttpResponse second =
+      handler_.handle(list_request("prefix=k&limit=2&cursor=k2%00"));
+  EXPECT_EQ(second.body, "{\"keys\":[\"k3\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListEncodesKeysThatAreNotValidUtf8) {
+  store_.set(std::string("k\x80\x01", 3), "v");
+  const HttpResponse response = handler_.handle(list_request("prefix=k"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body, "{\"keys\":[\"k%80%01\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListNeverRevealsAReservedKeyOrPosition) {
+  store_.set("__sys:user:alice", "record");
+  store_.set("a", "v");
+
+  const HttpResponse response = handler_.handle(list_request("limit=1"));
+  EXPECT_EQ(response.status_code, 200);
+  // The reserved range is jumped over as a range, so neither the keys array
+  // nor the cursor can name a user record.
+  EXPECT_EQ(response.body, "{\"keys\":[\"a\"]}");
+  EXPECT_EQ(response.body.find("__sys"), std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRefusesAReservedPrefix) {
+  const HttpResponse response =
+      handler_.handle(list_request("prefix=__sys%3A"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_NE(response.body.find("are reserved"), std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRejectsABadLimit) {
+  EXPECT_EQ(handler_.handle(list_request("limit=0")).status_code, 400);
+  EXPECT_EQ(handler_.handle(list_request("limit=-1")).status_code, 400);
+  EXPECT_EQ(handler_.handle(list_request("limit=abc")).status_code, 400);
+  EXPECT_EQ(handler_.handle(list_request("limit=abc")).body,
+            "{\"error\":\"limit must be an integer between 1 and 500\"}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListClampsAnOverLargeLimit) {
+  // A cap is not a client error.
+  EXPECT_EQ(handler_.handle(list_request("limit=100000")).status_code, 200);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRejectsMalformedPercentEncoding) {
+  const HttpResponse response = handler_.handle(list_request("prefix=%zz"));
+  EXPECT_EQ(response.status_code, 400);
+  EXPECT_EQ(response.body,
+            "{\"error\":\"malformed percent-encoding in the query "
+            "string\"}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListDoesNotCollideWithTheSingleKeyRoute) {
+  // "/kv" has no trailing slash; "/kv/" is still the empty-key 400.
+  EXPECT_EQ(handler_.handle(request_for("GET", "/kv/")).status_code, 400);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRejectsANonGetMethod) {
+  HttpRequest request = list_request("");
+  request.method = "POST";
+  EXPECT_EQ(handler_.handle(request).status_code, 405);
+}
+
+TEST_F(AuthenticatedHandlerTest, KvListRequiresTheReadClass) {
+  auth_.identity = identity_with("writer", {auth::kClassWrite}, {"*"});
+
+  const HttpResponse response = handler_.handle(list_request("prefix=app%3A"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_EQ(response.body, "{\"error\":\"permission denied\"}");
+}
+
+TEST_F(AuthenticatedHandlerTest,
+       KvListAppliesKeyPatternsAndRequiresACoveredPrefix) {
+  store_.set("app:mine", "v");
+  store_.set("other:theirs", "v");
+  auth_.identity = identity_with("scoped", {auth::kClassRead}, {"app:*"});
+
+  // Inside the allowance: fine.
+  const HttpResponse allowed = handler_.handle(list_request("prefix=app%3A"));
+  EXPECT_EQ(allowed.status_code, 200);
+  EXPECT_EQ(allowed.body, "{\"keys\":[\"app%3Amine\"]}");
+
+  // Outside it: refused, rather than scanning keys it may not see. This is
+  // what keeps a filtered-out key name out of the returned position.
+  const HttpResponse refused = handler_.handle(list_request("prefix=other%3A"));
+  EXPECT_EQ(refused.status_code, 403);
+  EXPECT_EQ(refused.body,
+            "{\"error\":\"prefix must fall within your permitted key "
+            "patterns\"}");
+
+  // And an unrestricted scan is refused for the same reason.
+  EXPECT_EQ(handler_.handle(list_request("")).status_code, 403);
+}
+
 } // namespace
 } // namespace kvdb
