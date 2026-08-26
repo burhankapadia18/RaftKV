@@ -125,11 +125,16 @@ set(KVDB_HEADERS
 
 # --- 5b. Console assets (embedded at build time) ---
 #
-# Defaults to OFF until console/ exists; Task 9 flips it to ON. The header is
-# generated in BOTH configurations -- empty when off -- so the HTTP handler
-# needs no preprocessor branch and the test build compiles identically.
+# Defaults ON: a release binary without its console is not the artefact anyone
+# wants. A local build with no Node opts out explicitly with -DKVDB_CONSOLE=OFF,
+# and the routes then answer "console not built into this binary" rather than
+# failing mysteriously.
+#
+# The header is generated in BOTH configurations -- empty when off -- so the HTTP
+# handler needs no preprocessor branch and the no-Node test build compiles
+# identically.
 
-option(KVDB_CONSOLE "Embed the built management console into kvdb_node" OFF)
+option(KVDB_CONSOLE "Embed the built management console into kvdb_node" ON)
 
 set(KVDB_CONSOLE_DIST "${CMAKE_CURRENT_SOURCE_DIR}/../console/dist"
     CACHE PATH "Built console assets (Vite dist/) to embed")
@@ -148,6 +153,20 @@ else()
         "${KVDB_CONSOLE_HEADER_DIR}/console_assets_generated.hpp"
         "")
 endif()
+
+# A SECOND, always-empty table, for kvdb_tests only.
+#
+# The unit tests pin the KVDB_CONSOLE=OFF contract ("console not built into this
+# binary"), which is a real deployment mode and deserves a real test. If they
+# compiled against the table above, their expected values would depend on
+# whether Node happened to be installed on the machine running them -- passing
+# in CI and failing locally, or the reverse. The populated table is verified
+# where it can actually be verified: end to end, over HTTP, in
+# tests/e2e/test_console.py.
+set(KVDB_CONSOLE_TEST_HEADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/console-tests")
+file(MAKE_DIRECTORY "${KVDB_CONSOLE_TEST_HEADER_DIR}")
+kvdb_generate_console_assets(
+    "${KVDB_CONSOLE_TEST_HEADER_DIR}/console_assets_generated.hpp" "")
 
 # --- 6. Build Executable ---
 
@@ -236,10 +255,13 @@ if(KVDB_BUILD_TESTS)
         tests/static_assets_test.cpp
     )
 
+    # KVDB_CONSOLE_TEST_HEADER_DIR comes FIRST on purpose: it holds the
+    # always-empty asset table, so these tests assert one fixed contract
+    # regardless of whether the console was built. See the note beside it.
     target_include_directories(kvdb_tests PRIVATE
+        ${KVDB_CONSOLE_TEST_HEADER_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${PROTO_BINARY_DIR}
-        ${KVDB_CONSOLE_HEADER_DIR}
     )
 
     # Phase 1 links consensus_proto: StateMachineService::Apply and

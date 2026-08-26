@@ -72,7 +72,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake g++ pkg-config protobuf-compiler protobuf-compiler-grpc \
             libprotobuf-dev libgrpc++-dev libmsgpack-dev libgtest-dev
-          cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON
+          # -DKVDB_CONSOLE=OFF: this step has no Node. The console is embedded
+          # by the buildx image build below, which is the artefact being released.
+          cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON -DKVDB_CONSOLE=OFF
           cmake --build cpp-app/build -j"$(nproc)"
           ctest --test-dir cpp-app/build --output-on-failure
 

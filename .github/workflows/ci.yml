@@ -130,7 +130,14 @@ jobs:
           echo "All C++ files are clang-format clean."
 
       - name: Configure
-        run: cmake -S cpp-app -B cpp-app/build -DKVDB_BUILD_TESTS=ON
+        run: |
+          # -DKVDB_CONSOLE=OFF: this job has no Node, and KVDB_CONSOLE defaults
+          # to ON. Off is a real deployment mode with its own tested contract
+          # ("console not built into this binary"), so this job exercises that
+          # shape rather than being a special case. The e2e job builds the
+          # Docker image, which is where the console is actually embedded.
+          cmake -S cpp-app -B cpp-app/build \
+            -DKVDB_BUILD_TESTS=ON -DKVDB_CONSOLE=OFF
 
       - name: Build
         run: cmake --build cpp-app/build -j "$(nproc)"
@@ -182,7 +189,7 @@ jobs:
       - name: Configure (sanitizers)
         run: |
           cmake -S cpp-app -B cpp-app/build-asan \
-            -DKVDB_BUILD_TESTS=ON \
+            -DKVDB_BUILD_TESTS=ON -DKVDB_CONSOLE=OFF \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
@@ -234,7 +241,7 @@ jobs:
       - name: Configure (TSan)
         run: |
           cmake -S cpp-app -B cpp-app/build-tsan \
-            -DKVDB_BUILD_TESTS=ON \
+            -DKVDB_BUILD_TESTS=ON -DKVDB_CONSOLE=OFF \
             -DCMAKE_BUILD_TYPE=Debug \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
@@ -267,7 +274,8 @@ jobs:
       - name: Configure
         run: |
           cmake -S cpp-app -B cpp-app/build-fuzz \
-            -DKVDB_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++
+            -DKVDB_BUILD_FUZZERS=ON -DKVDB_CONSOLE=OFF \
+            -DCMAKE_CXX_COMPILER=clang++
 
       - name: Build
         run: cmake --build cpp-app/build-fuzz -j "$(nproc)"

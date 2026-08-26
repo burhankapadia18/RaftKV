@@ -1,0 +1,103 @@
+@import './tokens.css';
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: var(--text-body) / 1.5 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Every figure on this page is compared against another figure, so digits must
+   not shift width between polls. */
+.numeric {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.app-shell {
+  max-width: 78rem;
+  margin: 0 auto;
+  padding: var(--space-loose) var(--space-base) var(--space-section);
+}
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-base);
+  padding-bottom: var(--space-snug);
+  border-bottom: 1px solid var(--color-rule-strong);
+}
+
+.app-title {
+  margin: 0;
+  font-size: var(--text-title);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.app-nav {
+  display: flex;
+  gap: var(--space-hair);
+  margin-left: auto;
+}
+
+.app-nav a {
+  padding: var(--space-hair) var(--space-tight);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  font-size: var(--text-label);
+  font-weight: 550;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-decoration: none;
+  transition:
+    color var(--duration-fast) var(--ease-out-expo),
+    background-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.app-nav a:hover {
+  color: var(--color-text);
+  background: var(--color-surface-sunken);
+}
+
+.app-nav a[aria-current='page'] {
+  color: var(--color-surface-raised);
+  background: var(--color-text);
+}
+
+/* Focus is designed, not defaulted: a keyboard operator must always know where
+   they are. */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.banner {
+  margin: var(--space-base) 0 0;
+  padding: var(--space-tight) var(--space-snug);
+  border-left: 3px solid var(--color-candidate);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  font-size: var(--text-label);
+}
+
+.banner strong {
+  color: var(--color-text);
+}
+
+.error-note {
+  margin: var(--space-base) 0 0;
+  padding: var(--space-tight) var(--space-snug);
+  border-left: 3px solid var(--color-danger);
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+  font-size: var(--text-label);
+}
