@@ -118,6 +118,7 @@ set(KVDB_HEADERS
     src/raft/raft_client.hpp
     src/raft/state_machine.hpp
     src/network/thread_pool.hpp
+    src/network/static_assets.hpp
     src/network/http_request.hpp
     src/network/http_server.hpp
 )
@@ -205,6 +206,7 @@ if(KVDB_BUILD_TESTS)
         tests/wal_test.cpp
         tests/thread_pool_test.cpp
         tests/metrics_test.cpp
+        tests/static_assets_test.cpp
     )
 
     target_include_directories(kvdb_tests PRIVATE
