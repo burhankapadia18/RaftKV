@@ -1205,5 +1205,129 @@ TEST_F(PersistentKVStoreTest, IndexRebuiltFromLegacyBaseFile) {
             (std::vector<std::string>{"a", "b", "c"}));
 }
 
+// --- scan_keys -------------------------------------------------------------
+//
+// `start` is INCLUSIVE, which is what lets a caller resume past a whole RANGE
+// of keys (there is no immediate predecessor of a string, so an exclusive
+// cursor cannot express that). Two positions matter downstream:
+//   K + '\0'  -- the first position strictly after K
+//   "__sys;"  -- the first position past every "__sys:"-prefixed key
+
+/** @brief The page's keys, for a terser EXPECT_EQ against a vector literal. */
+std::vector<std::string> keys_of(const IKVStore::KeyPage &page) {
+  return page.keys;
+}
+
+TEST_F(PersistentKVStoreTest, ScanOnAnEmptyStoreReachesEndImmediately) {
+  PersistentKVStore store(path(), fast_options());
+
+  const IKVStore::KeyPage page = store.scan_keys("", "", 10);
+  EXPECT_TRUE(page.keys.empty());
+  EXPECT_TRUE(page.reached_end);
+}
+
+TEST_F(PersistentKVStoreTest, ScanFiltersByPrefixAndStopsAtTheRangeEnd) {
+  PersistentKVStore store(path(), fast_options());
+  for (const char *key : {"app:a", "app:b", "app", "apq", "zz"}) {
+    store.set(key, "v");
+  }
+
+  // "app" is itself a key AND a prefix; it must be included.
+  const IKVStore::KeyPage page = store.scan_keys("app", "", 10);
+  EXPECT_EQ(keys_of(page), (std::vector<std::string>{"app", "app:a", "app:b"}));
+  EXPECT_TRUE(page.reached_end);
+}
+
+TEST_F(PersistentKVStoreTest, ScanLimitTruncatesAndDoesNotClaimTheEnd) {
+  PersistentKVStore store(path(), fast_options());
+  for (const char *key : {"k1", "k2", "k3"}) {
+    store.set(key, "v");
+  }
+
+  const IKVStore::KeyPage page = store.scan_keys("k", "", 2);
+  EXPECT_EQ(keys_of(page), (std::vector<std::string>{"k1", "k2"}));
+  EXPECT_FALSE(page.reached_end);
+}
+
+TEST_F(PersistentKVStoreTest, ScanStartIsInclusive) {
+  PersistentKVStore store(path(), fast_options());
+  for (const char *key : {"k1", "k2", "k3"}) {
+    store.set(key, "v");
+  }
+
+  // Inclusive: "k2" is returned.
+  EXPECT_EQ(keys_of(store.scan_keys("k", "k2", 10)),
+            (std::vector<std::string>{"k2", "k3"}));
+
+  // K + '\0' is the first position strictly after K.
+  EXPECT_EQ(keys_of(store.scan_keys("k", std::string("k2\0", 3), 10)),
+            (std::vector<std::string>{"k3"}));
+}
+
+TEST_F(PersistentKVStoreTest, ScanStartWorksWhenTheKeyContainsNul) {
+  PersistentKVStore store(path(), fast_options());
+  const std::string embedded("k\0z", 3);
+  store.set(embedded, "v");
+  store.set("k\1", "v");
+
+  // Resuming after a key that itself contains a NUL must not skip "k\1".
+  const std::string position = embedded + std::string(1, '\0');
+  EXPECT_EQ(keys_of(store.scan_keys("k", position, 10)),
+            (std::vector<std::string>{"k\1"}));
+}
+
+TEST_F(PersistentKVStoreTest, ScanStartBeforeThePrefixSnapsForward) {
+  PersistentKVStore store(path(), fast_options());
+  store.set("m1", "v");
+
+  // A caller-supplied position that precedes the prefix range must not make
+  // the scan stop instantly on a non-matching first key.
+  const IKVStore::KeyPage page = store.scan_keys("m", "a", 10);
+  EXPECT_EQ(keys_of(page), (std::vector<std::string>{"m1"}));
+  EXPECT_TRUE(page.reached_end);
+}
+
+TEST_F(PersistentKVStoreTest, ScanReservedRangeIsSkippableAsARange) {
+  PersistentKVStore store(path(), fast_options());
+  store.set("__sys:user:alice", "v");
+  store.set("__sys:user:bob", "v");
+  store.set("a", "v");
+  store.set("zz", "v");
+
+  // "__sys;" -- ';' is the byte after ':' -- lands past the whole reserved
+  // range in ONE lower_bound, so no reserved key is ever examined.
+  const IKVStore::KeyPage page = store.scan_keys("", "__sys;", 10);
+  EXPECT_EQ(keys_of(page), (std::vector<std::string>{"a", "zz"}));
+  EXPECT_TRUE(page.reached_end);
+}
+
+TEST_F(PersistentKVStoreTest, ScanPaginatesAcrossAnEraseBetweenPages) {
+  PersistentKVStore store(path(), fast_options());
+  for (const char *key : {"k1", "k2", "k3", "k4"}) {
+    store.set(key, "v");
+  }
+
+  const IKVStore::KeyPage first = store.scan_keys("k", "", 2);
+  EXPECT_EQ(keys_of(first), (std::vector<std::string>{"k1", "k2"}));
+
+  // The key the cursor was derived from disappears between pages. A position
+  // is not a key, so this must still resume correctly.
+  EXPECT_TRUE(store.remove("k2"));
+  const std::string position = first.keys.back() + std::string(1, '\0');
+  EXPECT_EQ(keys_of(store.scan_keys("k", position, 2)),
+            (std::vector<std::string>{"k3", "k4"}));
+}
+
+TEST_F(PersistentKVStoreTest, ScanLimitZeroReturnsNothingAndClaimsNothing) {
+  PersistentKVStore store(path(), fast_options());
+  store.set("k", "v");
+
+  // The handler never passes 0 (it rejects limit=0 with a 400), but the store
+  // must not claim the range is exhausted if it is asked for nothing.
+  const IKVStore::KeyPage page = store.scan_keys("", "", 0);
+  EXPECT_TRUE(page.keys.empty());
+  EXPECT_FALSE(page.reached_end);
+}
+
 } // namespace
 } // namespace kvdb

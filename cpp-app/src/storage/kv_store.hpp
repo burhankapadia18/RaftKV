@@ -191,6 +191,39 @@ public:
    * moved into place.
    */
   virtual void restore_state(StateMap state) = 0;
+
+  /**
+   * @brief One page of keys, plus whether the prefix range is exhausted.
+   *
+   * `reached_end` is not derivable from `keys.size() < limit`: a caller that
+   * filters the page (for reserved keys, or for an ACL) may need several pages
+   * to fill one response, and a short page does not mean the last page.
+   */
+  struct KeyPage {
+    std::vector<std::string> keys;
+    bool reached_end = false;
+  };
+
+  /**
+   * @brief Up to @p limit keys carrying @p prefix, from @p start inclusive.
+   *
+   * Lexicographic (byte) order. An empty @p start means "the beginning of the
+   * prefix range"; a @p start that precedes the range snaps forward to it.
+   *
+   * @p start is INCLUSIVE on purpose. An exclusive "after key K" cursor cannot
+   * express "resume past this entire range of keys", because a string has no
+   * immediate predecessor. An inclusive position expresses both: `K + '\0'` is
+   * the first position strictly after `K` (any key greater than `K` either
+   * extends it, and so is >= `K + '\0'`, or diverges earlier), and `"__sys;"`
+   * is the first position past every `"__sys:"`-prefixed key.
+   *
+   * Keys are copied out; the caller may hold them freely. Deliberately takes no
+   * filter callback: that would run caller logic while the store mutex is held.
+   * A caller that needs filtering calls this repeatedly instead.
+   */
+  [[nodiscard]] virtual KeyPage scan_keys(std::string_view prefix,
+                                          std::string_view start,
+                                          size_t limit) const = 0;
 };
 
 /**
@@ -418,6 +451,45 @@ public:
     replace_all_unlocked(std::move(state));
   }
 
+  /**
+   * @brief One page of keys under @p prefix, from @p start inclusive.
+   *
+   * O(log n + page) against the ordered index, so the cost of a listing is the
+   * page rather than the store. See IKVStore::scan_keys for the contract, and
+   * in particular for why @p start is inclusive.
+   */
+  [[nodiscard]] KeyPage scan_keys(std::string_view prefix,
+                                  std::string_view start,
+                                  size_t limit) const override {
+    KeyPage page;
+    if (limit == 0) {
+      // Asked for nothing, so nothing is known about what follows.
+      return page;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // max(prefix, start): an empty or too-early start snaps to the beginning of
+    // the prefix range, so the walk below cannot stop on a key that simply
+    // precedes it.
+    const std::string_view from = (start > prefix) ? start : prefix;
+    page.keys.reserve(limit);
+
+    for (auto it = index_.lower_bound(from); it != index_.end(); ++it) {
+      const std::string_view key = *it;
+      if (!has_prefix_unlocked(key, prefix)) {
+        break; // Ordered, so the first miss ends the range.
+      }
+      if (page.keys.size() == limit) {
+        return page; // Full page; reached_end stays false.
+      }
+      page.keys.emplace_back(key);
+    }
+
+    page.reached_end = true;
+    return page;
+  }
+
 private:
   /** @brief Operation strings understood by KVCommand::parse_operation. */
   static constexpr const char *kOpSet = "SET";
@@ -503,6 +575,18 @@ private:
    * Caller must hold @c mutex_ (the constructor's calls are the documented
    * exception: nothing can observe the object yet).
    */
+  /**
+   * @brief True when @p key begins with @p prefix.
+   *
+   * C++17 has no std::string_view::starts_with. Pure, so despite the suffix it
+   * needs no lock at all -- named for consistency with the helpers around it.
+   */
+  [[nodiscard]] static bool has_prefix_unlocked(std::string_view key,
+                                                std::string_view prefix) {
+    return key.size() >= prefix.size() &&
+           key.compare(0, prefix.size(), prefix) == 0;
+  }
+
   void replace_all_unlocked(StateMap state) {
     index_.clear();
     store_ = std::move(state);
