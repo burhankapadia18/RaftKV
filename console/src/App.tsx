@@ -6,6 +6,7 @@ import { useHashRoute } from './hooks/useHashRoute';
 import { clearCredential, loadCredential } from './lib/auth';
 import type { ClusterStatus } from './lib/api';
 import { ClusterPage } from './pages/ClusterPage';
+import { KeysPage } from './pages/KeysPage';
 import './styles/cluster.css';
 
 const ROUTES = [
@@ -86,9 +87,7 @@ export function App() {
         {route === 'cluster' && (
           <ClusterPage onUnauthorized={onUnauthorized} onStatus={onStatus} />
         )}
-        {route === 'keys' && (
-          <p class="page-note">The key browser arrives in the next task.</p>
-        )}
+        {route === 'keys' && <KeysPage onUnauthorized={onUnauthorized} />}
         {route === 'users' && (
           <p class="page-note">User management arrives in the next task.</p>
         )}

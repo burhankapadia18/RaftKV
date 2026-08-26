@@ -287,3 +287,51 @@
   min-height: 8rem;
   resize: vertical;
 }
+
+.page-actions.is-left {
+  margin: var(--space-base) 0 0;
+  margin-left: 0;
+  flex-wrap: wrap;
+}
+
+.col-shrink {
+  width: 1%;
+  white-space: nowrap;
+}
+
+/* A key may be long and may contain anything; it wraps rather than widening
+   the table past the viewport. */
+.key-cell {
+  max-width: 44rem;
+  overflow-wrap: anywhere;
+}
+
+.data-table tbody tr.is-selected {
+  background: color-mix(in oklab, var(--color-accent) 10%, transparent);
+}
+
+.key-editor {
+  margin-top: var(--space-section);
+  padding-top: var(--space-tight);
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.button:disabled:hover {
+  background: var(--color-surface-raised);
+  border-color: var(--color-rule-strong);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
