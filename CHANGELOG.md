@@ -9,6 +9,35 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+**Management console** — a browser UI at `/console/`, served by the storage engine
+itself from assets embedded in the binary. No extra process, port or container.
+
+- Three pages: a cluster overview, a key browser with prefix listing and a
+  single-key console, and user/ACL management when authentication is on. `/`
+  redirects to `/console/`.
+- Costs the database nothing while idle: the assets are `constexpr` data in
+  `.rodata`, so nothing is allocated or computed until a browser asks, and the
+  overview polls only while its tab is visible.
+- The static assets are served **outside** the authentication gate — they hold no
+  cluster state, and a page needing a credential to load could not render a login
+  form. Every API call the loaded page makes goes through the gate normally.
+- `GET /kv` — paginated key listing with percent-encoded keys and an opaque
+  cursor position (`read` class). Page until `next_cursor` is absent, never until
+  a page is short.
+- `GET /cluster/status` — this node's own raft view, over a new unary
+  `RaftNode.Status` RPC (`read` class). Every node answers for itself; an
+  unreachable sidecar is a 502, never a 200 with zeroed fields.
+- `GET /auth/users` — user names, admin only, never a salt or hash. Retires the
+  "no user listing" limitation.
+- `KVDB_CONSOLE` CMake option (default `ON`) and `KVDB_CONSOLE_DIST`. `OFF` builds
+  without Node and answers `404 console not built into this binary`.
+
+### Changed
+
+- `PersistentKVStore` keeps an ordered index of its keys (~48–64 bytes per key)
+  to serve prefix scans in `O(log n + page)` rather than `O(n)` per request. All
+  six mutation sites now go through three funnel helpers that maintain it.
+
 **Client authentication and user ACLs** — Redis-style, opt-in, and off unless a
 bootstrap admin password is configured.
 

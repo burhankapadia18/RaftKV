@@ -43,8 +43,14 @@ from contracts import (
     CLASS_ADMIN,
     CLASS_READ,
     CLASS_WRITE,
+    AUTH_USERS_PATH,
+    CLUSTER_STATUS_PATH,
+    CONSOLE_INDEX_PATH,
+    CONSOLE_NOT_BUILT_ERROR,
     ERROR_INVALID_CREDENTIALS,
     ERROR_PERMISSION_DENIED,
+    KV_LIST_PATH,
+    PREFIX_NOT_COVERED_ERROR,
     HTTP_BAD_REQUEST,
     HTTP_FORBIDDEN,
     HTTP_NOT_FOUND,
@@ -794,3 +800,133 @@ def test_user_management_operations_are_refused_on_the_legacy_write_route(
         ).status_code
         == HTTP_NOT_FOUND
     )
+
+
+# --------------------------------------------------------------------------
+# Console surface under auth
+# --------------------------------------------------------------------------
+
+
+def test_console_assets_need_no_credential(auth_cluster):
+    """The static bytes are outside the authentication gate, by design.
+
+    A page that required a credential to LOAD could not render a login form.
+    The bytes are compile-time constants holding no cluster state.
+    """
+    for base_url in auth_cluster:
+        response = requests.get(f"{base_url}{CONSOLE_INDEX_PATH}", timeout=TIMEOUT)
+        # 404 only when this binary was built with -DKVDB_CONSOLE=OFF. What must
+        # never happen either way is a 401.
+        assert response.status_code != HTTP_UNAUTHORIZED, base_url
+        if response.status_code == HTTP_NOT_FOUND:
+            assert CONSOLE_NOT_BUILT_ERROR in response.text, base_url
+        else:
+            assert response.status_code == HTTP_OK, base_url
+
+        root = requests.get(base_url + "/", timeout=TIMEOUT, allow_redirects=False)
+        assert root.status_code == 302, base_url
+        assert root.headers["Location"] == CONSOLE_INDEX_PATH
+
+
+def test_console_api_routes_require_a_credential(auth_cluster):
+    """Everything the loaded page then calls goes through the gate normally."""
+    for path in (CLUSTER_STATUS_PATH, f"{KV_LIST_PATH}?limit=10", AUTH_USERS_PATH):
+        response = requests.get(auth_cluster[0] + path, timeout=TIMEOUT)
+        assert response.status_code == HTTP_UNAUTHORIZED, path
+        assert WWW_AUTHENTICATE_BASIC in response.headers.get(
+            WWW_AUTHENTICATE_HEADER, ""
+        ), path
+
+
+def test_user_list_requires_admin_and_leaks_no_hash(
+    auth_cluster, admin, user_factory
+):
+    secret = "listed-secret-password"
+    user, _ = user_factory([CLASS_READ], ["app:*"], password=secret)
+
+    listing = requests.get(
+        f"{auth_cluster[0]}{AUTH_USERS_PATH}", auth=admin, timeout=TIMEOUT
+    )
+    assert listing.status_code == HTTP_OK
+    assert user in listing.json()["users"]
+    # Names only. A record carries a salt and a password hash, and the entire
+    # point of __sys: being unreadable is to keep those out of any body.
+    assert secret not in listing.text
+    assert "salt" not in listing.text
+    assert "hash" not in listing.text
+    # The bootstrap admin is configuration, not a record, so it is not listed.
+    assert BOOTSTRAP_ADMIN not in listing.json()["users"]
+
+    # A read-class user may not enumerate accounts.
+    refused = requests.get(
+        f"{auth_cluster[0]}{AUTH_USERS_PATH}", auth=(user, secret), timeout=TIMEOUT
+    )
+    assert refused.status_code == HTTP_FORBIDDEN
+    assert refused.json()["error"] == ERROR_PERMISSION_DENIED
+
+
+def test_key_listing_respects_key_patterns(auth_cluster, admin, user_factory):
+    """Read access to a key's NAME is read access.
+
+    Without pattern filtering on the listing, enumeration would route around
+    the check GET /kv/{key} enforces.
+    """
+    leader_url = _find_write_node(auth_cluster, admin)
+    prefix = f"acl{uuid.uuid4().hex[:10]}"
+    visible = f"{prefix}:visible"
+    hidden = f"{prefix}-secret:hidden"
+
+    for key in (visible, hidden):
+        assert (
+            requests.put(
+                f"{leader_url}/kv/{key}", data=b"v", auth=admin, timeout=TIMEOUT
+            ).status_code
+            == HTTP_OK
+        )
+
+    secret = "scoped-password"
+    user, _ = user_factory([CLASS_READ], [f"{prefix}:*"], password=secret)
+    scoped = (user, secret)
+
+    try:
+        allowed = requests.get(
+            f"{leader_url}{KV_LIST_PATH}?prefix={prefix}%3A",
+            auth=scoped,
+            timeout=TIMEOUT,
+        )
+        assert allowed.status_code == HTTP_OK
+        assert allowed.json()["keys"] == [visible.replace(":", "%3A")]
+
+        # Outside the allowance: refused rather than filtered, which is what
+        # keeps a key name the caller cannot read out of the returned cursor.
+        for query in (f"?prefix={prefix}-secret%3A", ""):
+            refused = requests.get(
+                f"{leader_url}{KV_LIST_PATH}{query}", auth=scoped, timeout=TIMEOUT
+            )
+            assert refused.status_code == HTTP_FORBIDDEN, query
+            assert refused.json()["error"] == PREFIX_NOT_COVERED_ERROR, query
+    finally:
+        for key in (visible, hidden):
+            requests.delete(f"{leader_url}/kv/{key}", auth=admin, timeout=TIMEOUT)
+
+
+def test_cluster_status_needs_only_the_read_class(auth_cluster, user_factory):
+    """It addresses no key, so no key-pattern check applies -- but a caller
+    without the read class is still refused."""
+    reader, reader_pw = user_factory([CLASS_READ], ["nothing:*"])
+    writer, writer_pw = user_factory([CLASS_WRITE], ["*"])
+
+    allowed = requests.get(
+        f"{auth_cluster[0]}{CLUSTER_STATUS_PATH}",
+        auth=(reader, reader_pw),
+        timeout=TIMEOUT,
+    )
+    assert allowed.status_code == HTTP_OK
+    assert allowed.json()["auth_enabled"] is True
+
+    refused = requests.get(
+        f"{auth_cluster[0]}{CLUSTER_STATUS_PATH}",
+        auth=(writer, writer_pw),
+        timeout=TIMEOUT,
+    )
+    assert refused.status_code == HTTP_FORBIDDEN

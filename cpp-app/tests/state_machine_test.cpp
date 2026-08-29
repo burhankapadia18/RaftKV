@@ -90,6 +90,35 @@ public:
     data.insert(state.begin(), state.end());
   }
 
+  /**
+   * @brief scan_keys over the ordered map backing this fake.
+   *
+   * Same contract as PersistentKVStore::scan_keys, implemented independently:
+   * a fake that delegated to the real store would not be a fake.
+   */
+  [[nodiscard]] KeyPage scan_keys(std::string_view prefix,
+                                  std::string_view start,
+                                  size_t limit) const override {
+    KeyPage page;
+    if (limit == 0) {
+      return page;
+    }
+    const std::string from = std::string((start > prefix) ? start : prefix);
+    for (auto it = data.lower_bound(from); it != data.end(); ++it) {
+      const std::string &key = it->first;
+      if (key.size() < prefix.size() ||
+          key.compare(0, prefix.size(), prefix) != 0) {
+        break;
+      }
+      if (page.keys.size() == limit) {
+        return page;
+      }
+      page.keys.push_back(key);
+    }
+    page.reached_end = true;
+    return page;
+  }
+
   /** @brief Every set()/remove() call, whether or not it changed anything. */
   int writes = 0;
   std::map<std::string, std::string> data;

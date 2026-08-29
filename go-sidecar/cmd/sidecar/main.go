@@ -155,7 +155,11 @@ func main() {
 	// WithLocalReader is what makes linearizable reads (R4.5) available: after
 	// the Barrier and the quorum check, the leader answers from its own C++
 	// store through this.
-	grpcServer := rpc.NewServer(node, forwarder).WithLocalReader(storeReader)
+	// WithStatusReporter backs the console's overview page. Read-only and
+	// leader-free, so every node answers for itself.
+	grpcServer := rpc.NewServer(node, forwarder).
+		WithLocalReader(storeReader).
+		WithStatusReporter(node)
 
 	// Graceful shutdown (R5.8). The ORDER matters and each step earns its place:
 	//

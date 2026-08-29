@@ -71,3 +71,9 @@ cpp-app/build-fuzz/
 # documented commands now point that at /tmp, but ignore the conventional local
 # name too so an ad-hoc run cannot re-add hundreds of hash-named files.
 cpp-app/fuzz/corpus-generated/
+
+# Console build output. node_modules and dist are also ignored by
+# console/.gitignore; listed here too so a `git add -A` from the repo root
+# cannot pick them up -- the same mistake that once committed bench/kvbench.
+console/node_modules/
+console/dist/

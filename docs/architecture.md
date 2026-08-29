@@ -260,8 +260,17 @@ a CA before it prints anything is a demo nobody runs — and
 | Raft peer transport | Plaintext — anyone who can reach it can append entries | Mutual TLS against one cluster CA |
 | C++ StateMachine gRPC | Plaintext on `127.0.0.1` | Same |
 | Sidecar RaftNode gRPC | Plaintext, peer-reachable | Same |
+| Static console assets | Served unauthenticated on the client port | Same, through the proxy |
 
 Design points worth keeping:
+
+- **The console's static assets are outside the authentication gate, and its API
+  calls are not.** The bytes are `constexpr` arrays holding no keys, values or
+  configuration; a page that required a credential to load could not render a
+  login form. This is the only such exception besides `/metrics`.
+- **Key *names* are protected like key values.** `GET /kv` applies the caller's
+  ACL patterns per key and refuses a prefix outside them, because enumeration
+  would otherwise route around the check `GET /kv/{key}` enforces.
 
 - **`internal/tlsconfig` is the only place a `*tls.Config` is built.** A server
   with a cert and key but no `ClientCAs` completes a handshake with anybody, looks
@@ -290,7 +299,7 @@ and in CLAUDE.md's limitations, at the same level of detail as what is.
 
 | Port | Process | Purpose | Exposure |
 |---|---|---|---|
-| 8080 | C++ | Client HTTP API | Published (default profile) |
+| 8080 | C++ | Client HTTP API, and the management console at `/console/` | Published (default profile) |
 | 8443 | proxy | Client HTTPS | Published (secure profile) |
 | 6000 | Go | Management API: `/join`, `/remove`, `/status`, `/health`, `/ready`, `/metrics` | Published |
 | 8088 | Go | Raft peer transport | Cluster-internal |

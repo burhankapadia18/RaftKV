@@ -1,0 +1,137 @@
+/* The console's design tokens. The visual language, where it came from and why
+   each rule exists, is documented in /DESIGN.md -- read that before changing a
+   value here. In short: warm paper, white cards, hard ink borders with solid
+   un-blurred offset shadows, a display serif against a plain sans, and four
+   pastels that mean exactly one raft state each. */
+
+:root {
+  color-scheme: light dark;
+
+  /* --- Paper and ink -----------------------------------------------------
+     Cream, never white: white is reserved for cards, which is what makes a
+     card read as an object placed ON the paper rather than a region of it. */
+  --paper: #f7f3eb;
+  --paper-sunken: #efe9dd;
+  --card: #ffffff;
+  --ink: #21221f;
+  --ink-muted: #6b6a62;
+  --ink-faint: #a4a199;
+
+  /* Borders and hard shadows are the same colour as the ink by construction:
+     the whole system is a pen drawing on paper. On dark they both become the
+     cream instead, so the drawing survives the flip. */
+  --stroke: var(--ink);
+  --stroke-hair: #d8d2c4;
+
+  /* --- Raft state vocabulary ---------------------------------------------
+     Four colours, four meanings, no decorative use. Sampled from design.webp.
+     Text on any of them is ALWAYS ink -- they are all light. */
+  --mint: #6acca2; /* leader */
+  --sky: #aaebfe; /* follower */
+  --butter: #fff387; /* candidate / election */
+  --coral: #fe976c; /* primary action, and danger */
+
+  /* The four pastels stay LIGHT in both themes, because a band is a band. Text
+     drawn on a band is therefore this fixed near-black in BOTH themes -- it is
+     not --ink, which becomes cream on dark and would vanish. Anything filled
+     with a pastel at full strength must use this. */
+  --band-ink: #21221f;
+  /* ...and the surface a chip sits on inside one. Fixed for the same reason:
+     --card is a dark brown on the dark theme, and a chip filled with it inside
+     a mint band is --band-ink on dark brown, which is unreadable. */
+  --band-card: #ffffff;
+
+  /* Tints, for a row fill or a notice where a full-strength band would shout.
+     Derived, so a palette change propagates. Only the two that are actually
+     used exist -- a mint or sky tint would be a token nothing references. */
+  --butter-tint: color-mix(in oklab, var(--butter) 40%, var(--card));
+  --coral-tint: color-mix(in oklab, var(--coral) 26%, var(--card));
+
+  /* --- Type ---------------------------------------------------------------
+     No webfont, deliberately: this console is embedded in the engine binary and
+     served to operators who may have no route to the internet. ui-serif is New
+     York on Apple platforms and Georgia elsewhere -- both warm, sturdy,
+     large-x-height transitional serifs, the same genus as the reference. */
+  --font-display: ui-serif, 'New York', 'Iowan Old Style', Georgia,
+    'Times New Roman', serif;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+    'Helvetica Neue', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas,
+    monospace;
+
+  /* Wide steps: family + scale contrast is what carries hierarchy here, so the
+     display sizes sit roughly 3x the body step rather than 1.4x. */
+  --text-micro: 0.6875rem;
+  --text-label: 0.75rem;
+  --text-body: 0.875rem;
+  --text-lede: 0.9375rem;
+  --text-figure: clamp(1.375rem, 1.15rem + 0.7vw, 1.75rem);
+  --text-title: clamp(1.5rem, 1.15rem + 1.4vw, 2.375rem);
+  --text-display: clamp(2rem, 1.4rem + 2.4vw, 3.25rem);
+
+  /* Deliberately non-uniform: dense inside a card, generous between sections. */
+  --space-hair: 0.25rem;
+  --space-tight: 0.5rem;
+  --space-snug: 0.75rem;
+  --space-base: 1rem;
+  --space-wide: 1.5rem;
+  --space-loose: 2rem;
+  --space-section: clamp(2.5rem, 1.75rem + 2.5vw, 4rem);
+
+  /* Radii are NOT uniform: a chip is nearly a pill, a card is generously
+     rounded, an input sits between them. Uniform radius everywhere is one of
+     the tells of a template. */
+  --radius-chip: 6px;
+  --radius-field: 8px;
+  --radius-card: 14px;
+  --radius-pill: 999px;
+
+  /* The signature: solid, un-blurred, offset down-and-right. Never a blur. */
+  --lift: 3px;
+  --lift-card: 5px;
+  --shadow-press: var(--lift) var(--lift) 0 var(--stroke);
+  --shadow-card: var(--lift-card) var(--lift-card) 0 var(--stroke);
+
+  --border: 2px solid var(--stroke);
+  --border-hair: 1px solid var(--stroke-hair);
+
+  --duration-fast: 120ms;
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Night paper, not a blue-grey dashboard: a warm brown-black ground with cream
+   ink. Borders and hard shadows become the cream, so a card still reads as an
+   ink-drawn object rather than dissolving into the ground. The pastels are
+   re-chosen at dark-appropriate chroma rather than lightness-flipped, so mint
+   still reads as mint. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #1a1815;
+    --paper-sunken: #131210;
+    --card: #232019;
+    --ink: #f2ede3;
+    --ink-muted: #a8a294;
+    --ink-faint: #6f6a5e;
+
+    --stroke: #f2ede3;
+    --stroke-hair: #45402f;
+
+    /* Damped, never darkened past the point where --band-ink stops being the
+       right text colour on them. */
+    --mint: #74c9a4;
+    --sky: #a3dff2;
+    --butter: #f2e488;
+    --coral: #fa9169;
+
+    --butter-tint: color-mix(in oklab, var(--butter) 22%, var(--card));
+    --coral-tint: color-mix(in oklab, var(--coral) 22%, var(--card));
+  }
+}
+
+/* Transitions are removed, not shortened. The button press still works: it is a
+   state, not an animation. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+  }
+}

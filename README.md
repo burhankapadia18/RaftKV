@@ -347,6 +347,77 @@ Same status codes as a write. **Deleting a key that does not exist returns
 `200`** — the operation is idempotent and the response describes the resulting
 state, not whether anything changed.
 
+### List keys
+
+```http
+GET /kv?prefix=&cursor=&limit=
+```
+
+| Outcome | Status | Body |
+|---|---|---|
+| Success | `200 OK` | `{"keys":["app%3Aa"],"next_cursor":"app%3Aa%00"}` |
+| `limit` not an integer in `1..500` | `400 Bad Request` | `{"error":"limit must be an integer between 1 and 500"}` |
+| Malformed percent-encoding in `prefix` or `cursor` | `400 Bad Request` | `{"error":"malformed percent-encoding in the query string"}` |
+| `prefix` under the reserved `__sys:` space | `403 Forbidden` | `{"error":"keys under \"__sys:\" are reserved; use /auth/users/{name}"}` |
+| `prefix` outside the caller's key patterns | `403 Forbidden` | `{"error":"prefix must fall within your permitted key patterns"}` |
+| Method other than GET | `405 Method Not Allowed` | `{"error":"method not allowed on /kv: use GET"}` |
+
+**Keys in the response are percent-encoded.** A key is arbitrary bytes and a
+JSON string is Unicode text, so a key holding a raw `0x80` would produce a body
+no parser accepts. The encoded form pastes straight back into `/kv/{key}`, which
+percent-decodes.
+
+**Page until `next_cursor` is absent — never until a page is short.** Reserved
+keys and keys outside your ACL are filtered out, so a page can come back shorter
+than `limit` while more keys remain. `limit` defaults to 100 and is *clamped* at
+500 rather than rejected.
+
+`next_cursor` is a *position*, not a key: normally the last returned key plus a
+NUL byte, so it reveals only keys you have already been shown.
+
+Values are **not** returned — fetch them with `GET /kv/{key}`. A page of 500
+values could be hundreds of megabytes.
+
+Requires the `read` class. A caller whose key patterns are not `*` must scan
+inside its own allowance, which is what keeps a key name it cannot read out of
+both the listing and the cursor.
+
+### Cluster status
+
+```http
+GET /cluster/status
+```
+
+Requires the `read` class and applies no key-pattern check, since it addresses no
+key. **Every node answers for itself**, including its own belief about who leads
+— it needs no leader and touches no log. Poll all three and a disagreement
+between them is the information.
+
+```json
+{"node_id":"node1","state":"Leader","term":4,
+ "leader_id":"node1","leader_addr":"node1:8088",
+ "peers":[{"id":"node1","address":"node1:8088","suffrage":"Voter"}],
+ "first_log_index":1,"last_log_index":118,"applied_index":118,
+ "commit_index":118,"last_snapshot_index":0,
+ "key_count":42,"wal_bytes":9310,"auth_enabled":false}
+```
+
+`error` appears only when one field could not be read and the rest still stands.
+An **unreachable sidecar is a `502`**, never a `200` with zeroed fields — a
+dashboard showing "term 0, no peers, not leader" is indistinguishable from a
+cluster that has lost quorum.
+
+### List users
+
+```http
+GET /auth/users
+```
+
+Requires the `admin` class; `403` when authentication is disabled, like the rest
+of `/auth/*`. Returns `{"users":["alice","bob"]}` — **names only**, never a salt
+or a password hash. The bootstrap administrator from `RAFTKV_ADMIN_PASSWORD` is
+not a record and is not listed.
+
 ### Percent-decoding
 
 `/kv/{key}` percent-decodes its path. `/get-val?key=` and `/insert-val` do not.
@@ -468,6 +539,42 @@ is the same propagation delay any replicated ACL has.
 | Outcome | Status | Body |
 |---|---|---|
 | Any other path | `404 Not Found` | `{"error":"not found"}` |
+
+## Management console
+
+A browser console is served by the engine itself at
+**<http://localhost:8080/console/>** (`/` redirects there). No extra process, no
+extra port, no extra container: the built assets are embedded in `kvdb_node` as
+read-only data at compile time.
+
+Three pages — a cluster overview, a key browser with prefix listing and a
+single-key console, and user/ACL management when authentication is on.
+
+**What it costs the database.** Nothing while idle: no background thread, no
+timer, and nothing computed until a browser asks. The cluster page polls once
+every 3 s **only while its tab is visible**, and stops entirely when hidden. The
+one standing cost is the ordered key index behind `GET /kv`, at roughly 48–64
+bytes per key.
+
+**It shows one node's view.** The page polls the node that served it, which
+answers `/cluster/status` locally and includes the committed peer list. It cannot
+poll its siblings, because a served page cannot know their browser-reachable URLs
+— published host ports are a compose detail, and the secure profile puts one
+proxy address in front of all three. Open the console on each node to compare.
+
+**Authentication.** The static assets are served without a credential — a page
+that needed one to load could not render a login form — while every API call it
+makes goes through the normal gate. With authentication off, the console shows a
+banner saying so.
+
+**Building without Node.** `KVDB_CONSOLE` defaults to `ON` and the Docker build
+handles it. A local CMake build with no Node needs `-DKVDB_CONSOLE=OFF`; the
+console routes then answer `404 {"error":"console not built into this binary"}`.
+
+```bash
+cd console && npm ci && npm run build   # produces console/dist
+cmake -S cpp-app -B cpp-app/build       # embeds it
+```
 
 ### Cluster Management (Sidecar)
 

@@ -63,9 +63,35 @@ public:
   std::string last_payload;
   int calls = 0;
 
+  /** @brief Scriptable cluster status (console phase). */
+  [[nodiscard]] StatusResult status() override {
+    ++status_calls;
+    return status_result;
+  }
+
   ReadResult read_result = ReadResult::miss();
   std::string last_read_key;
   int read_calls = 0;
+
+  StatusResult status_result;
+  int status_calls = 0;
+};
+
+/**
+ * @brief In-memory IStoreStats double.
+ *
+ * Separate from FakeKVStore on purpose: IStoreStats is its own seam, so a test
+ * can drive the counters without touching the storage fake at all.
+ */
+class FakeStoreStats : public IStoreStats {
+public:
+  std::size_t keys = 0;
+  std::size_t wal_bytes = 0;
+
+  [[nodiscard]] std::size_t key_count() const override { return keys; }
+  [[nodiscard]] std::size_t wal_size_bytes() const override {
+    return wal_bytes;
+  }
 };
 
 /** @brief In-memory IKVStore double - no file, no locking. */
@@ -100,6 +126,35 @@ public:
   void restore_state(StateMap state) override {
     entries_.clear();
     entries_.insert(state.begin(), state.end());
+  }
+
+  /**
+   * @brief scan_keys over the ordered map backing this fake.
+   *
+   * Same contract as PersistentKVStore::scan_keys, implemented independently:
+   * a fake that delegated to the real store would not be a fake.
+   */
+  [[nodiscard]] KeyPage scan_keys(std::string_view prefix,
+                                  std::string_view start,
+                                  size_t limit) const override {
+    KeyPage page;
+    if (limit == 0) {
+      return page;
+    }
+    const std::string from = std::string((start > prefix) ? start : prefix);
+    for (auto it = entries_.lower_bound(from); it != entries_.end(); ++it) {
+      const std::string &key = it->first;
+      if (key.size() < prefix.size() ||
+          key.compare(0, prefix.size(), prefix) != 0) {
+        break;
+      }
+      if (page.keys.size() == limit) {
+        return page;
+      }
+      page.keys.push_back(key);
+    }
+    page.reached_end = true;
+    return page;
   }
 
 private:
@@ -157,11 +212,14 @@ public:
 
 class KVHttpHandlerTest : public ::testing::Test {
 protected:
-  KVHttpHandlerTest() : handler_(raft_, store_, auth_) {}
+  // `stats_` is a separate object from `store_` because IStoreStats is its own
+  // seam; in production PersistentKVStore is passed twice, once per interface.
+  KVHttpHandlerTest() : handler_(raft_, store_, auth_, stats_) {}
 
   FakeRaftClient raft_;
   FakeKVStore store_;
   FakeAuthEngine auth_;
+  FakeStoreStats stats_;
   KVHttpHandler handler_;
 };
 
@@ -667,7 +725,7 @@ TEST_F(KVHttpHandlerTest, TheAuthenticatorIsNotEvenConsultedWhenDisabled) {
 
 class AuthenticatedHandlerTest : public ::testing::Test {
 protected:
-  AuthenticatedHandlerTest() : handler_(raft_, store_, auth_) {
+  AuthenticatedHandlerTest() : handler_(raft_, store_, auth_, stats_) {
     auth_.enabled_flag = true;
     // Default caller: a full-access non-admin, so a test that cares about the
     // admin class has to grant it explicitly.
@@ -678,6 +736,7 @@ protected:
   FakeRaftClient raft_;
   FakeKVStore store_;
   FakeAuthEngine auth_;
+  FakeStoreStats stats_;
   KVHttpHandler handler_;
 };
 
@@ -1061,6 +1120,442 @@ TEST_F(AdminHandlerTest, TheUserNameNeverBecomesAMetricLabel) {
   const std::string exposition = metrics::Registry::global().render();
   EXPECT_EQ(exposition.find("some-unique-user-name"), std::string::npos);
   EXPECT_NE(exposition.find("/auth/users/{name}"), std::string::npos);
+}
+
+// --- GET /kv (list) --------------------------------------------------------
+//
+// Every key in the body is PERCENT-ENCODED. Keys are arbitrary bytes; a JSON
+// string is Unicode text, so a key holding a raw 0x80 would produce a body no
+// parser accepts -- and json_escape() would not save it, because it passes
+// bytes >= 0x20 straight through (correct for UTF-8, wrong for arbitrary).
+
+namespace {
+
+/** @brief GET /kv with the given raw (undecoded) query string. */
+HttpRequest list_request(const std::string &query_string) {
+  HttpRequest request;
+  request.method = "GET";
+  request.path = "/kv";
+  request.query_string = query_string;
+  return request;
+}
+
+} // namespace
+
+TEST_F(KVHttpHandlerTest, KvListReturnsPercentEncodedKeysInOrder) {
+  store_.set("app:b", "2");
+  store_.set("app:a", "1");
+  store_.set("other", "3");
+
+  const HttpResponse response = handler_.handle(list_request("prefix=app%3A"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.content_type, kJsonContentType);
+  EXPECT_EQ(response.body, "{\"keys\":[\"app%3Aa\",\"app%3Ab\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListOmitsCursorAtTheEndOfTheRange) {
+  store_.set("k1", "v");
+  const HttpResponse response = handler_.handle(list_request("prefix=k"));
+  // No next_cursor: a client pages until the field is ABSENT, never by
+  // comparing the returned count against limit.
+  EXPECT_EQ(response.body, "{\"keys\":[\"k1\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListPaginatesWithAnOpaquePosition) {
+  for (const char *key : {"k1", "k2", "k3"}) {
+    store_.set(key, "v");
+  }
+
+  const HttpResponse first = handler_.handle(list_request("prefix=k&limit=2"));
+  EXPECT_EQ(first.status_code, 200);
+  // The position is the last emitted key plus a NUL, so it reveals only a key
+  // the caller has already been shown.
+  EXPECT_EQ(first.body, "{\"keys\":[\"k1\",\"k2\"],\"next_cursor\":\"k2%00\"}");
+
+  const HttpResponse second =
+      handler_.handle(list_request("prefix=k&limit=2&cursor=k2%00"));
+  EXPECT_EQ(second.body, "{\"keys\":[\"k3\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListEncodesKeysThatAreNotValidUtf8) {
+  store_.set(std::string("k\x80\x01", 3), "v");
+  const HttpResponse response = handler_.handle(list_request("prefix=k"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body, "{\"keys\":[\"k%80%01\"]}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListNeverRevealsAReservedKeyOrPosition) {
+  store_.set("__sys:user:alice", "record");
+  store_.set("a", "v");
+
+  const HttpResponse response = handler_.handle(list_request("limit=1"));
+  EXPECT_EQ(response.status_code, 200);
+  // The reserved range is jumped over as a range, so neither the keys array
+  // nor the cursor can name a user record.
+  EXPECT_EQ(response.body, "{\"keys\":[\"a\"]}");
+  EXPECT_EQ(response.body.find("__sys"), std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRefusesAReservedPrefix) {
+  const HttpResponse response =
+      handler_.handle(list_request("prefix=__sys%3A"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_NE(response.body.find("are reserved"), std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRejectsABadLimit) {
+  EXPECT_EQ(handler_.handle(list_request("limit=0")).status_code, 400);
+  EXPECT_EQ(handler_.handle(list_request("limit=-1")).status_code, 400);
+  EXPECT_EQ(handler_.handle(list_request("limit=abc")).status_code, 400);
+  EXPECT_EQ(handler_.handle(list_request("limit=abc")).body,
+            "{\"error\":\"limit must be an integer between 1 and 500\"}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListClampsAnOverLargeLimit) {
+  // A cap is not a client error.
+  EXPECT_EQ(handler_.handle(list_request("limit=100000")).status_code, 200);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRejectsMalformedPercentEncoding) {
+  const HttpResponse response = handler_.handle(list_request("prefix=%zz"));
+  EXPECT_EQ(response.status_code, 400);
+  EXPECT_EQ(response.body,
+            "{\"error\":\"malformed percent-encoding in the query "
+            "string\"}");
+}
+
+TEST_F(KVHttpHandlerTest, KvListDoesNotCollideWithTheSingleKeyRoute) {
+  // "/kv" has no trailing slash; "/kv/" is still the empty-key 400.
+  EXPECT_EQ(handler_.handle(request_for("GET", "/kv/")).status_code, 400);
+}
+
+TEST_F(KVHttpHandlerTest, KvListRejectsANonGetMethod) {
+  HttpRequest request = list_request("");
+  request.method = "POST";
+  EXPECT_EQ(handler_.handle(request).status_code, 405);
+}
+
+TEST_F(AuthenticatedHandlerTest, KvListRequiresTheReadClass) {
+  auth_.identity = identity_with("writer", {auth::kClassWrite}, {"*"});
+
+  const HttpResponse response = handler_.handle(list_request("prefix=app%3A"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_EQ(response.body, "{\"error\":\"permission denied\"}");
+}
+
+TEST_F(AuthenticatedHandlerTest,
+       KvListAppliesKeyPatternsAndRequiresACoveredPrefix) {
+  store_.set("app:mine", "v");
+  store_.set("other:theirs", "v");
+  auth_.identity = identity_with("scoped", {auth::kClassRead}, {"app:*"});
+
+  // Inside the allowance: fine.
+  const HttpResponse allowed = handler_.handle(list_request("prefix=app%3A"));
+  EXPECT_EQ(allowed.status_code, 200);
+  EXPECT_EQ(allowed.body, "{\"keys\":[\"app%3Amine\"]}");
+
+  // Outside it: refused, rather than scanning keys it may not see. This is
+  // what keeps a filtered-out key name out of the returned position.
+  const HttpResponse refused = handler_.handle(list_request("prefix=other%3A"));
+  EXPECT_EQ(refused.status_code, 403);
+  EXPECT_EQ(refused.body,
+            "{\"error\":\"prefix must fall within your permitted key "
+            "patterns\"}");
+
+  // And an unrestricted scan is refused for the same reason.
+  EXPECT_EQ(handler_.handle(list_request("")).status_code, 403);
+}
+
+// --- GET /cluster/status ---------------------------------------------------
+
+namespace {
+
+/** @brief A StatusResult the sidecar answered successfully. */
+StatusResult healthy_status() {
+  StatusResult status;
+  status.ok = true;
+  status.node_id = "node1";
+  status.state = "Leader";
+  return status;
+}
+
+} // namespace
+
+TEST_F(KVHttpHandlerTest, ClusterStatusRendersRaftAndLocalState) {
+  raft_.status_result = StatusResult{};
+  raft_.status_result.ok = true;
+  raft_.status_result.node_id = "node1";
+  raft_.status_result.state = "Leader";
+  raft_.status_result.term = 4;
+  raft_.status_result.leader_id = "node1";
+  raft_.status_result.leader_addr = "node1:8088";
+  raft_.status_result.first_log_index = 1;
+  raft_.status_result.last_log_index = 118;
+  raft_.status_result.applied_index = 117;
+  raft_.status_result.commit_index = 118;
+  raft_.status_result.last_snapshot_index = 0;
+  raft_.status_result.peers = {RaftPeer{"node1", "node1:8088", "Voter"},
+                               RaftPeer{"node2", "node2:8088", "Voter"}};
+  stats_.keys = 42;
+  stats_.wal_bytes = 9310;
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.content_type, kJsonContentType);
+  EXPECT_EQ(response.body,
+            "{\"node_id\":\"node1\",\"state\":\"Leader\",\"term\":4,"
+            "\"leader_id\":\"node1\",\"leader_addr\":\"node1:8088\","
+            "\"peers\":["
+            "{\"id\":\"node1\",\"address\":\"node1:8088\","
+            "\"suffrage\":\"Voter\"},"
+            "{\"id\":\"node2\",\"address\":\"node2:8088\","
+            "\"suffrage\":\"Voter\"}],"
+            "\"first_log_index\":1,\"last_log_index\":118,"
+            "\"applied_index\":117,\"commit_index\":118,"
+            "\"last_snapshot_index\":0,"
+            "\"key_count\":42,\"wal_bytes\":9310,"
+            "\"auth_enabled\":false}");
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusIs502WhenTheSidecarIsUnreachable) {
+  raft_.status_result = StatusResult::failure("sidecar unreachable");
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+
+  // 502, not 200-with-zeros. A dashboard rendering "term 0, no peers, not
+  // leader" for a node whose sidecar is merely unreachable looks exactly like
+  // a cluster that has lost quorum, which is worse than an error.
+  EXPECT_EQ(response.status_code, 502);
+  EXPECT_EQ(response.body, "{\"error\":\"sidecar unreachable\"}");
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusReportsAPartialFailure) {
+  raft_.status_result = healthy_status();
+  raft_.status_result.state = "Follower";
+  raft_.status_result.partial_error = "failed to read first log index";
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_NE(response.body.find("\"error\":\"failed to read first log index\""),
+            std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusOmitsTheErrorFieldWhenHealthy) {
+  raft_.status_result = healthy_status();
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/cluster/status"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body.find("\"error\""), std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusRejectsANonGetMethod) {
+  raft_.status_result = healthy_status();
+
+  const HttpResponse response =
+      handler_.handle(request_for("POST", "/cluster/status"));
+  EXPECT_EQ(response.status_code, 405);
+}
+
+TEST_F(KVHttpHandlerTest, ClusterStatusReportsAuthEnabled) {
+  // The console shows an "unauthenticated" banner off this field, so it must
+  // reflect the engine's real configuration rather than the request.
+  raft_.status_result = healthy_status();
+  EXPECT_NE(handler_.handle(request_for("GET", "/cluster/status"))
+                .body.find("\"auth_enabled\":false"),
+            std::string::npos);
+}
+
+TEST_F(AuthenticatedHandlerTest, ClusterStatusRequiresTheReadClassOnly) {
+  // read-class, no key pattern check: it addresses no key, and requiring admin
+  // would hide the overview page from the users most likely to open it.
+  raft_.status_result = healthy_status();
+
+  auth_.identity = identity_with("reader", {auth::kClassRead}, {"nothing:*"});
+  EXPECT_EQ(handler_.handle(request_for("GET", "/cluster/status")).status_code,
+            200);
+  // ...and it reports auth as ON, unlike the fixture above.
+  EXPECT_NE(handler_.handle(request_for("GET", "/cluster/status"))
+                .body.find("\"auth_enabled\":true"),
+            std::string::npos);
+
+  auth_.identity = identity_with("writer", {auth::kClassWrite}, {"*"});
+  EXPECT_EQ(handler_.handle(request_for("GET", "/cluster/status")).status_code,
+            403);
+
+  auth_.outcome = auth::AuthOutcome::kNoCredentials;
+  EXPECT_EQ(handler_.handle(request_for("GET", "/cluster/status")).status_code,
+            401);
+}
+
+// --- GET /auth/users -------------------------------------------------------
+
+TEST_F(AdminHandlerTest, UsersListReturnsNamesInOrder) {
+  // Records are planted directly in the store: this route reads key NAMES, so
+  // it must work without going anywhere near a propose.
+  store_.set(auth::user_storage_key("carol"), "record");
+  store_.set(auth::user_storage_key("alice"), "record");
+  store_.set(auth::user_storage_key("bob"), "record");
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.content_type, kJsonContentType);
+  // Names only. Usernames are charset-restricted to [A-Za-z0-9_.-] by
+  // auth::username_error, so unlike data keys they are safe raw in JSON.
+  EXPECT_EQ(response.body, "{\"users\":[\"alice\",\"bob\",\"carol\"]}");
+}
+
+TEST_F(AdminHandlerTest, UsersListNeverLeaksASaltOrAHash) {
+  // A real serialized record, so the assertion is not vacuous.
+  auth::UserUpsertRequest request;
+  request.password = "s3cret";
+  request.enabled = true;
+  request.classes = {auth::kClassRead};
+  request.patterns = {"*"};
+  store_.set(auth::user_storage_key("alice"),
+             request.to_record("alice").to_msgpack());
+
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body, "{\"users\":[\"alice\"]}");
+  EXPECT_EQ(response.body.find("s3cret"), std::string::npos);
+  EXPECT_EQ(response.body.find("salt"), std::string::npos);
+  EXPECT_EQ(response.body.find("hash"), std::string::npos);
+  // The route must never deserialize a UserRecord into the response at all.
+  EXPECT_EQ(response.body.find("classes"), std::string::npos);
+}
+
+TEST_F(AdminHandlerTest, UsersListOmitsTheBootstrapAdmin) {
+  // The configured admin is not a record, and PUT /auth/users/admin is already
+  // refused, so listing it would advertise an account this API cannot manage.
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+  EXPECT_EQ(response.status_code, 200);
+  EXPECT_EQ(response.body, "{\"users\":[]}");
+}
+
+TEST_F(AdminHandlerTest, UsersListIgnoresNonUserReservedKeys) {
+  // Only the user prefix is listed, not the whole reserved space: a future
+  // "__sys:" key of another kind must not turn up as a phantom account.
+  store_.set(auth::user_storage_key("alice"), "record");
+  store_.set("__sys:something-else", "value");
+
+  EXPECT_EQ(handler_.handle(request_for("GET", "/auth/users")).body,
+            "{\"users\":[\"alice\"]}");
+}
+
+TEST_F(AuthenticatedHandlerTest, UsersListRequiresTheAdminClass) {
+  auth_.identity = identity_with("reader", {auth::kClassRead}, {"*"});
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_EQ(response.body, "{\"error\":\"permission denied\"}");
+}
+
+TEST_F(AdminHandlerTest, UsersListRejectsANonGetMethod) {
+  EXPECT_EQ(handler_.handle(request_for("DELETE", "/auth/users")).status_code,
+            405);
+}
+
+TEST_F(KVHttpHandlerTest, UsersListIsClosedWhenAuthIsDisabled) {
+  // Default-closed, exactly like the rest of /auth/*: with no admin password
+  // there is no way to authenticate an administrator.
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/auth/users"));
+  EXPECT_EQ(response.status_code, 403);
+  EXPECT_NE(response.body.find("RAFTKV_ADMIN_PASSWORD"), std::string::npos);
+}
+
+// --- Console static routes -------------------------------------------------
+//
+// The C++ test build has no Node, so the generated asset table is EMPTY here.
+// That is the KVDB_CONSOLE=OFF shape and it is a real deployment mode, so it
+// gets a real contract rather than being untested. The populated table is
+// exercised end-to-end instead (tests/e2e/test_console.py).
+
+namespace {
+
+/** @brief The value of one response header, or "" when absent. */
+std::string header_of(const HttpResponse &response, const std::string &name) {
+  for (const auto &header : response.extra_headers) {
+    if (header.first == name) {
+      return header.second;
+    }
+  }
+  return std::string();
+}
+
+} // namespace
+
+TEST_F(KVHttpHandlerTest, RootRedirectsToTheConsole) {
+  const HttpResponse response = handler_.handle(request_for("GET", "/"));
+
+  EXPECT_EQ(response.status_code, 302);
+  EXPECT_EQ(HttpResponse::reason_phrase(302), "Found");
+  EXPECT_EQ(header_of(response, "Location"), "/console/");
+  // ...and it must actually reach the wire.
+  EXPECT_NE(response.to_string().find("Location: /console/"),
+            std::string::npos);
+}
+
+TEST_F(KVHttpHandlerTest, ConsolePathIs404WhenNotBuiltIn) {
+  const HttpResponse response =
+      handler_.handle(request_for("GET", "/console/"));
+  EXPECT_EQ(response.status_code, 404);
+  // An answer, not a mystery: an operator hitting this needs to know the
+  // binary was configured without the console, not that they mistyped.
+  EXPECT_EQ(response.body,
+            "{\"error\":\"console not built into this binary\"}");
+}
+
+TEST_F(KVHttpHandlerTest, ConsoleAssetPathIs404WhenNotBuiltIn) {
+  EXPECT_EQ(handler_.handle(request_for("GET", "/console/assets/app-abc123.js"))
+                .status_code,
+            404);
+}
+
+TEST_F(AuthenticatedHandlerTest, ConsoleRoutesSkipTheAuthenticationGate) {
+  // Deliberate exception to authenticate-once-before-any-route: these bytes
+  // are compile-time constants holding no cluster state, and a page that
+  // needed a credential to LOAD could not render a login form.
+  //
+  // With an empty table that is observable as 404-not-401.
+  auth_.outcome = auth::AuthOutcome::kNoCredentials;
+
+  EXPECT_EQ(handler_.handle(request_for("GET", "/console/")).status_code, 404);
+  // And the redirect must not demand a credential either.
+  EXPECT_EQ(handler_.handle(request_for("GET", "/")).status_code, 302);
+
+  // The engine never even consulted the authenticator for these two.
+  EXPECT_EQ(auth_.calls, 0);
+
+  // Contrast: an API route on the same server still demands one.
+  EXPECT_EQ(handler_.handle(request_for("GET", "/kv/k")).status_code, 401);
+}
+
+TEST_F(KVHttpHandlerTest, ConsoleRejectsANonGetMethod) {
+  EXPECT_EQ(handler_.handle(request_for("POST", "/console/")).status_code, 405);
+}
+
+TEST_F(KVHttpHandlerTest, ConsolePathsCollapseToOneMetricLabel) {
+  // ONE label for every asset. Labelling per file would create a time series
+  // per asset -- the same unbounded-cardinality mistake that keeps the key out
+  // of /kv/{key}. Asserted through the rendered exposition, which is where it
+  // would actually show up.
+  handler_.handle(request_for("GET", "/console/assets/app-unique-hash.js"));
+
+  const std::string exposition = metrics::Registry::global().render();
+  EXPECT_EQ(exposition.find("app-unique-hash"), std::string::npos);
+  EXPECT_NE(exposition.find("/console/*"), std::string::npos);
 }
 
 } // namespace

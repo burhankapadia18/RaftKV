@@ -6,11 +6,14 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 
@@ -147,6 +150,30 @@ inline constexpr size_t kStateMinEntrySize = 8;
 }
 
 /**
+ * @brief Observability seam over a store: counters, not storage semantics.
+ *
+ * Deliberately SEPARATE from IKVStore. key_count() and wal_size_bytes() were
+ * kept off IKVStore on purpose -- widening the storage interface for
+ * observability forces every test fake to implement it -- and that decision
+ * still holds. What changed is that the HTTP handler is now a consumer of these
+ * counters (GET /cluster/status), and it holds interfaces, not the concrete
+ * store. So they get their own seam rather than moving.
+ *
+ * PersistentKVStore implements both interfaces; main.cpp holds the concrete
+ * type and injects it twice, once per interface.
+ */
+class IStoreStats {
+public:
+  virtual ~IStoreStats() = default;
+
+  /** @brief Keys currently held in the local store. */
+  [[nodiscard]] virtual std::size_t key_count() const = 0;
+
+  /** @brief Current size of the write-ahead log, in bytes. */
+  [[nodiscard]] virtual std::size_t wal_size_bytes() const = 0;
+};
+
+/**
  * @brief Abstract interface for key-value storage.
  *
  * Follows the Interface Segregation Principle - defines only
@@ -188,6 +215,39 @@ public:
    * moved into place.
    */
   virtual void restore_state(StateMap state) = 0;
+
+  /**
+   * @brief One page of keys, plus whether the prefix range is exhausted.
+   *
+   * `reached_end` is not derivable from `keys.size() < limit`: a caller that
+   * filters the page (for reserved keys, or for an ACL) may need several pages
+   * to fill one response, and a short page does not mean the last page.
+   */
+  struct KeyPage {
+    std::vector<std::string> keys;
+    bool reached_end = false;
+  };
+
+  /**
+   * @brief Up to @p limit keys carrying @p prefix, from @p start inclusive.
+   *
+   * Lexicographic (byte) order. An empty @p start means "the beginning of the
+   * prefix range"; a @p start that precedes the range snaps forward to it.
+   *
+   * @p start is INCLUSIVE on purpose. An exclusive "after key K" cursor cannot
+   * express "resume past this entire range of keys", because a string has no
+   * immediate predecessor. An inclusive position expresses both: `K + '\0'` is
+   * the first position strictly after `K` (any key greater than `K` either
+   * extends it, and so is >= `K + '\0'`, or diverges earlier), and `"__sys;"`
+   * is the first position past every `"__sys:"`-prefixed key.
+   *
+   * Keys are copied out; the caller may hold them freely. Deliberately takes no
+   * filter callback: that would run caller logic while the store mutex is held.
+   * A caller that needs filtering calls this repeatedly instead.
+   */
+  [[nodiscard]] virtual KeyPage scan_keys(std::string_view prefix,
+                                          std::string_view start,
+                                          size_t limit) const = 0;
 };
 
 /**
@@ -223,7 +283,7 @@ public:
  * The constructor calls the same helpers without the lock, which is safe
  * because no other thread can reach the object before construction returns.
  */
-class PersistentKVStore : public IKVStore {
+class PersistentKVStore : public IKVStore, public IStoreStats {
 public:
   /**
    * @brief Open the store at @p db_path and recover its contents.
@@ -272,7 +332,7 @@ public:
   void set(const std::string &key, const std::string &value) override {
     std::lock_guard<std::mutex> lock(mutex_);
     wal_.append(encode_command(kOpSet, key, value));
-    store_[key] = value;
+    put_unlocked(key, value);
     maybe_compact_unlocked();
   }
 
@@ -304,7 +364,7 @@ public:
       return false;
     }
     wal_.append(encode_command(kOpDelete, key, std::string()));
-    store_.erase(key);
+    erase_unlocked(key);
     maybe_compact_unlocked();
     return true;
   }
@@ -314,18 +374,35 @@ public:
    *
    * Deliberately NOT on IKVStore: it exists for observability, and widening the
    * storage interface for it would force every test fake to implement it too.
-   * main.cpp holds the concrete type, which is all the metrics registration
-   * needs.
+   * It IS on IStoreStats, which is that same reasoning taken one step further
+   * -- a separate seam for the HTTP handler, which holds interfaces rather than
+   * the concrete store. main.cpp holds the concrete type and injects both.
    */
-  [[nodiscard]] size_t key_count() const {
+  [[nodiscard]] size_t key_count() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     return store_.size();
   }
 
   /** @brief Current WAL size in bytes (R5.4 gauge). */
-  [[nodiscard]] size_t wal_size_bytes() const {
+  [[nodiscard]] size_t wal_size_bytes() const override {
     std::lock_guard<std::mutex> lock(mutex_);
     return wal_.size_bytes();
+  }
+
+  /**
+   * @brief The index's contents, in order, as owned strings (tests only).
+   *
+   * Exists so the string_view invariant is observable. Deliberately NOT on
+   * IKVStore and deliberately O(n): production code pages through scan_keys.
+   */
+  [[nodiscard]] std::vector<std::string> ordered_keys_for_test() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> keys;
+    keys.reserve(index_.size());
+    for (const std::string_view key : index_) {
+      keys.emplace_back(key);
+    }
+    return keys;
   }
 
   /**
@@ -396,7 +473,46 @@ public:
     const std::string image = serialize_state(state);
     reset_wal_unlocked();
     write_base_unlocked(image);
-    store_ = std::move(state);
+    replace_all_unlocked(std::move(state));
+  }
+
+  /**
+   * @brief One page of keys under @p prefix, from @p start inclusive.
+   *
+   * O(log n + page) against the ordered index, so the cost of a listing is the
+   * page rather than the store. See IKVStore::scan_keys for the contract, and
+   * in particular for why @p start is inclusive.
+   */
+  [[nodiscard]] KeyPage scan_keys(std::string_view prefix,
+                                  std::string_view start,
+                                  size_t limit) const override {
+    KeyPage page;
+    if (limit == 0) {
+      // Asked for nothing, so nothing is known about what follows.
+      return page;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // max(prefix, start): an empty or too-early start snaps to the beginning of
+    // the prefix range, so the walk below cannot stop on a key that simply
+    // precedes it.
+    const std::string_view from = (start > prefix) ? start : prefix;
+    page.keys.reserve(limit);
+
+    for (auto it = index_.lower_bound(from); it != index_.end(); ++it) {
+      const std::string_view key = *it;
+      if (!has_prefix_unlocked(key, prefix)) {
+        break; // Ordered, so the first miss ends the range.
+      }
+      if (page.keys.size() == limit) {
+        return page; // Full page; reached_end stays false.
+      }
+      page.keys.emplace_back(key);
+    }
+
+    page.reached_end = true;
+    return page;
   }
 
 private:
@@ -409,7 +525,100 @@ private:
   DurabilityOptions options_;
   Wal wal_;
   StateMap store_;
+
+  /**
+   * @brief Lexicographically ordered view of every key in @c store_.
+   *
+   * Holds std::string_view into the KEY STRINGS OWNED BY store_'s own nodes,
+   * so no key bytes are copied: an unordered_map node keeps its address across
+   * a rehash, which is what makes the views stable. Cost is one RB-tree node
+   * per key (48-64 bytes, independent of key length).
+   *
+   * INVARIANT, and it is a use-after-free if broken: every view in here points
+   * at a live node of store_. Exactly three helpers may mutate store_ --
+   * put_unlocked, erase_unlocked and replace_all_unlocked -- and every one of
+   * them maintains this set. Nothing else in this file may touch store_
+   * directly.
+   *
+   * Declared AFTER store_ so it is destroyed FIRST: a set of views must not
+   * outlive the strings it points at, even during teardown.
+   *
+   * Byte-transparent, like the store: std::less<std::string_view> compares via
+   * char_traits::compare, so keys containing '=', newlines or NUL bytes order
+   * exactly.
+   */
+  std::set<std::string_view> index_;
+
   mutable std::mutex mutex_;
+
+  /**
+   * @brief Insert or update one entry, keeping @c index_ in step.
+   *
+   * The view is taken from the MAP NODE'S key (@c result.first->first), never
+   * from @p key. A view of the caller's argument dangles the moment that
+   * string dies -- and would appear to work, because the bytes are usually
+   * still there.
+   *
+   * Caller must hold @c mutex_.
+   */
+  void put_unlocked(const std::string &key, const std::string &value) {
+    const auto result = store_.insert_or_assign(key, value);
+    if (result.second) {
+      // A new node was created. An update reuses the existing node, whose key
+      // is already registered, so re-inserting would be wasted work.
+      index_.insert(std::string_view(result.first->first));
+    }
+  }
+
+  /**
+   * @brief Erase one entry, keeping @c index_ in step.
+   * @return true if the key existed.
+   *
+   * The view is removed BEFORE the node dies. The reverse order leaves a
+   * dangling view in the set for as long as it takes to erase it, and the
+   * erase itself compares against it.
+   *
+   * Caller must hold @c mutex_.
+   */
+  bool erase_unlocked(const std::string &key) {
+    const auto it = store_.find(key);
+    if (it == store_.end()) {
+      return false;
+    }
+    index_.erase(std::string_view(it->first));
+    store_.erase(it);
+    return true;
+  }
+
+  /**
+   * @brief Replace the whole map, rebuilding @c index_ from scratch.
+   *
+   * Every pre-existing view is dead and every new node is unregistered, so
+   * this is a clear-and-rebuild rather than a diff. O(n log n), and it only
+   * runs on a snapshot install or a start-up load.
+   *
+   * Caller must hold @c mutex_ (the constructor's calls are the documented
+   * exception: nothing can observe the object yet).
+   */
+  /**
+   * @brief True when @p key begins with @p prefix.
+   *
+   * C++17 has no std::string_view::starts_with. Pure, so despite the suffix it
+   * needs no lock at all -- named for consistency with the helpers around it.
+   */
+  [[nodiscard]] static bool has_prefix_unlocked(std::string_view key,
+                                                std::string_view prefix) {
+    return key.size() >= prefix.size() &&
+           key.compare(0, prefix.size(), prefix) == 0;
+  }
+
+  void replace_all_unlocked(StateMap state) {
+    index_.clear();
+    store_ = std::move(state);
+    for (const auto &entry : store_) {
+      index_.insert(std::string_view(entry.first));
+    }
+  }
 
   /**
    * @brief Rebuild in-memory state from disk (R2.3 / R2.5).
@@ -455,7 +664,7 @@ private:
       // file whose first line happens to begin with "KVB1" - resolves the same
       // way: it fails loudly rather than loading wrong data.
       try {
-        store_ = deserialize_state(*contents);
+        replace_all_unlocked(deserialize_state(*contents));
       } catch (const std::runtime_error &error) {
         // The decoder is shared with the snapshot path and knows nothing about
         // where its bytes came from, so the path is attached here - an
@@ -491,7 +700,7 @@ private:
       if (eq_pos == std::string::npos) {
         continue;
       }
-      store_[line.substr(0, eq_pos)] = line.substr(eq_pos + 1);
+      put_unlocked(line.substr(0, eq_pos), line.substr(eq_pos + 1));
     }
   }
 
@@ -554,10 +763,12 @@ private:
 
     switch (cmd.operation_type()) {
     case Operation::SET:
-      store_[cmd.key] = cmd.value;
+      put_unlocked(cmd.key, cmd.value);
       return true;
     case Operation::DELETE:
-      store_.erase(cmd.key);
+      // The bool is discarded on purpose: replay does not care whether the key
+      // was present, and erase_unlocked is deliberately not [[nodiscard]].
+      erase_unlocked(cmd.key);
       return true;
     case Operation::USER_SET:
     case Operation::USER_DEL:
