@@ -1,6 +1,7 @@
 import { useState } from 'preact/hooks';
 
 import { storeCredential } from '../lib/auth';
+import { Motif } from './Motif';
 
 interface Props {
   /** Message from the rejected request, if any. */
@@ -20,7 +21,14 @@ export function LoginForm({ reason, onAuthenticated }: Props) {
 
   return (
     <form class="login" onSubmit={onSubmit}>
+      <span class="login-motif">
+        <Motif size={40} />
+      </span>
       <h2 class="login-title">Sign in</h2>
+      <p class="login-note">
+        This node has client ACLs enabled. Credentials are sent to this node
+        only and are not stored beyond the browser session.
+      </p>
       {reason !== undefined && (
         <p class="error-note" role="alert">
           {reason}
@@ -50,7 +58,7 @@ export function LoginForm({ reason, onAuthenticated }: Props) {
         />
       </label>
       <button class="button is-primary" type="submit">
-        Sign in
+        Sign in <span class="arrow" aria-hidden="true">→</span>
       </button>
     </form>
   );

@@ -1,3 +1,5 @@
+import { Motif } from './Motif';
+
 interface Props {
   names: string[];
   onSelect: (name: string) => void;
@@ -7,11 +9,14 @@ interface Props {
 export function UserTable({ names, onSelect, onDelete }: Props) {
   if (names.length === 0) {
     return (
-      <p class="page-note">
-        No users yet. The bootstrap administrator comes from{' '}
-        <code>RAFTKV_ADMIN_PASSWORD</code> and is not a record, so it is not
-        listed here and cannot be edited.
-      </p>
+      <div class="empty">
+        <Motif />
+        <p>
+          No users yet. The bootstrap administrator comes from{' '}
+          <code>RAFTKV_ADMIN_PASSWORD</code> and is not a record, so it is not
+          listed here and cannot be edited.
+        </p>
+      </div>
     );
   }
 

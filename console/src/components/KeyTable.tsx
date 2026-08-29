@@ -1,4 +1,5 @@
 import { decodeKey } from '../lib/api';
+import { Motif } from './Motif';
 
 interface Props {
   /** Percent-encoded keys, exactly as the API returned them. */
@@ -14,7 +15,12 @@ interface Props {
  */
 export function KeyTable({ encodedKeys, selected, onSelect }: Props) {
   if (encodedKeys.length === 0) {
-    return <p class="page-note">No keys under this prefix.</p>;
+    return (
+      <div class="empty">
+        <Motif />
+        <p>No keys under this prefix.</p>
+      </div>
+    );
   }
 
   return (
@@ -45,7 +51,7 @@ export function KeyTable({ encodedKeys, selected, onSelect }: Props) {
                     type="button"
                     onClick={() => onSelect(raw)}
                   >
-                    Open
+                    Open <span class="arrow" aria-hidden="true">→</span>
                   </button>
                 </td>
               </tr>

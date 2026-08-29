@@ -140,7 +140,7 @@ export function UsersPage({ authEnabled, onUnauthorized }: Props) {
               type="button"
               onClick={() => setEditing({ mode: 'create' })}
             >
-              New user
+              New user <span class="arrow" aria-hidden="true">→</span>
             </button>
           </div>
         )}

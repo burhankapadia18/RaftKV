@@ -151,6 +151,23 @@ the only exception besides `/metrics`. Safe because they are compile-time
 constants holding no cluster state, and necessary because a page needing a
 credential to load cannot render a login form.
 
+The console's **visual language is specified in [DESIGN.md](DESIGN.md)** — the
+palette, where each of the four state colours is allowed to appear, why figures
+are set in the mono face rather than the display serif, and why both themes are
+designed rather than inverted. Two rules there are correctness, not taste, and
+belong here too:
+
+- **Assets are served under a tight CSP** (`default-src 'self'`, set in
+  `route_request`'s static-asset response). A `data:` URI is a fetched resource
+  and is blocked, silently — a masked pseudo-element simply loses its mask. The
+  deckled band edge was an SVG data URI first: it rendered from the filesystem,
+  passed every local check, and rendered on no real node. Verify console visuals
+  against a **running node**, never only the Vite dev server. No console change
+  may widen that header.
+- **No webfont.** The console ships inside the binary and is opened by operators
+  who may have no route to the internet, so the type is a system stack. If that
+  ever changes it is a subset, self-hosted, and recorded in DESIGN.md.
+
 `PUT /auth/users/{name}` takes **msgpack**, not JSON, and always requires a
 password of at least 8 bytes: an upsert mints a fresh salt and hash every time,
 so there is no partial update and no "leave the password alone" request. The

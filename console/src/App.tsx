@@ -109,7 +109,9 @@ export function App() {
   return (
     <div class="app-shell">
       <header class="app-header">
-        <h1 class="app-title">RaftKV</h1>
+        <h1 class="app-title">
+          Raft<span class="app-title-mark">KV</span>
+        </h1>
         <nav class="app-nav" aria-label="Console sections">
           {ROUTES.map((entry) => (
             <a

@@ -1,5 +1,8 @@
 @import './tokens.css';
 
+/* The base layer: paper, ink, and the three primitives every surface is built
+   from -- the drawn card, the pressable button and the field. See /DESIGN.md. */
+
 *,
 *::before,
 *::after {
@@ -8,96 +11,302 @@
 
 body {
   margin: 0;
-  background: var(--color-surface);
-  color: var(--color-text);
-  font: var(--text-body) / 1.5 var(--font-sans);
+  background: var(--paper);
+  color: var(--ink);
+  font: var(--text-body) / 1.55 var(--font-sans);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 /* Every figure on this page is compared against another figure, so digits must
-   not shift width between polls. */
+   not shift width between polls. This is also why figures are set in the mono
+   face and not the display serif, whose old-style figures vary in height and
+   cannot be compared down a column -- see DESIGN.md section 3. */
 .numeric {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+  font-size: 0.9375em;
+  letter-spacing: -0.01em;
 }
+
+/* Explicit ink, not inherited: a <code> span usually sits inside muted prose,
+   and a literal the operator has to type exactly is the wrong thing to render
+   at the surrounding paragraph's reduced contrast. */
+code {
+  padding: 0 0.25em;
+  border-radius: 3px;
+  background: var(--paper-sunken);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+/* Focus is designed, not defaulted: a keyboard operator must always know where
+   they are, and on a page whose whole language is drawn ink the ring is ink. */
+:focus-visible {
+  outline: 2px solid var(--stroke);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* --- Shell ------------------------------------------------------------- */
 
 .app-shell {
-  max-width: 78rem;
+  max-width: 76rem;
   margin: 0 auto;
-  padding: var(--space-loose) var(--space-base) var(--space-section);
+  padding: var(--space-wide) var(--space-base) var(--space-section);
 }
 
+/* The masthead is a drawn object in its own right rather than a rule under a
+   heading: it establishes the ink-on-paper contract before any data appears. */
 .app-header {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   gap: var(--space-base);
-  padding-bottom: var(--space-snug);
-  border-bottom: 1px solid var(--color-rule-strong);
+  padding: var(--space-snug) var(--space-base);
+  border: var(--border);
+  border-radius: var(--radius-card);
+  background: var(--card);
+  box-shadow: var(--shadow-card);
 }
 
 .app-title {
   margin: 0;
-  font-size: var(--text-title);
-  font-weight: 650;
-  letter-spacing: -0.015em;
+  font-family: var(--font-display);
+  font-size: 1.75rem;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+/* Darkened coral, not the band coral: the wordmark is text, and full-strength
+   coral on white is 2.1:1. Mixed toward the ink it keeps the accent and clears
+   the 3:1 that large text owes. */
+.app-title .app-title-mark {
+  color: color-mix(in oklab, var(--coral) 55%, var(--ink));
 }
 
 .app-nav {
   display: flex;
-  gap: var(--space-hair);
+  flex-wrap: wrap;
+  gap: var(--space-tight);
   margin-left: auto;
 }
 
+/* Tab chips, straight from the reference: bordered, unshadowed, and selected by
+   an INK FILL rather than a colour fill -- colour in this console means a raft
+   state and nothing else. */
 .app-nav a {
-  padding: var(--space-hair) var(--space-tight);
-  border-radius: var(--radius-sm);
-  color: var(--color-text-muted);
+  padding: 0.3rem 0.7rem;
+  border: var(--border);
+  border-radius: var(--radius-chip);
+  color: var(--ink);
   font-size: var(--text-label);
-  font-weight: 550;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.01em;
   text-decoration: none;
+  background: var(--card);
   transition:
-    color var(--duration-fast) var(--ease-out-expo),
+    transform var(--duration-fast) var(--ease-out-expo),
+    box-shadow var(--duration-fast) var(--ease-out-expo),
     background-color var(--duration-fast) var(--ease-out-expo);
 }
 
 .app-nav a:hover {
-  color: var(--color-text);
-  background: var(--color-surface-sunken);
+  background: var(--paper-sunken);
 }
 
 .app-nav a[aria-current='page'] {
-  color: var(--color-surface-raised);
-  background: var(--color-text);
+  background: var(--stroke);
+  color: var(--card);
 }
 
-/* Focus is designed, not defaulted: a keyboard operator must always know where
-   they are. */
-:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
+/* --- Button ------------------------------------------------------------ */
+
+/* The signature interaction: the hard shadow is offset by --lift, and pressing
+   translates by exactly that offset while the shadow goes to zero, so the
+   control appears pushed flat onto the paper. Transform and box-shadow only --
+   both compositor-friendly, neither touches layout. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 0.4rem 0.8rem;
+  border: var(--border);
+  border-radius: var(--radius-field);
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: var(--text-label);
+  font-weight: 650;
+  line-height: 1.4;
+  cursor: pointer;
+  box-shadow: var(--shadow-press);
+  transition:
+    transform var(--duration-fast) var(--ease-out-expo),
+    box-shadow var(--duration-fast) var(--ease-out-expo),
+    background-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.button:hover {
+  background: var(--paper-sunken);
+}
+
+.button:active {
+  transform: translate(var(--lift), var(--lift));
+  box-shadow: 0 0 0 var(--stroke);
+}
+
+.button.is-primary {
+  background: var(--coral);
+  color: var(--band-ink);
+}
+
+.button.is-primary:hover {
+  background: color-mix(in oklab, var(--coral) 88%, var(--band-ink));
+}
+
+/* Danger is coral too -- see DESIGN.md section 4. It is distinguished from the
+   primary action by being outlined rather than filled, which is also the
+   correct emphasis for a destructive control. */
+.button.is-danger {
+  background: var(--coral-tint);
+}
+
+.button[aria-pressed='true'] {
+  background: var(--stroke);
+  color: var(--card);
+}
+
+.button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: translate(var(--lift), var(--lift));
+}
+
+.button:disabled:hover {
+  background: var(--card);
+}
+
+/* The reference puts a trailing arrow on its calls to action. One glyph, no
+   asset, and it is the cheapest piece of the language to keep. */
+.button .arrow {
+  transition: transform var(--duration-fast) var(--ease-out-expo);
+}
+
+.button:hover .arrow {
+  transform: translateX(2px);
+}
+
+/* --- Fields ------------------------------------------------------------ */
+
+.field {
+  display: block;
+  margin-bottom: var(--space-base);
+}
+
+.field-label {
+  display: block;
+  margin-bottom: var(--space-hair);
+  color: var(--ink-muted);
+  font-size: var(--text-micro);
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.field-input,
+.field-textarea {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border: var(--border);
+  border-radius: var(--radius-field);
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--text-body);
+  transition:
+    box-shadow var(--duration-fast) var(--ease-out-expo),
+    background-color var(--duration-fast) var(--ease-out-expo);
+}
+
+.field-input:focus,
+.field-textarea:focus {
+  outline: none;
+  background: var(--card);
+  box-shadow: var(--shadow-press);
+}
+
+.field-input::placeholder,
+.field-textarea::placeholder {
+  color: var(--ink-faint);
+}
+
+.field-textarea {
+  min-height: 9rem;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.field-hint {
+  display: block;
+  margin-top: var(--space-hair);
+  color: var(--ink-muted);
+  font-size: var(--text-micro);
+  line-height: 1.5;
+}
+
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: var(--space-tight);
+}
+
+.checkbox-field input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--ink);
+}
+
+/* --- Notices ----------------------------------------------------------- */
+
+/* Drawn as small cards rather than left-bordered strips, so a notice reads as
+   something placed on the page at the moment it became true. */
+.banner,
+.error-note {
+  display: flex;
+  gap: var(--space-tight);
+  margin: var(--space-base) 0 0;
+  padding: var(--space-tight) var(--space-snug);
+  border: var(--border);
+  border-radius: var(--radius-field);
+  font-size: var(--text-label);
+  line-height: 1.55;
 }
 
 .banner {
-  margin: var(--space-base) 0 0;
-  padding: var(--space-tight) var(--space-snug);
-  border-left: 3px solid var(--color-candidate);
-  background: var(--color-surface-sunken);
-  color: var(--color-text-muted);
-  font-size: var(--text-label);
-}
-
-.banner strong {
-  color: var(--color-text);
+  background: var(--butter-tint);
 }
 
 .error-note {
-  margin: var(--space-base) 0 0;
-  padding: var(--space-tight) var(--space-snug);
-  border-left: 3px solid var(--color-danger);
-  background: var(--color-surface-sunken);
-  color: var(--color-text);
-  font-size: var(--text-label);
+  background: var(--coral-tint);
+}
+
+.banner strong,
+.error-note strong {
+  font-weight: 700;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }

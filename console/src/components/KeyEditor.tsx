@@ -117,7 +117,7 @@ export function KeyEditor({
   const busy = status.kind === 'busy';
 
   return (
-    <section class="key-editor" aria-labelledby="key-editor-heading">
+    <section class="editor-card" aria-labelledby="key-editor-heading">
       <h3 class="section-title" id="key-editor-heading">
         Key console
       </h3>
@@ -168,7 +168,7 @@ export function KeyEditor({
           disabled={busy || keyName === ''}
           onClick={save}
         >
-          Write
+          Write <span class="arrow" aria-hidden="true">→</span>
         </button>
         <button
           class="button is-danger"

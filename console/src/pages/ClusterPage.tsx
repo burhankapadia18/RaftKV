@@ -102,9 +102,11 @@ export function ClusterPage({ onUnauthorized, onStatus }: Props) {
                   <td>{peer.suffrage}</td>
                   <td>
                     {peer.id === status.leader_id ? (
-                      <span class="state-chip is-leader">leader</span>
+                      <span class="state-chip on-paper is-leader">leader</span>
                     ) : (
-                      <span class="state-chip is-follower">follower</span>
+                      <span class="state-chip on-paper is-follower">
+                        follower
+                      </span>
                     )}
                   </td>
                 </tr>

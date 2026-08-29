@@ -96,17 +96,22 @@ export function KeysPage({ onUnauthorized }: Props) {
         </h2>
       </div>
 
-      <label class="field">
-        <span class="field-label">Prefix</span>
-        <input
-          class="field-input"
-          value={prefix}
-          placeholder="all keys"
-          onInput={(event) =>
-            setPrefix((event.target as HTMLInputElement).value)
-          }
-        />
-      </label>
+      <div class="filter-bar">
+        <label class="field">
+          <span class="field-label">Prefix</span>
+          <input
+            class="field-input"
+            value={prefix}
+            placeholder="all keys"
+            onInput={(event) =>
+              setPrefix((event.target as HTMLInputElement).value)
+            }
+          />
+        </label>
+        <button class="button" type="button" onClick={reloadCurrent}>
+          Refresh
+        </button>
+      </div>
 
       <p class="page-note">
         Values are fetched only when a key is opened — a page of {PAGE_SIZE}{' '}
@@ -146,10 +151,7 @@ export function KeysPage({ onUnauthorized }: Props) {
           disabled={nextCursor === undefined}
           onClick={goForward}
         >
-          Next
-        </button>
-        <button class="button" type="button" onClick={reloadCurrent}>
-          Refresh
+          Next <span class="arrow" aria-hidden="true">→</span>
         </button>
       </div>
 

@@ -48,7 +48,7 @@ export function UserForm({ existing, onSubmit, onCancel }: Props) {
   };
 
   return (
-    <form class="user-form" onSubmit={submit}>
+    <form class="editor-card user-form" onSubmit={submit}>
       <h3 class="section-title">
         {existing === undefined ? 'Create user' : `Edit ${existing.name}`}
       </h3>
@@ -63,7 +63,7 @@ export function UserForm({ existing, onSubmit, onCancel }: Props) {
           pattern="[A-Za-z0-9_.\-]+"
           onInput={(event) => setName((event.target as HTMLInputElement).value)}
         />
-        <span class="stat-note">Letters, digits, '_', '.' and '-' only.</span>
+        <span class="field-hint">Letters, digits, '_', '.' and '-' only.</span>
       </label>
 
       <label class="field">
@@ -82,7 +82,7 @@ export function UserForm({ existing, onSubmit, onCancel }: Props) {
         {/* Required even on an edit, and that is the API, not a UI choice: an
             upsert mints a fresh salt and hash every time, so there is no
             "leave the password alone" request to send. */}
-        <span class="stat-note">
+        <span class="field-hint">
           At least {MIN_PASSWORD_BYTES} characters.
           {existing !== undefined &&
             ' Saving replaces the existing password — there is no partial update.'}
@@ -115,7 +115,7 @@ export function UserForm({ existing, onSubmit, onCancel }: Props) {
             setPatterns((event.target as HTMLTextAreaElement).value)
           }
         />
-        <span class="stat-note">
+        <span class="field-hint">
           Globs with '*' and '?' and no escapes, so a key containing '*' cannot
           be named exactly. An empty list denies every key.
         </span>
