@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'preact/hooks';
 
-import { ApiFailure, listKeys } from '../lib/api';
+import { isAuthenticationFailure, listKeys } from '../lib/api';
 import { KeyEditor } from '../components/KeyEditor';
 import { KeyTable } from '../components/KeyTable';
 
@@ -49,7 +49,7 @@ export function KeysPage({ onUnauthorized }: Props) {
           setError(undefined);
         })
         .catch((failure: unknown) => {
-          if (failure instanceof ApiFailure && failure.status === 401) {
+          if (isAuthenticationFailure(failure)) {
             onUnauthorized(failure.message);
             return;
           }
@@ -119,11 +119,15 @@ export function KeysPage({ onUnauthorized }: Props) {
         </p>
       )}
 
-      <KeyTable
-        encodedKeys={encodedKeys}
-        selected={selected}
-        onSelect={setSelected}
-      />
+      {/* Suppressed on failure: "No keys under this prefix" next to a 403 is a
+          claim about the store that the request never established. */}
+      {error === undefined && (
+        <KeyTable
+          encodedKeys={encodedKeys}
+          selected={selected}
+          onSelect={setSelected}
+        />
+      )}
 
       <div class="page-actions is-left">
         <button

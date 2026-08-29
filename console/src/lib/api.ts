@@ -83,6 +83,38 @@ export class ApiFailure extends Error {
   }
 }
 
+/**
+ * The engine's message for a credential that was presented and rejected.
+ *
+ * Mirrors `ERROR_INVALID_CREDENTIALS` in tests/e2e/contracts.py.
+ */
+const INVALID_CREDENTIALS = 'invalid credentials';
+
+/**
+ * True when `error` means "authenticate again", as opposed to "you are who you
+ * say you are, and you may not do that".
+ *
+ * The engine splits these deliberately and NOT along the 401/403 line:
+ *
+ *   - 401 -- no usable credential was presented (with a Basic challenge).
+ *   - 403 "invalid credentials" -- something WAS presented and rejected: an
+ *     unknown user, a disabled user, or a wrong password, kept
+ *     indistinguishable on purpose so the endpoint is not a user-enumeration
+ *     oracle.
+ *   - 403 anything else -- a valid identity that lacks the class or the key
+ *     pattern. Signing such a user out would be wrong: their credential is
+ *     fine, they just cannot do this.
+ *
+ * Treating only 401 as re-authenticate strands anyone who mistypes a password:
+ * the login form is dismissed, every later poll answers 403, and nothing ever
+ * invites them to try again.
+ */
+export function isAuthenticationFailure(error: unknown): error is ApiFailure {
+  if (!(error instanceof ApiFailure)) return false;
+  if (error.status === 401) return true;
+  return error.status === 403 && error.message === INVALID_CREDENTIALS;
+}
+
 /** The engine's error envelope is always `{"error": "..."}`. */
 async function failureFrom(response: Response): Promise<ApiFailure> {
   const text = await response.text();

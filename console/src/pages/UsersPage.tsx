@@ -4,6 +4,7 @@ import {
   ApiFailure,
   deleteUser,
   getUser,
+  isAuthenticationFailure,
   listUsers,
   putUser,
   whoami,
@@ -15,7 +16,13 @@ import { UserForm } from '../components/UserForm';
 import { UserTable } from '../components/UserTable';
 
 interface Props {
-  authEnabled: boolean;
+  /**
+   * Whether the engine reports client auth as ON. `undefined` means the answer
+   * is not known yet (the status call failed), which is NOT the same as "off" --
+   * claiming "off" without being told is what made this page tell an
+   * authenticated admin that authentication was disabled.
+   */
+  authEnabled: boolean | undefined;
   onUnauthorized: (reason: string) => void;
 }
 
@@ -30,14 +37,19 @@ export function UsersPage({ authEnabled, onUnauthorized }: Props) {
   const [editing, setEditing] = useState<Editing>({ mode: 'none' });
   const [error, setError] = useState<string | undefined>(undefined);
   const [note, setNote] = useState<string | undefined>(undefined);
+  // A 403 on the listing means "you are not an administrator", which is a
+  // different screen from "there are no users". Showing the empty table for it
+  // states something false -- there may well be users, this caller just may not
+  // see them -- and offering "New user" advertises an action that cannot work.
+  const [forbidden, setForbidden] = useState(false);
 
   const handle = useCallback(
     (failure: unknown) => {
+      if (isAuthenticationFailure(failure)) {
+        onUnauthorized(failure.message);
+        return;
+      }
       if (failure instanceof ApiFailure) {
-        if (failure.status === 401) {
-          onUnauthorized(failure.message);
-          return;
-        }
         setError(`${failure.status}: ${failure.message}`);
         return;
       }
@@ -47,13 +59,23 @@ export function UsersPage({ authEnabled, onUnauthorized }: Props) {
   );
 
   const refresh = useCallback(() => {
-    if (!authEnabled) return;
+    if (authEnabled === false) return;
     listUsers()
       .then((loaded) => {
         setNames(loaded);
         setError(undefined);
+        setForbidden(false);
       })
-      .catch(handle);
+      .catch((failure: unknown) => {
+        if (failure instanceof ApiFailure && failure.status === 403) {
+          setForbidden(true);
+          setNames([]);
+          return;
+        }
+        handle(failure);
+      });
+    // whoami needs no class, so it answers for a non-admin too -- which is what
+    // lets the page say WHO you are while explaining what you may not do.
     whoami().then(setIdentity).catch(handle);
   }, [authEnabled, handle]);
 
@@ -89,7 +111,7 @@ export function UsersPage({ authEnabled, onUnauthorized }: Props) {
       .catch(handle);
   };
 
-  if (!authEnabled) {
+  if (authEnabled === false) {
     return (
       <section class="page" aria-labelledby="users-heading">
         <h2 class="page-title" id="users-heading">
@@ -111,15 +133,17 @@ export function UsersPage({ authEnabled, onUnauthorized }: Props) {
         <h2 class="page-title" id="users-heading">
           Users
         </h2>
-        <div class="page-actions">
-          <button
-            class="button is-primary"
-            type="button"
-            onClick={() => setEditing({ mode: 'create' })}
-          >
-            New user
-          </button>
-        </div>
+        {!forbidden && (
+          <div class="page-actions">
+            <button
+              class="button is-primary"
+              type="button"
+              onClick={() => setEditing({ mode: 'create' })}
+            >
+              New user
+            </button>
+          </div>
+        )}
       </div>
 
       {identity !== undefined && (
@@ -141,15 +165,23 @@ export function UsersPage({ authEnabled, onUnauthorized }: Props) {
         </p>
       )}
 
-      <UserTable names={names} onSelect={edit} onDelete={remove} />
+      {forbidden ? (
+        <p class="banner">
+          <strong>Administrator access required.</strong> Managing users needs
+          the <code>admin</code> class; your account does not hold it. Your own
+          identity and permissions are shown above.
+        </p>
+      ) : (
+        <UserTable names={names} onSelect={edit} onDelete={remove} />
+      )}
 
-      {editing.mode === 'create' && (
+      {!forbidden && editing.mode === 'create' && (
         <UserForm
           onSubmit={save}
           onCancel={() => setEditing({ mode: 'none' })}
         />
       )}
-      {editing.mode === 'edit' && (
+      {!forbidden && editing.mode === 'edit' && (
         <UserForm
           existing={editing.record}
           onSubmit={save}

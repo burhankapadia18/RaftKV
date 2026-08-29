@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'preact/hooks';
 
-import { ApiFailure, deleteValue, getValue, putValue } from '../lib/api';
+import {
+  ApiFailure,
+  deleteValue,
+  getValue,
+  isAuthenticationFailure,
+  putValue,
+} from '../lib/api';
 
 interface Props {
   /** Raw key. Empty string means "the single-key console with nothing loaded". */
@@ -35,11 +41,11 @@ export function KeyEditor({
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
 
   const handle = (failure: unknown): void => {
+    if (isAuthenticationFailure(failure)) {
+      onUnauthorized(failure.message);
+      return;
+    }
     if (failure instanceof ApiFailure) {
-      if (failure.status === 401) {
-        onUnauthorized(failure.message);
-        return;
-      }
       const suffix =
         failure.status === 503
           ? ' — retry; this does not mean the write was lost'

@@ -1,6 +1,10 @@
 import { useCallback, useState } from 'preact/hooks';
 
-import { ApiFailure, getClusterStatus, type ClusterStatus } from '../lib/api';
+import {
+  getClusterStatus,
+  isAuthenticationFailure,
+  type ClusterStatus,
+} from '../lib/api';
 import { useVisiblePoll } from '../hooks/useVisiblePoll';
 import { NodeCard } from '../components/NodeCard';
 
@@ -36,7 +40,7 @@ export function ClusterPage({ onUnauthorized, onStatus }: Props) {
         onStatus(next);
       })
       .catch((failure: unknown) => {
-        if (failure instanceof ApiFailure && failure.status === 401) {
+        if (isAuthenticationFailure(failure)) {
           onUnauthorized(failure.message);
           return;
         }
