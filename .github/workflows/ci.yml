@@ -260,11 +260,29 @@ jobs:
     container:
       image: debian:bookworm-slim
     steps:
+      # Two packages here are non-obvious, and this job failed on both.
+      #
+      # gRPC and protobuf are used by NEITHER fuzz target — both parse bytes
+      # with nothing but msgpack — but cpp-app/CMakeLists.txt requires them at
+      # CONFIGURE time for the kvdb_node target, so a container without them
+      # dies on `find_package(gRPC CONFIG REQUIRED)` before a fuzzer is even
+      # considered. Same package set as the `cpp` and sanitizer jobs; the build
+      # step below still builds only the two fuzz targets.
+      #
+      # libclang-rt-14-dev is where Debian keeps compiler-rt: the `clang`
+      # package alone gives a compiler that ACCEPTS -fsanitize=fuzzer,address
+      # and then fails at link with "cannot find libclang_rt.fuzzer-x86_64.a".
+      # Version-suffixed on purpose — the container is pinned to bookworm, whose
+      # clang is 14, exactly as the `cpp` job pins its clang-format version.
       - name: Install build dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential cmake clang libmsgpack-dev git ca-certificates
+            build-essential cmake clang libclang-rt-14-dev \
+            libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            pkg-config \
+            libmsgpack-dev \
+            git ca-certificates
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -277,8 +295,13 @@ jobs:
             -DKVDB_BUILD_FUZZERS=ON -DKVDB_CONSOLE=OFF \
             -DCMAKE_CXX_COMPILER=clang++
 
+      # Only the fuzz targets, exactly as the sanitizer jobs build only
+      # kvdb_tests: kvdb_node and the generated protobuf sources are not what
+      # this job gates, and compiling them costs minutes for no signal.
       - name: Build
-        run: cmake --build cpp-app/build-fuzz -j "$(nproc)"
+        run: |
+          cmake --build cpp-app/build-fuzz -j "$(nproc)" \
+            --target fuzz_kv_command fuzz_http_parser
 
       # Bounded so this stays a PR gate rather than a fuzzing campaign. Any crash,
       # OOM or sanitizer report fails the job and the input becomes a checked-in
@@ -355,6 +378,17 @@ jobs:
       # to the host, so it is queried from inside the containers (the runtime
       # image ships curl).
       # Worst case for a join is 20 attempts x 2s = ~40s; 120s gives headroom.
+      #
+      # (1) is probed on /metrics, NOT on a data route. This poll originally
+      # fetched `/get-val?key=__ci_readiness_probe__`, which was a liveness
+      # check only for as long as the server answered 200 for everything. R1.7
+      # made status codes truthful, so a miss is a 404, `curl -sf` exits 22, and
+      # the loop could never reach ready however healthy the cluster was: 120s
+      # of polling a fully converged cluster, then "did not become ready" with
+      # three `(healthy)` containers in the `docker compose ps` dump.
+      # /metrics is answered before the store or the sidecar is consulted and is
+      # deliberately unauthenticated, so it means "this listener is alive" in
+      # every profile. Same probe as the e2e-auth and chaos jobs.
       - name: Wait for cluster readiness
         run: |
           deadline=$(( $(date +%s) + 120 ))
@@ -362,9 +396,8 @@ jobs:
             ready=1
 
             for port in 8080 8081 8082; do
-              if ! curl -sf --max-time 2 \
-                "http://localhost:${port}/get-val?key=__ci_readiness_probe__" \
-                >/dev/null; then
+              if ! curl -sf --max-time 2 -o /dev/null \
+                "http://localhost:${port}/metrics"; then
                 ready=0
               fi
             done
